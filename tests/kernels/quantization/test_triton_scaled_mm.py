@@ -190,3 +190,24 @@ def test_scaled_mm_explicit_tiles_match_heuristic(M):
         use_heuristic=False,
     )
     torch.testing.assert_close(explicit, heuristic, rtol=0, atol=0)
+
+
+# The int8 linear kernel calls triton_scaled_mm through this op so that
+# torch.compile cannot bake in the tile picked for the traced M.
+@pytest.mark.skipif(
+    not current_platform.is_cuda_alike(), reason="Triton scaled_mm on CUDA-alike."
+)
+def test_triton_int8_scaled_mm_opcheck():
+    from tests.kernels.utils import opcheck
+    from vllm.model_executor.kernels.linear.scaled_mm import triton  # noqa: F401
+
+    dev = current_platform.device_type
+    M, N, K = 16, 256, 512
+    a = torch.randint(-32, 32, (M, K), dtype=torch.int8, device=dev)
+    b = torch.randint(-32, 32, (N, K), dtype=torch.int8, device=dev).t()
+    scale_a = torch.rand((M, 1), device=dev)
+    scale_b = torch.rand((N, 1), device=dev)
+    opcheck(
+        torch.ops.vllm.triton_int8_scaled_mm,
+        (a, b, scale_a, scale_b, torch.float16, None),
+    )
