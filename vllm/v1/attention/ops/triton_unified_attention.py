@@ -35,6 +35,14 @@ is_batch_invariant = envs.VLLM_BATCH_INVARIANT
 float8_info = torch.finfo(current_platform.fp8_dtype())
 
 
+def _on_gfx10() -> bool:
+    if not current_platform.is_rocm():
+        return False
+    from vllm.platforms.rocm import on_gfx10
+
+    return on_gfx10()
+
+
 @triton.jit
 def _cast_kv_tile(data, Q, tensor_scale, KV_QUANT_MODE: tl.constexpr):
     """Cast a loaded KV tile to Q's dtype, dequantizing if needed.
@@ -632,6 +640,10 @@ def kernel_unified_attention(
                 acc,
                 mask=dim_mask[None, :] & query_mask_0[:, None] & query_mask_1[:, None],
             )
+        # A row whose keys in this segment are all masked (a draft token
+        # before a segment boundary) ends with M=0, L=0; store -inf so
+        # reduce_segments ignores the segment for that row.
+        M = tl.where(L > 0.0, M, float("-inf"))
         store_segm_reduce_scalars(
             segm_max_ptr,
             segm_expsum_ptr,
@@ -826,6 +838,8 @@ def unified_attention(
     softmax_segm_output=None,
     softmax_segm_max=None,
     softmax_segm_expsum=None,
+    # Longest query the 3D split-KV kernel may take (spec-decode verify).
+    max_seqlen_q_3d: int = 1,
     alibi_slopes=None,
     output_scale=None,
     qq_bias=None,
@@ -934,9 +948,34 @@ def unified_attention(
     num_queries_per_kv = num_query_heads // num_kv_heads
     head_size = q.shape[2]
 
+    # Launch the 2D kernel if
+    # 1. No intermediate tiled softmax buffers for the 3D kernel have been allocated, or
+    # 2. The batch includes a query longer than max_seqlen_q_3d (prefill), or
+    # 3. The number of sequences exceeds the configured threshold, or
+    # 4. The query tokens do not fit the 3D scratch buffers, or
+    # 5. Batch invariance is enabled
+    use_3d = not (
+        seq_threshold_3D is None
+        or num_par_softmax_segments is None
+        or softmax_segm_output is None
+        or softmax_segm_max is None
+        or softmax_segm_expsum is None
+        or max_seqlen_q > max_seqlen_q_3d
+        or num_seqs > seq_threshold_3D
+        or q.shape[0] > softmax_segm_max.shape[0]
+        or is_batch_invariant
+    )
+
     BLOCK_M = (
         16 if num_queries_per_kv <= 16 else triton.next_power_of_2(num_queries_per_kv)
     )
+    if use_3d and max_seqlen_q > 1:
+        # One Q block per sequence (up to 64 rows), so each KV tile is read
+        # once for all of its draft tokens.
+        BLOCK_M = max(
+            BLOCK_M,
+            min(64, triton.next_power_of_2(max_seqlen_q * num_queries_per_kv)),
+        )
     BLOCK_Q = BLOCK_M // num_queries_per_kv
 
     # Tuned launch parameters; ``None`` lets Triton pick its defaults.
@@ -958,6 +997,11 @@ def unified_attention(
         BLOCK_Q = BLOCK_M // num_queries_per_kv
         launch_num_warps = 8
         launch_num_stages = 2
+    elif use_3d and head_size == 256 and q.dtype == torch.float16 and _on_gfx10():
+        # RDNA2 split-KV decode / verify: single-stage, 4 warps, 16-wide KV tile
+        # (with the backend's 32 segments, 1.5-1.8x over the defaults).
+        launch_num_warps = 4
+        launch_num_stages = 1
 
     # Ideally we would launch with kernel with:
     # \sum_i[ceil(query_len[i] / BLOCK_Q)] blocks.
@@ -1037,22 +1081,6 @@ def unified_attention(
             f"USE_TD_QO requires contiguous output heads "
             f"(out.stride(1) = {out.stride(1)} != head_size = {head_size})."
         )
-
-    # Launch the 2D kernel if
-    # 1. No intermediate tiled softmax buffers for the 3D kernel have been allocated, or
-    # 2. The batch includes at least one prefill request, or
-    # 3. The number of sequences exceeds the configured threshold, or
-    # 4. Batch invariance is enabled
-    use_3d = not (
-        seq_threshold_3D is None
-        or num_par_softmax_segments is None
-        or softmax_segm_output is None
-        or softmax_segm_max is None
-        or softmax_segm_expsum is None
-        or max_seqlen_q > 1
-        or num_seqs > seq_threshold_3D
-        or is_batch_invariant
-    )
 
     # The kernel signature is the same for 2D and 3D — only the launch
     # grid + a handful of constexpr toggles differ.  Per-token-head scale

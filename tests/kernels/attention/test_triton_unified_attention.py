@@ -937,3 +937,105 @@ def test_softcap_does_not_overflow_on_large_scores() -> None:
     ref = soft_cap * torch.tanh(scores / soft_cap)
     assert torch.isfinite(out).all(), out
     torch.testing.assert_close(out, ref, atol=1e-3, rtol=1e-3)
+
+
+@pytest.mark.parametrize(
+    "seq_lens",
+    [
+        [(3, 1346), (3, 769), (2, 40)],
+        [(1, 1346), (1, 769), (1, 40)],
+        [(129, 463), (40, 1346)],
+    ],
+)
+@pytest.mark.parametrize("num_heads", [(8, 2), (24, 4)])
+@pytest.mark.parametrize("head_size", HEAD_SIZES)
+@pytest.mark.parametrize("num_segments", [16, 32])
+@pytest.mark.parametrize("negative_scores", [False, True])
+@torch.inference_mode()
+def test_triton_unified_attn_fp16_verify_decode_prefill(
+    seq_lens: list[tuple[int, int]],
+    num_heads: tuple[int, int],
+    head_size: int,
+    num_segments: int,
+    negative_scores: bool,
+) -> None:
+    """fp16 spec-decode verify (a few query tokens per sequence) and decode
+    batches on the 3D split-KV kernel, and prefill on the 2D kernel. The KV
+    lengths place a segment boundary between draft tokens, so some rows see no
+    keys in a segment; uniformly very negative scores make such a segment
+    corrupt the reduction unless it is ignored."""
+    torch.set_default_device(DEVICE_TYPE)
+    set_random_seed(0)
+    query_lens = [x[0] for x in seq_lens]
+    kv_lens_list = [x[1] for x in seq_lens]
+    num_query_heads, num_kv_heads = num_heads
+    block_size, num_blocks = 16, 2048
+    dtype = torch.float16
+    scale = head_size**-0.5
+
+    query = torch.randn(sum(query_lens), num_query_heads, head_size, dtype=dtype)
+    key_cache = torch.randn(
+        num_blocks, block_size, num_kv_heads, head_size, dtype=dtype
+    )
+    value_cache = torch.randn_like(key_cache)
+    if negative_scores:
+        query.fill_(-4.0)
+        key_cache.fill_(4.0)
+    cu_query_lens = torch.tensor([0] + query_lens, dtype=torch.int32).cumsum(
+        dim=0, dtype=torch.int32
+    )
+    kv_lens = torch.tensor(kv_lens_list, dtype=torch.int32)
+    max_num_blocks_per_seq = (max(kv_lens_list) + block_size - 1) // block_size
+    block_tables = torch.randint(
+        0, num_blocks, (len(seq_lens), max_num_blocks_per_seq), dtype=torch.int32
+    )
+
+    # As with two speculative tokens: up to 3 query tokens take the 3D kernel.
+    seq_threshold_3D, max_seqlen_q_3d = 8, 3
+    rows = seq_threshold_3D * max_seqlen_q_3d
+    output = torch.empty_like(query)
+    unified_attention(
+        q=query,
+        k=key_cache,
+        v=value_cache,
+        out=output,
+        cu_seqlens_q=cu_query_lens,
+        seqused_k=kv_lens,
+        max_seqlen_q=max(query_lens),
+        max_seqlen_k=max(kv_lens_list),
+        softmax_scale=scale,
+        causal=True,
+        window_size=(-1, -1),
+        block_table=block_tables,
+        softcap=0,
+        q_descale=None,
+        k_descale=None,
+        v_descale=None,
+        seq_threshold_3D=seq_threshold_3D,
+        num_par_softmax_segments=num_segments,
+        softmax_segm_output=torch.empty(
+            rows,
+            num_query_heads,
+            num_segments,
+            next_power_of_2(head_size),
+            dtype=torch.float32,
+        ),
+        softmax_segm_max=torch.empty(
+            rows, num_query_heads, num_segments, dtype=torch.float32
+        ),
+        softmax_segm_expsum=torch.empty(
+            rows, num_query_heads, num_segments, dtype=torch.float32
+        ),
+        max_seqlen_q_3d=max_seqlen_q_3d,
+    )
+
+    ref_output = ref_paged_attn(
+        query=query,
+        key_cache=key_cache,
+        value_cache=value_cache,
+        query_lens=query_lens,
+        kv_lens=kv_lens,
+        block_tables=block_tables,
+        scale=scale,
+    )
+    torch.testing.assert_close(output, ref_output, atol=1.5e-2, rtol=1e-2)

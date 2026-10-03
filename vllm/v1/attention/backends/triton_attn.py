@@ -94,6 +94,7 @@ class TritonAttentionMetadata:
     mm_prefix_range_tensor: torch.Tensor | None = None
     rswa_prefix_lens: torch.Tensor | None = None
     rswa_window: int | None = None
+    max_seqlen_q_3d: int = 1
 
 
 class TritonAttentionMetadataBuilder(AttentionMetadataBuilder[TritonAttentionMetadata]):
@@ -152,6 +153,18 @@ class TritonAttentionMetadataBuilder(AttentionMetadataBuilder[TritonAttentionMet
             )
 
         self.num_par_softmax_segments = NUM_PAR_SOFTMAX_SEGMENTS
+        # gfx10: 32 KV segments fill the GPU at small batch (decode 1.5-1.8x on a
+        # V620), and spec-decode verify batches (k+1 query tokens per sequence)
+        # also take the 3D kernel; the 2D one launches only a few programs for them.
+        self.max_seqlen_q_3d = 1
+        if current_platform.is_rocm():
+            from vllm.platforms.rocm import on_gfx10
+
+            if on_gfx10():
+                self.num_par_softmax_segments = 32
+                spec_config = vllm_config.speculative_config
+                if spec_config is not None:
+                    self.max_seqlen_q_3d = 1 + spec_config.num_speculative_tokens
         # On SM120, batches whose 16-segment grid under-fills the SMs use 64.
         self.max_seqs_64_segments = 0
         if current_platform.is_cuda() and current_platform.is_device_capability(
@@ -160,7 +173,7 @@ class TritonAttentionMetadataBuilder(AttentionMetadataBuilder[TritonAttentionMet
             self.max_seqs_64_segments = (current_platform.num_compute_units() - 1) // (
                 NUM_PAR_SOFTMAX_SEGMENTS * self.num_heads_kv
             )
-        max_num_tokens_3d = self.seq_threshold_3D
+        max_num_tokens_3d = self.seq_threshold_3D * self.max_seqlen_q_3d
         if self.max_seqs_64_segments > 0:
             self.num_par_softmax_segments = 64
             # build() reuses this scratch at 16 segments with proportionally more rows.
@@ -264,6 +277,7 @@ class TritonAttentionMetadataBuilder(AttentionMetadataBuilder[TritonAttentionMet
             softmax_segm_output=self.softmax_segm_output,
             softmax_segm_max=self.softmax_segm_max,
             softmax_segm_expsum=self.softmax_segm_expsum,
+            max_seqlen_q_3d=self.max_seqlen_q_3d,
         )
         if self.max_seqs_64_segments > 0 and (
             self.max_seqs_64_segments < seq_lens.shape[0]
@@ -720,6 +734,7 @@ class TritonAttentionImpl(AttentionImpl):
             softmax_segm_output=softmax_segm_output,
             softmax_segm_max=softmax_segm_max,
             softmax_segm_expsum=softmax_segm_expsum,
+            max_seqlen_q_3d=attn_metadata.max_seqlen_q_3d,
             sinks=self.sinks,
             output_scale=output_scale,
             mm_prefix_range=mm_prefix_range_tensor,
