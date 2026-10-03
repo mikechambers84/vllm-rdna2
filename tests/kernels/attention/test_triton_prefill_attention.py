@@ -248,7 +248,12 @@ class _LaunchCapture:
 
 
 def _capture_tile_config(
-    monkeypatch, *, is_rocm: bool, on_gfx1x: bool, dtype=torch.bfloat16
+    monkeypatch,
+    *,
+    is_rocm: bool,
+    on_gfx1x: bool,
+    on_gfx10: bool = False,
+    dtype=torch.bfloat16,
 ) -> _LaunchCapture:
     """Capture the tile configuration with the platform predicates mocked.
 
@@ -266,6 +271,7 @@ def _capture_tile_config(
         import vllm.platforms.rocm as rocm_platform
 
         monkeypatch.setattr(rocm_platform, "on_gfx1x", lambda: on_gfx1x)
+        monkeypatch.setattr(rocm_platform, "on_gfx10", lambda: on_gfx10)
 
     capture = _LaunchCapture()
     monkeypatch.setattr(prefill_ops, "_fwd_kernel", capture)
@@ -315,3 +321,14 @@ def test_rdna_narrows_the_kv_tile_and_nothing_else(monkeypatch) -> None:
     assert tuned.kwargs.pop("BLOCK_N") != stock.kwargs.pop("BLOCK_N")
     assert tuned.kwargs == stock.kwargs
     assert tuned.grid == stock.grid
+
+
+def test_gfx10_uses_small_tiles(monkeypatch) -> None:
+    """gfx1030 reports capability 10.3 and would get the sm80 128-row tiles;
+    RDNA2 uses 64x16 tiles with 4 warps, and the grid follows BLOCK_M."""
+    capture = _capture_tile_config(
+        monkeypatch, is_rocm=True, on_gfx1x=False, on_gfx10=True
+    )
+    kwargs = capture.kwargs
+    assert (kwargs["BLOCK_M"], kwargs["BLOCK_N"], kwargs["num_warps"]) == (64, 16, 4)
+    assert capture.grid[2] == 2
