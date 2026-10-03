@@ -506,6 +506,15 @@ def _get_backend_priorities(
                 AttentionBackendEnum.TRITON_MLA,
             ]
 
+    if _ON_GFX10:
+        # ROCM_ATTN's native paged-attention kernel is a stub on gfx10, and its
+        # Triton fallback is far slower at decode than TRITON_ATTN's split-KV.
+        backends = [AttentionBackendEnum.TRITON_ATTN]
+        if not use_kv_connector:
+            backends.append(AttentionBackendEnum.ROCM_ATTN)
+        backends.append(AttentionBackendEnum.TURBOQUANT)
+        return backends
+
     backends = []
     # Keep ROCM_ATTN disabled for KV connectors until connector transfer
     # semantics are validated for its asymmetric native K/V cache views.
