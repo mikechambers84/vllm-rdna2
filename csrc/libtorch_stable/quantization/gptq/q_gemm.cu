@@ -1360,8 +1360,20 @@ void gemm_half_q_half_cuda(cublasHandle_t cublas_handle, const half* a,
 
     const half alpha = __float2half(1.0f);
     const half beta = __float2half(0.0f);
-    cublasHgemm(cublas_handle, CUBLAS_OP_N, CUBLAS_OP_N, size_n, size_m, size_k,
-                &alpha, temp_dq, size_n, a, size_k, &beta, c, size_n);
+#if defined(USE_ROCM)
+    // rocBLAS picks a slower tile for very wide outputs on gfx1030 (a
+    // 34816-wide MLP gate_up at 8192 rows: 15.5 vs 20 TFLOPS); two column
+    // halves get the faster one.
+    const int n_split = (size_n >= 32768 && size_n % 256 == 0) ? 2 : 1;
+#else
+    const int n_split = 1;
+#endif
+    const int n_part = size_n / n_split;
+    for (int i = 0; i < n_split; ++i) {
+      cublasHgemm(cublas_handle, CUBLAS_OP_N, CUBLAS_OP_N, n_part, size_m,
+                  size_k, &alpha, temp_dq + i * n_part, size_n, a, size_k,
+                  &beta, c + i * n_part, size_n);
+    }
   } else if (use_exllama) {
     // Quantized matmul
     int max_chunks = size_m / BLOCK_M_SIZE_MAX;

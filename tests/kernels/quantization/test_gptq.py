@@ -47,13 +47,17 @@ def _gptq_int4_sym(k: int, n: int, group_size: int):
     return w_q, zeros, scales, w_ref
 
 
-@pytest.mark.parametrize("m", [1, 16, 64, 512])
-@pytest.mark.parametrize("k", [5120, 17408])
-def test_gptq_gemm_int4_matches_reference(m, k):
+@pytest.mark.parametrize(
+    "m,k,n",
+    [(m, k, 1024) for m in (1, 16, 64, 512) for k in (5120, 17408)]
+    # Wide outputs run the reconstruct-path GEMM as two column halves on ROCm.
+    + [(512, 5120, 34816)],
+)
+def test_gptq_gemm_int4_matches_reference(m, k, n):
     """Covers the fused exllama path (m <= 50) and the reconstruct + GEMM path,
     which must accumulate in fp32: fp16 accumulation costs ~1e-2 at this K."""
     torch.manual_seed(0)
-    w_q, zeros, scales, w_ref = _gptq_int4_sym(k, 1024, 32)
+    w_q, zeros, scales, w_ref = _gptq_int4_sym(k, n, 32)
     a = torch.randn(m, k, device="cuda", dtype=torch.float16)
     out = ops.gptq_gemm(a, w_q, zeros, scales, True, False, 4)
     ref = a.float() @ w_ref
