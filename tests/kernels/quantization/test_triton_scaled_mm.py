@@ -160,3 +160,33 @@ def test_scaled_mm_td_matches_plain(M, N, K, in_dtype, use_scalar_scale_a, use_b
     out_plain = triton_scaled_mm(a, b, scale_a, scale_b, out_dtype, bias, use_td=False)
     out_td = triton_scaled_mm(a, b, scale_a, scale_b, out_dtype, bias, use_td=True)
     torch.testing.assert_close(out_td, out_plain, rtol=0, atol=0)
+
+
+# Explicit tiles must work, and int8 must match the heuristic tiles bit-exactly
+# (int32 accumulation is exact), whichever tile the heuristic picks.
+@pytest.mark.skipif(
+    not current_platform.is_cuda_alike(), reason="Triton scaled_mm on CUDA-alike."
+)
+@pytest.mark.parametrize("M", [1, 16, 64])
+def test_scaled_mm_explicit_tiles_match_heuristic(M):
+    dev = current_platform.device_type
+    set_random_seed(0)
+    N, K = 4096, 4096
+    a = torch.randint(-32, 32, (M, K), dtype=torch.int8, device=dev)
+    b = torch.randint(-32, 32, (K, N), dtype=torch.int8, device=dev)
+    scale_a = 0.25 * torch.rand((M, 1), device=dev)
+    scale_b = 0.25 * torch.rand((N, 1), device=dev)
+
+    heuristic = triton_scaled_mm(a, b, scale_a, scale_b, torch.bfloat16)
+    explicit = triton_scaled_mm(
+        a,
+        b,
+        scale_a,
+        scale_b,
+        torch.bfloat16,
+        block_size_m=32,
+        block_size_n=64,
+        block_size_k=64,
+        use_heuristic=False,
+    )
+    torch.testing.assert_close(explicit, heuristic, rtol=0, atol=0)

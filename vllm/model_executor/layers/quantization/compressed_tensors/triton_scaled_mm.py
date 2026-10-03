@@ -4,10 +4,19 @@
 
 import torch
 
+from vllm.platforms import current_platform
 from vllm.triton_utils import tl, triton, use_tensor_descriptor
 from vllm.triton_utils.allocation import set_triton_allocator
 
 _TD_ALLOCATOR_DEVICES: set[torch.device] = set()
+
+
+def _on_gfx10() -> bool:
+    if not current_platform.is_rocm():
+        return False
+    from vllm.platforms.rocm import on_gfx10
+
+    return on_gfx10()
 
 
 def is_weak_contiguous(x: torch.Tensor):
@@ -213,10 +222,17 @@ def triton_scaled_mm(
 
     has_scalar = lambda x: x.shape[0] == 1 and x.shape[1] == 1
 
+    tile_shape = (block_size_m, block_size_n, block_size_k)
+    launch_kwargs: dict[str, int] = {}
     if use_heuristic:
         is_small_N = N < 8192
         next_power_of_2_M = max(32, triton.next_power_of_2(M))
-        if next_power_of_2_M <= 32:
+        if M <= 16 and _on_gfx10():
+            # RDNA2 decode: a 16-row tile wastes far less of the int8 dot work
+            # and launches more programs (1.6-2.2x on a V620).
+            tile_shape = (16, 128 if N > 5120 else 64, 128)
+            launch_kwargs = {"num_warps": 4, "num_stages": 1}
+        elif next_power_of_2_M <= 32:
             tile_shape = (64, 64, 256) if is_small_N else (64, 128, 256)
         elif next_power_of_2_M <= 64:
             tile_shape = (64, 64, 256)
@@ -277,6 +293,7 @@ def triton_scaled_mm(
         BLOCK_SIZE_SCALE_B=block_size_sb,
         USE_TD=use_td,
         B_T=b_t,
+        **launch_kwargs,
     )
 
     return result.to(out_dtype)
