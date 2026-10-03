@@ -292,6 +292,45 @@ def test_profiling_fallback_declines_off_rocm(rocm):
     assert maybe_rocm_profiling_fallback(result) is None
 
 
+class _StopProfiling(Exception):
+    pass
+
+
+@pytest.mark.parametrize("rocm", [True, False], indirect=True)
+def test_rocm_warms_up_before_the_measured_profiling_run(rocm):
+    """On ROCm a warmup forward pass, without the multimodal encoder, runs
+    before memory profiling, so first-call compilation and Triton autotuning
+    buffers are not measured as activation peak."""
+    events = []
+    mm_config = SimpleNamespace(skip_mm_profiling=False)
+    worker = gpu_worker.Worker.__new__(gpu_worker.Worker)
+    worker.cache_config = SimpleNamespace(kv_cache_memory_bytes=None)
+    worker.model_config = SimpleNamespace(multimodal_config=mm_config)
+    worker.parallel_config = SimpleNamespace(data_parallel_size=1)
+    worker.init_snapshot = None
+    worker.model_runner = SimpleNamespace(
+        model_memory_usage=0,
+        profile_run=lambda randomize_inputs: events.append(
+            ("warmup", mm_config.skip_mm_profiling)
+        ),
+    )
+    worker._scoped_allocator_max_split = lambda max_split_size_mb: nullcontext()
+
+    def start_profiling(*args, **kwargs):
+        events.append(("profile", mm_config.skip_mm_profiling))
+        raise _StopProfiling
+
+    with (
+        patch.object(gpu_worker, "maybe_apply_startup_plan", lambda worker: None),
+        patch.object(gpu_worker, "memory_profiling", start_profiling),
+        pytest.raises(_StopProfiling),
+    ):
+        worker.determine_available_memory()
+
+    warmup = [("warmup", True)] if rocm else []
+    assert events == warmup + [("profile", False)]
+
+
 class _OrderedHandle:
     """Send handle that logs when it is waited."""
 

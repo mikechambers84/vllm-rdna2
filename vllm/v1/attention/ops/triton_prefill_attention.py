@@ -42,6 +42,14 @@ def _prefer_narrow_kv_tile() -> bool:
     return on_gfx1x()
 
 
+def _on_gfx10() -> bool:
+    if not current_platform.is_rocm():
+        return False
+    from vllm.platforms.rocm import on_gfx10
+
+    return on_gfx10()
+
+
 @triton.jit
 def _fwd_kernel(
     Q,
@@ -244,6 +252,12 @@ def context_attention_fwd(
     out: [b * s, head, head_dim]
     """
     BLOCK = get_block_size(q.dtype)
+    # RDNA2 (gfx1030 reports capability 10.3, so it gets the sm80 tile above):
+    # 64x16 tiles with 4 warps run the Qwen3.5 vision tower's attention (16
+    # heads of 72, non-causal) at ~4 vs 0.75 TFLOPS on a V620.
+    gfx10 = _on_gfx10()
+    if gfx10:
+        BLOCK = min(BLOCK, 64)
 
     Lq, Lk, _ = q.shape[-1], k.shape[-1], v.shape[-1]
 
@@ -262,6 +276,9 @@ def context_attention_fwd(
     # BLOCK_M, num_warps and num_stages stay at the shared defaults; min()
     # leaves dtypes whose default tile is already 32, such as float32, alone.
     BLOCK_N = min(BLOCK, 32) if _prefer_narrow_kv_tile() else BLOCK
+    if gfx10:
+        BLOCK_N = min(BLOCK, 16)
+        num_warps = 4
 
     sliding_window_q = sliding_window_q if sliding_window_q is not None else 0
     sliding_window_k = sliding_window_k if sliding_window_k is not None else 0

@@ -636,6 +636,26 @@ class Worker(WorkerBase):
                 getattr(self.parallel_config, "_api_process_count", 1),
             )
 
+        if current_platform.is_rocm():
+            # A cold start compiles the model and runs Triton autotuning (the FLA
+            # kernels) in the first forward pass. Autotune benchmark buffers would
+            # count as peak activation and come out of the KV cache (~1.2 GiB for
+            # Qwen3.8-27B on a V620), so warm up before the measured pass, with
+            # the same split limit so the freed buffers stay releasable. The
+            # warmup skips the multimodal encoder pass, which can take minutes.
+            mm_config = self.model_config.multimodal_config
+            if mm_config is not None:
+                skip_mm_profiling = mm_config.skip_mm_profiling
+                mm_config.skip_mm_profiling = True
+            try:
+                with self._scoped_allocator_max_split(max_split_size_mb=20):
+                    self.model_runner.profile_run(
+                        randomize_inputs=self.randomize_dummy_inputs
+                    )
+            finally:
+                if mm_config is not None:
+                    mm_config.skip_mm_profiling = skip_mm_profiling
+
         # Execute a forward pass with dummy inputs to profile the memory usage
         # of the model.
         with (

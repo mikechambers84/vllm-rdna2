@@ -47,13 +47,17 @@ def _gptq_int4_sym(k: int, n: int, group_size: int):
     return w_q, zeros, scales, w_ref
 
 
-@pytest.mark.parametrize("m", [1, 16, 64, 512])
-@pytest.mark.parametrize("k", [5120, 17408])
-def test_gptq_gemm_int4_matches_reference(m, k):
+@pytest.mark.parametrize(
+    "m,k,n",
+    [(m, k, 1024) for m in (1, 16, 64, 512) for k in (5120, 17408)]
+    # Wide outputs run the reconstruct-path GEMM as two column halves on ROCm.
+    + [(512, 5120, 34816)],
+)
+def test_gptq_gemm_int4_matches_reference(m, k, n):
     """Covers the fused exllama path (m <= 50) and the reconstruct + GEMM path,
     which must accumulate in fp32: fp16 accumulation costs ~1e-2 at this K."""
     torch.manual_seed(0)
-    w_q, zeros, scales, w_ref = _gptq_int4_sym(k, 1024, 32)
+    w_q, zeros, scales, w_ref = _gptq_int4_sym(k, n, 32)
     a = torch.randn(m, k, device="cuda", dtype=torch.float16)
     out = ops.gptq_gemm(a, w_q, zeros, scales, True, False, 4)
     ref = a.float() @ w_ref
@@ -64,11 +68,13 @@ def test_gptq_gemm_int4_matches_reference(m, k):
 
 def test_gptq_gemm_reconstruct_path_cuda_graph():
     """The reconstruct path (m > 50) calls into BLAS; vLLM captures it in
-    piecewise CUDA/HIP graphs, so capture and replay must reproduce eager."""
+    piecewise CUDA/HIP graphs, so capture and replay must reproduce eager,
+    also when the dequantized weight goes to a caller-owned workspace."""
     torch.manual_seed(0)
     w_q, zeros, scales, _ = _gptq_int4_sym(1024, 1024, 32)
     a = torch.randn(64, 1024, device="cuda", dtype=torch.float16)
     args = (a, w_q, zeros, scales, True, False, 4)
+    workspace = torch.empty(1024 * 1024, device="cuda", dtype=torch.float16)
     side = torch.cuda.Stream()
     side.wait_stream(torch.cuda.current_stream())
     with torch.cuda.stream(side):
@@ -76,7 +82,7 @@ def test_gptq_gemm_reconstruct_path_cuda_graph():
     torch.cuda.current_stream().wait_stream(side)
     graph = torch.cuda.CUDAGraph()
     with torch.cuda.graph(graph):
-        out = ops.gptq_gemm(*args)
+        out = ops.gptq_gemm(*args, workspace)
     graph.replay()
     torch.accelerator.synchronize()
     torch.testing.assert_close(out, eager)

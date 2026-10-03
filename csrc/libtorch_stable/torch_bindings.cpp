@@ -697,7 +697,7 @@ STABLE_TORCH_LIBRARY_FRAGMENT(_C, ops) {
   ops.def(
       "gptq_gemm(Tensor a, Tensor b_q_weight, Tensor b_gptq_qzeros, "
       "Tensor b_gptq_scales, bool use_exllama, bool "
-      "use_v2_format, int bit) "
+      "use_v2_format, int bit, Tensor? workspace=None) "
       "-> Tensor");
 
   // Post processing for GPTQ.
