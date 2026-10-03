@@ -288,10 +288,25 @@ def wvsplitkrc_dispatch(n: int, k: int, m: int, cu_count: int) -> tuple[int, boo
     return chunkk, fits
 
 
+def _use_rdna2_skinny_gemv(n: int, m: int, k: int) -> bool:
+    """Where wvSplitK_rdna2 beats rocBLAS on a V620: a wide K (up to 8 tokens),
+    or up to 4 tokens with a tiny weight (rocBLAS is launch-bound there) or a
+    large one."""
+    if k >= 4096:
+        return 0 < n <= 8
+    return 0 < n <= 4 and (m <= 256 or m * k * 2 >= 32 * 2**20)
+
+
 def rocm_unquantized_gemm_impl(
     x: torch.Tensor, weight: torch.Tensor, bias: torch.Tensor | None = None
 ) -> torch.Tensor:
-    from vllm.platforms.rocm import on_gfx1x, on_gfx9, on_gfx950, on_gfx1250
+    from vllm.platforms.rocm import (
+        on_gfx1x,
+        on_gfx9,
+        on_gfx950,
+        on_gfx1030,
+        on_gfx1250,
+    )
 
     n = x.numel() // x.size(-1)
     m = weight.shape[0]
@@ -356,6 +371,19 @@ def rocm_unquantized_gemm_impl(
             x_view = x.reshape(-1, x.size(-1)).contiguous()
             out = ops.LLMM1(weight, x_view, 4)
             return out.reshape(*x.shape[:-1], weight.shape[0])
+
+    if (
+        envs.VLLM_ROCM_USE_SKINNY_GEMM
+        and on_gfx1030()
+        and x.dtype in [torch.float16, torch.bfloat16]
+        and weight.dtype == x.dtype
+        and k % 8 == 0
+        and skinny_operands_compatible
+        and _use_rdna2_skinny_gemv(n, m, k)
+    ):
+        x_view = x.reshape(-1, x.size(-1)).contiguous()
+        out = ops.wvSplitK_rdna2(weight, x_view, bias)
+        return out.reshape(*x.shape[:-1], m)
 
     if rocm_aiter_ops.is_tgemm_enabled():
         from aiter.tuned_gemm import tgemm

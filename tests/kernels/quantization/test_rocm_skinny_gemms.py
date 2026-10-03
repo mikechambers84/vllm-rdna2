@@ -9,7 +9,7 @@ import vllm._custom_ops as ops
 from tests.kernels.quant_utils import ref_dynamic_per_tensor_fp8_quant
 from vllm.distributed import cleanup_dist_env_and_memory
 from vllm.platforms import current_platform
-from vllm.platforms.rocm import on_gfx950
+from vllm.platforms.rocm import on_gfx10, on_gfx950, on_gfx1030
 from vllm.utils.platform_utils import num_compute_units
 
 # Global per-test cleanup costs more than the tests themselves.
@@ -325,6 +325,7 @@ def _release_together(streams):
 @pytest.mark.parametrize("rows_per_block", [2, 4, 8, 16])
 @pytest.mark.parametrize("seed", SEEDS)
 @pytest.mark.skipif(not current_platform.is_rocm(), reason="only test for rocm")
+@pytest.mark.skipif(on_gfx10(), reason="not built for gfx10 (stub kernels)")
 @torch.inference_mode()
 def test_rocm_llmm1_kernel(n, k, m, dtype, rows_per_block, seed):
     torch.manual_seed(seed)
@@ -347,6 +348,7 @@ def test_rocm_llmm1_kernel(n, k, m, dtype, rows_per_block, seed):
 )
 @pytest.mark.parametrize("seed", SEEDS)
 @pytest.mark.skipif(not current_platform.is_rocm(), reason="only test for rocm")
+@pytest.mark.skipif(on_gfx10(), reason="not built for gfx10 (stub kernels)")
 def test_rocm_wvsplitk_kernel(
     n, k, m, dtype, padded_a, padded_b, bias_mode, xnorm, seed
 ):
@@ -372,6 +374,26 @@ def test_rocm_wvsplitk_kernel(
     # Accumulation error in fp16 GEMM scales with sqrt(K)
     atol = torch.finfo(dtype).eps * math.sqrt(k)
     torch.testing.assert_close(out, ref_out, atol=atol, rtol=1e-2)
+
+
+@pytest.mark.parametrize("n", [1, 3, 8, 16])
+@pytest.mark.parametrize("k,m", [(2048, 256), (5120, 9216), (4096, 1000)])
+@pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
+@pytest.mark.parametrize("with_bias", [False, True])
+@pytest.mark.skipif(not on_gfx1030(), reason="RDNA2 (gfx1030) kernel")
+def test_rocm_wvsplitk_rdna2_kernel(n, k, m, dtype, with_bias):
+    """Covers both A paths: staged in LDS when n*k fits 64 KB, else streamed."""
+    torch.manual_seed(0)
+    xavier = math.sqrt(2 / k)
+    A = (torch.rand(n, k, dtype=dtype, device="cuda") * 2 - 1) * xavier
+    B = (torch.rand(m, k, dtype=dtype, device="cuda") * 2 - 1) * xavier
+    bias = torch.rand(m, dtype=dtype, device="cuda") if with_bias else None
+
+    out = ops.wvSplitK_rdna2(B, A, bias)
+    ref_bias = bias.float() if bias is not None else None
+    ref = torch.nn.functional.linear(A.float(), B.float(), ref_bias).to(dtype)
+    atol = torch.finfo(dtype).eps * math.sqrt(k)
+    torch.testing.assert_close(out, ref, atol=atol, rtol=1e-2)
 
 
 @pytest.mark.parametrize("n,k,m", NKM_FACTORS_WVSPLITK_FP8)

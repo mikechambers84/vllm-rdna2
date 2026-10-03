@@ -15,6 +15,7 @@ if current_platform.is_cuda():
     )
 
 from vllm.model_executor.layers import utils
+from vllm.platforms.rocm import on_gfx10 as _on_gfx10
 
 
 @pytest.mark.parametrize("m", [1, 128])
@@ -25,6 +26,7 @@ def test_rocm_unquantized_gemm_gfx1x_wvsplitk_path(monkeypatch, m):
     monkeypatch.setattr(utils, "use_aiter_triton_gemm", lambda *args: False)
     monkeypatch.setattr(utils.envs, "VLLM_ROCM_USE_SKINNY_GEMM", True)
     monkeypatch.setattr("vllm.platforms.rocm.on_gfx1x", lambda: True)
+    monkeypatch.setattr("vllm.platforms.rocm.on_gfx1030", lambda: False)
     monkeypatch.setattr("vllm.platforms.rocm.on_gfx9", lambda: False)
     monkeypatch.setattr("vllm.platforms.rocm.on_gfx950", lambda: False)
     monkeypatch.setattr("vllm.platforms.rocm.on_gfx1250", lambda: False)
@@ -41,6 +43,38 @@ def test_rocm_unquantized_gemm_gfx1x_wvsplitk_path(monkeypatch, m):
     wvsplitk_mock.assert_called_once()
     llmm1_mock.assert_not_called()
     assert torch.allclose(out, ref, atol=1e-3, rtol=1e-3)
+
+
+@pytest.mark.parametrize(
+    "n, m, k, expect_rdna2",
+    [
+        (1, 248320, 5120, True),  # lm_head
+        (8, 96, 5120, True),  # tiny projection, rocBLAS is launch-bound
+        (16, 248320, 5120, False),  # too many tokens for a GEMV
+        (1, 1024, 2048, False),  # mid-size weight at narrow K
+    ],
+)
+def test_rocm_unquantized_gemm_gfx1030_rdna2_gemv_routing(
+    monkeypatch, n, m, k, expect_rdna2
+):
+    x = torch.randn(n, k, dtype=torch.float16)
+    weight = torch.empty(m, k, dtype=torch.float16)
+
+    monkeypatch.setattr(utils, "use_aiter_triton_gemm", lambda *args: False)
+    monkeypatch.setattr(utils.envs, "VLLM_ROCM_USE_SKINNY_GEMM", True)
+    monkeypatch.setattr("vllm.platforms.rocm.on_gfx1030", lambda: True)
+    monkeypatch.setattr("vllm.platforms.rocm.on_gfx1x", lambda: False)
+    monkeypatch.setattr("vllm.platforms.rocm.on_gfx9", lambda: False)
+    monkeypatch.setattr("vllm.platforms.rocm.on_gfx950", lambda: False)
+    rdna2_mock = MagicMock(return_value=torch.empty(n, m, dtype=torch.float16))
+    monkeypatch.setattr(utils.ops, "wvSplitK_rdna2", rdna2_mock)
+    linear_mock = MagicMock(return_value=torch.empty(n, m, dtype=torch.float16))
+    monkeypatch.setattr(torch.nn.functional, "linear", linear_mock)
+
+    utils.rocm_unquantized_gemm_impl(x, weight, None)
+
+    assert rdna2_mock.called is expect_rdna2
+    assert linear_mock.called is not expect_rdna2
 
 
 @pytest.mark.skipif(not current_platform.is_rocm(), reason="ROCm-only kernel test")
@@ -66,6 +100,7 @@ def test_rocm_unquantized_gemm_makes_skinny_activation_contiguous(monkeypatch):
     monkeypatch.setattr(utils, "use_aiter_triton_gemm", lambda *args: False)
     monkeypatch.setattr(utils.envs, "VLLM_ROCM_USE_SKINNY_GEMM", True)
     monkeypatch.setattr("vllm.platforms.rocm.on_gfx1x", lambda: True)
+    monkeypatch.setattr("vllm.platforms.rocm.on_gfx1030", lambda: False)
     monkeypatch.setattr("vllm.platforms.rocm.on_gfx9", lambda: False)
     monkeypatch.setattr("vllm.platforms.rocm.on_gfx950", lambda: False)
     monkeypatch.setattr("vllm.platforms.rocm.on_gfx1250", lambda: False)
@@ -92,6 +127,7 @@ def test_rocm_unquantized_gemm_makes_llmm1_activation_contiguous(monkeypatch):
     monkeypatch.setattr(utils, "use_aiter_triton_gemm", lambda *args: False)
     monkeypatch.setattr(utils.envs, "VLLM_ROCM_USE_SKINNY_GEMM", True)
     monkeypatch.setattr("vllm.platforms.rocm.on_gfx1x", lambda: True)
+    monkeypatch.setattr("vllm.platforms.rocm.on_gfx1030", lambda: False)
     monkeypatch.setattr("vllm.platforms.rocm.on_gfx9", lambda: False)
     monkeypatch.setattr("vllm.platforms.rocm.on_gfx950", lambda: False)
     monkeypatch.setattr("vllm.platforms.rocm.on_gfx1250", lambda: False)
@@ -127,6 +163,7 @@ def test_rocm_unquantized_gemm_rejects_unsupported_skinny_layouts(
     monkeypatch.setattr(utils.rocm_aiter_ops, "is_tgemm_enabled", lambda: False)
     monkeypatch.setattr(utils.envs, "VLLM_ROCM_USE_SKINNY_GEMM", True)
     monkeypatch.setattr("vllm.platforms.rocm.on_gfx1x", lambda: True)
+    monkeypatch.setattr("vllm.platforms.rocm.on_gfx1030", lambda: False)
     monkeypatch.setattr("vllm.platforms.rocm.on_gfx9", lambda: False)
     monkeypatch.setattr("vllm.platforms.rocm.on_gfx950", lambda: False)
     monkeypatch.setattr("vllm.platforms.rocm.on_gfx1250", lambda: False)
@@ -146,6 +183,9 @@ def test_rocm_unquantized_gemm_rejects_unsupported_skinny_layouts(
 
 
 @pytest.mark.skipif(not current_platform.is_rocm(), reason="ROCm-only kernel test")
+@pytest.mark.skipif(
+    current_platform.is_rocm() and _on_gfx10(), reason="wvSplitK not used on gfx10"
+)
 @pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
 def test_rocm_unquantized_gemm_noncontiguous_activation_real_kernel(monkeypatch, dtype):
     x = torch.randn(64, 4, device="cuda", dtype=dtype).t()
@@ -174,6 +214,7 @@ def test_rocm_unquantized_gemm_gfx1x_n_gt_5_falls_back(monkeypatch, m):
     monkeypatch.setattr(utils, "use_aiter_triton_gemm", lambda *args: False)
     monkeypatch.setattr(utils.envs, "VLLM_ROCM_USE_SKINNY_GEMM", True)
     monkeypatch.setattr("vllm.platforms.rocm.on_gfx1x", lambda: True)
+    monkeypatch.setattr("vllm.platforms.rocm.on_gfx1030", lambda: False)
     monkeypatch.setattr("vllm.platforms.rocm.on_gfx9", lambda: False)
     monkeypatch.setattr("vllm.platforms.rocm.on_gfx950", lambda: False)
     monkeypatch.setattr("vllm.platforms.rocm.on_gfx1250", lambda: False)
