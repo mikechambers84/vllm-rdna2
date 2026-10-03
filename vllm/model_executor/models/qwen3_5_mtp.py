@@ -7,6 +7,7 @@ from collections.abc import Iterable
 import torch
 from torch import nn
 
+import vllm.envs as envs
 from vllm.compilation.decorators import support_torch_compile
 from vllm.config import VllmConfig
 from vllm.distributed import get_pp_group, tensor_model_parallel_all_gather
@@ -16,6 +17,7 @@ from vllm.model_executor.layers.fused_moe.utils import (
 )
 from vllm.model_executor.layers.linear import ColumnParallelLinear
 from vllm.model_executor.layers.logits_processor import LogitsProcessor
+from vllm.model_executor.layers.utils import dispatch_unquantized_gemm
 from vllm.model_executor.layers.vocab_parallel_embedding import (
     ParallelLMHead,
     VocabParallelEmbedding,
@@ -298,7 +300,28 @@ class Qwen3_5MTP(LocalArgmaxMixin, nn.Module, SupportsMultiModal, SupportsPP):
         hidden_states: torch.Tensor,
         spec_step_idx: int = 0,
     ) -> torch.Tensor | None:
+        draft_vocab = envs.VLLM_MTP_DRAFT_VOCAB_SIZE
+        if (
+            0 < draft_vocab < self.logits_processor.org_vocab_size
+            and self.lm_head.tp_size == 1
+        ):
+            return self._compute_prefix_logits(hidden_states, draft_vocab)
         return self.logits_processor(self.lm_head, hidden_states)
+
+    def _compute_prefix_logits(
+        self, hidden_states: torch.Tensor, draft_vocab: int
+    ) -> torch.Tensor:
+        # Only the first draft_vocab rows of lm_head are read; the other tokens
+        # get -inf, i.e. zero draft probability.
+        prefix = dispatch_unquantized_gemm()(
+            self.lm_head, hidden_states, self.lm_head.weight[:draft_vocab]
+        )
+        logits = prefix.new_full(
+            (hidden_states.shape[0], self.logits_processor.org_vocab_size),
+            float("-inf"),
+        )
+        logits[:, :draft_vocab] = prefix
+        return logits
 
     def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
         def remap_weight_names(weights):

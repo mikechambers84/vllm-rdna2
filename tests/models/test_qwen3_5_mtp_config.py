@@ -1,10 +1,13 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
-"""CPU-only tests for Qwen3.5 MTP speculative decoding config overrides."""
+"""CPU-only tests for Qwen3.5 MTP speculative decoding: config overrides and
+draft logits."""
 
+import types
 from typing import Any
 
 import pytest
+import torch
 from transformers import AutoConfig, PreTrainedConfig
 
 from vllm.config.speculative import SpeculativeConfig
@@ -119,3 +122,27 @@ def test_mtp_override_downloads_real_hf_hub_configs(
     assert cfg.model_type == "qwen3_5_mtp"
     assert cfg.architectures == [expected_arch]
     assert cfg.n_predict == 1
+
+
+def test_mtp_draft_vocab_prefix_logits(monkeypatch: pytest.MonkeyPatch) -> None:
+    """VLLM_MTP_DRAFT_VOCAB_SIZE keeps draft logits for the first N token ids
+    and gives every other id -inf, so drafts only propose prefix ids."""
+    from vllm.model_executor.models.qwen3_5_mtp import Qwen3_5MTP
+
+    monkeypatch.setenv("VLLM_MTP_DRAFT_VOCAB_SIZE", "8")
+    torch.manual_seed(0)
+    hidden = torch.randn(3, 16)
+    weight = torch.randn(32, 16)
+    model = types.SimpleNamespace(
+        lm_head=types.SimpleNamespace(weight=weight, tp_size=1),
+        logits_processor=types.SimpleNamespace(org_vocab_size=32),
+    )
+    model._compute_prefix_logits = types.MethodType(
+        Qwen3_5MTP._compute_prefix_logits, model
+    )
+
+    logits = Qwen3_5MTP.compute_logits(model, hidden)
+
+    assert logits.shape == (3, 32)
+    torch.testing.assert_close(logits[:, :8], hidden @ weight[:8].T)
+    assert torch.isneginf(logits[:, 8:]).all()
