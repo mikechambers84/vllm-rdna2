@@ -29,6 +29,12 @@ torch::Tensor wvSplitK_rdna2(const at::Tensor& in_a, const at::Tensor& in_b,
                              const std::optional<at::ScalarType>& out_dtype,
                              const std::optional<at::Tensor>& out_opt);
 
+torch::Tensor w8a8_gemv_rdna2(const at::Tensor& a, const at::Tensor& w,
+                              const at::Tensor& scale_a,
+                              const at::Tensor& scale_b,
+                              const std::optional<at::Tensor>& bias,
+                              at::ScalarType out_dtype);
+
 torch::Tensor gptq_gemm_rdna3(torch::Tensor a, torch::Tensor b_q_weight,
                               torch::Tensor b_qzeros, torch::Tensor b_scales,
                               bool use_v2_format);

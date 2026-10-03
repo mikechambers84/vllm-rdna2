@@ -59,6 +59,11 @@ TORCH_LIBRARY_EXPAND(TORCH_EXTENSION_NAME, rocm_ops) {
       "wvSplitK_rdna2(Tensor in_a, Tensor in_b, Tensor? in_bias, "
       "ScalarType? out_dtype, Tensor(a!)? out) -> Tensor");
   rocm_ops.impl("wvSplitK_rdna2", torch::kCUDA, &wvSplitK_rdna2);
+  // W8A8 int8 GEMV (M <= 8) on v_dot4_i32_i8 for decode.
+  rocm_ops.def(
+      "w8a8_gemv_rdna2(Tensor a, Tensor w, Tensor scale_a, Tensor scale_b, "
+      "Tensor? bias, ScalarType out_dtype) -> Tensor");
+  rocm_ops.impl("w8a8_gemv_rdna2", torch::kCUDA, &w8a8_gemv_rdna2);
 #endif  // VLLM_ROCM_GFX1030
 
 #ifdef VLLM_ROCM_GFX1100

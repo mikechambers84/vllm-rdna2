@@ -1,9 +1,11 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
+from functools import cache
 
 import torch
 
+import vllm.envs as envs
 from vllm import _custom_ops as ops
 from vllm.model_executor.layers.quantization.compressed_tensors.triton_scaled_mm import (  # noqa: E501
     triton_scaled_mm,
@@ -154,6 +156,34 @@ class TritonInt8ScaledMMLinearKernel(CutlassInt8ScaledMMLinearKernel):
         return out
 
 
+@cache
+def _rdna2_w8a8_gemv_available() -> bool:
+    if not (current_platform.is_rocm() and envs.VLLM_ROCM_USE_SKINNY_GEMM):
+        return False
+    from vllm.platforms.rocm import on_gfx1030
+
+    return on_gfx1030() and hasattr(torch.ops._rocm_C, "w8a8_gemv_rdna2")
+
+
+def _use_rdna2_w8a8_gemv(
+    x_q: torch.Tensor,
+    w_q: torch.Tensor,
+    x_s: torch.Tensor,
+    w_s: torch.Tensor,
+    out_dtype: torch.dtype,
+) -> bool:
+    # w_q is the [K, N] view of [N, K] weight rows.
+    return (
+        x_q.shape[0] <= 8
+        and x_q.shape[1] % 16 == 0
+        and x_q.is_contiguous()
+        and w_q.stride(0) == 1
+        and x_s.dtype == w_s.dtype == torch.float32
+        and out_dtype in (torch.float16, torch.bfloat16)
+        and _rdna2_w8a8_gemv_available()
+    )
+
+
 def _triton_int8_scaled_mm_func(
     x_q: torch.Tensor,
     w_q: torch.Tensor,
@@ -162,6 +192,12 @@ def _triton_int8_scaled_mm_func(
     out_dtype: torch.dtype,
     bias: torch.Tensor | None = None,
 ) -> torch.Tensor:
+    # gfx1030 decode: the v_dot4 GEMV streams the weights at ~95% of bandwidth,
+    # 2.1-2.3x the Triton kernel, with identical (int32-accumulated) results.
+    if _use_rdna2_w8a8_gemv(x_q, w_q, x_s, w_s, out_dtype):
+        return ops.w8a8_gemv_rdna2(
+            x_q, w_q.t(), x_s.contiguous(), w_s.contiguous(), out_dtype, bias
+        )
     return triton_scaled_mm(x_q, w_q, x_s, w_s, out_dtype, bias)
 
 
@@ -176,7 +212,7 @@ def _triton_int8_scaled_mm_fake(
     return torch.empty((x_q.size(0), w_q.size(1)), dtype=out_dtype, device=x_q.device)
 
 
-# Opaque to Dynamo: triton_scaled_mm picks its tile from M, which must be the
+# Opaque to Dynamo: the kernel and its tile are picked from M, which must be the
 # runtime M, not the symbolic M that torch.compile traced with.
 direct_register_custom_op(
     "triton_int8_scaled_mm",
