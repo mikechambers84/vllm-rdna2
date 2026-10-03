@@ -14,6 +14,17 @@ from vllm.scalar_type import scalar_types
 
 from .MPLinearKernel import MPLinearKernel, MPLinearLayerConfig
 
+# Per-device buffer for the reconstruct path (the dequantized fp16 weight fed to
+# the prefill GEMM), sized for the largest Exllama layer. Reserved at load time
+# so CUDA graphs never allocate it.
+_dq_workspaces: dict[torch.device, torch.Tensor] = {}
+
+
+def _reserve_dq_workspace(numel: int, dtype: torch.dtype, device: torch.device):
+    workspace = _dq_workspaces.get(device)
+    if workspace is None or workspace.numel() < numel or workspace.dtype != dtype:
+        _dq_workspaces[device] = torch.empty(numel, dtype=dtype, device=device)
+
 
 class ExllamaLinearKernel(MPLinearKernel):
     SUPPORTED_QUANT_TYPES = [scalar_types.uint4b8, scalar_types.uint8b128]
@@ -120,6 +131,9 @@ class ExllamaLinearKernel(MPLinearKernel):
         self._transform_param(layer, self.w_q_name, transform_w_q)
         self._transform_param(layer, self.w_s_name, transform_w_s)
 
+        k, n = c.partition_weight_shape
+        _reserve_dq_workspace(k * n, c.act_type, getattr(layer, self.w_q_name).device)
+
     def apply_weights(
         self,
         layer: torch.nn.Module,
@@ -139,7 +153,14 @@ class ExllamaLinearKernel(MPLinearKernel):
 
         assert w_zp is not None, "Zero points are required by Exllama"
         output = ops.gptq_gemm(
-            x_2d, w_q, w_zp, w_s, True, use_v2_format, c.weight_type.size_bits
+            x_2d,
+            w_q,
+            w_zp,
+            w_s,
+            True,
+            use_v2_format,
+            c.weight_type.size_bits,
+            _dq_workspaces.get(x_2d.device),
         )
 
         if bias is not None:

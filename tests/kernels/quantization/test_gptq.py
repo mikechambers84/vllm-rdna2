@@ -68,11 +68,13 @@ def test_gptq_gemm_int4_matches_reference(m, k, n):
 
 def test_gptq_gemm_reconstruct_path_cuda_graph():
     """The reconstruct path (m > 50) calls into BLAS; vLLM captures it in
-    piecewise CUDA/HIP graphs, so capture and replay must reproduce eager."""
+    piecewise CUDA/HIP graphs, so capture and replay must reproduce eager,
+    also when the dequantized weight goes to a caller-owned workspace."""
     torch.manual_seed(0)
     w_q, zeros, scales, _ = _gptq_int4_sym(1024, 1024, 32)
     a = torch.randn(64, 1024, device="cuda", dtype=torch.float16)
     args = (a, w_q, zeros, scales, True, False, 4)
+    workspace = torch.empty(1024 * 1024, device="cuda", dtype=torch.float16)
     side = torch.cuda.Stream()
     side.wait_stream(torch.cuda.current_stream())
     with torch.cuda.stream(side):
@@ -80,7 +82,7 @@ def test_gptq_gemm_reconstruct_path_cuda_graph():
     torch.cuda.current_stream().wait_stream(side)
     graph = torch.cuda.CUDAGraph()
     with torch.cuda.graph(graph):
-        out = ops.gptq_gemm(*args)
+        out = ops.gptq_gemm(*args, workspace)
     graph.replay()
     torch.accelerator.synchronize()
     torch.testing.assert_close(out, eager)

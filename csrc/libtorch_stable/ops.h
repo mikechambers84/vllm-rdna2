@@ -624,12 +624,11 @@ void dynamic_per_token_scaled_fp8_quant(
     std::optional<torch::stable::Tensor> const& scale_ub);
 
 // GPTQ kernels (shared CUDA/ROCm)
-torch::stable::Tensor gptq_gemm(torch::stable::Tensor a,
-                                torch::stable::Tensor b_q_weight,
-                                torch::stable::Tensor b_gptq_qzeros,
-                                torch::stable::Tensor b_gptq_scales,
-                                bool use_exllama, bool use_v2_format,
-                                int64_t bit);
+torch::stable::Tensor gptq_gemm(
+    torch::stable::Tensor a, torch::stable::Tensor b_q_weight,
+    torch::stable::Tensor b_gptq_qzeros, torch::stable::Tensor b_gptq_scales,
+    bool use_exllama, bool use_v2_format, int64_t bit,
+    std::optional<torch::stable::Tensor> const& workspace);
 
 void gptq_shuffle(torch::stable::Tensor q_weight, int64_t bit);
 

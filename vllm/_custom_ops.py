@@ -625,6 +625,7 @@ def gptq_gemm(
     use_exllama: bool,
     use_v2_format: bool,
     bit: int,
+    workspace: torch.Tensor | None = None,
 ) -> torch.Tensor:
     return torch.ops._C.gptq_gemm(
         a,
@@ -634,6 +635,7 @@ def gptq_gemm(
         use_exllama,
         use_v2_format,
         bit,
+        workspace,
     )
 
 
@@ -648,6 +650,7 @@ if hasattr(torch.ops._C, "gptq_gemm"):
         use_exllama: bool,
         use_v2_format: bool,
         bit: int,
+        workspace: torch.Tensor | None = None,
     ) -> torch.Tensor:
         return torch.empty(
             (a.size(0), b_q_weight.size(1)), dtype=a.dtype, device=a.device

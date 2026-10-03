@@ -1333,22 +1333,25 @@ void reconstruct_gptq(const uint32_t* b_q_weight, const uint32_t* b_gptq_qzeros,
                                            use_v2_format, out);
 }
 
+// Whether gemm_half_q_half_cuda dequantizes the weight into temp_dq and runs a
+// BLAS GEMM instead of a quantized matmul kernel.
+bool uses_reconstruct(int size_m, bool use_exllama, int bit) {
+  if (use_exllama) {
+    return (bit == 8 && size_m > MAX_Q_GEMM_ROWS_8BIT) ||
+           (bit != 8 && size_m > MAX_Q_GEMM_ROWS);
+  }
+  // The 2/3-bit kernels are somehow slower than dequant + gemm baseline, so
+  // we disabled them for now.
+  return bit < 4 || size_m > MAX_ALT_GEMM_ROWS;
+}
+
 void gemm_half_q_half_cuda(cublasHandle_t cublas_handle, const half* a,
                            const uint32_t* b_q_weight,
                            const uint32_t* b_gptq_qzeros,
                            const half* b_gptq_scales, half* c, half* temp_dq,
                            int size_m, int size_n, int size_k, int groups,
                            bool use_exllama, bool use_v2_format, int bit) {
-  bool use_reconstruct;
-  if (use_exllama) {
-    use_reconstruct = ((bit == 8 && size_m > MAX_Q_GEMM_ROWS_8BIT) ||
-                       (bit != 8 && size_m > MAX_Q_GEMM_ROWS));
-  } else {
-    // The 2/3-bit kernels are somehow slower than dequant + gemm baseline, so
-    // we disabled them for now.
-    use_reconstruct = (bit < 4 || size_m > MAX_ALT_GEMM_ROWS);
-  }
-  if (use_reconstruct) {
+  if (uses_reconstruct(size_m, use_exllama, bit)) {
     // Reconstruct FP16 matrix, then cuBLAS
     if (use_exllama) {
       reconstruct_exllama(b_q_weight, b_gptq_qzeros, b_gptq_scales, temp_dq,
@@ -1472,12 +1475,11 @@ void shuffle_exllama_weight(uint32_t* q_weight, int height, int width,
 }  // namespace gptq
 }  // namespace vllm
 
-torch::stable::Tensor gptq_gemm(torch::stable::Tensor a,
-                                torch::stable::Tensor b_q_weight,
-                                torch::stable::Tensor b_gptq_qzeros,
-                                torch::stable::Tensor b_gptq_scales,
-                                bool use_exllama, bool use_v2_format,
-                                int64_t bit) {
+torch::stable::Tensor gptq_gemm(
+    torch::stable::Tensor a, torch::stable::Tensor b_q_weight,
+    torch::stable::Tensor b_gptq_qzeros, torch::stable::Tensor b_gptq_scales,
+    bool use_exllama, bool use_v2_format, int64_t bit,
+    std::optional<torch::stable::Tensor> const& workspace) {
   const torch::stable::accelerator::DeviceGuard device_guard(
       a.get_device_index());
   const int64_t num_groups = b_gptq_qzeros.size(0);
@@ -1488,16 +1490,32 @@ torch::stable::Tensor gptq_gemm(torch::stable::Tensor a,
   STD_TORCH_CHECK(a.size(1) % num_groups == 0, "Input size K = ", a.size(1),
                   " is not divisible by the number of groups = ", num_groups);
   auto c = torch::stable::new_zeros(a, {a.size(0), b_q_weight.size(1)});
-  auto temp_dq =
-      torch::stable::empty({b_q_weight.size(0) * 32 / bit, b_q_weight.size(1)},
-                           a.scalar_type(), std::nullopt, a.device());
+
+  // The dequantized fp16 weight is only needed by the reconstruct path. A
+  // caller-owned workspace keeps this per-call buffer (up to a full layer)
+  // out of the allocations captured into CUDA graph memory pools.
+  const int64_t dq_rows = b_q_weight.size(0) * 32 / bit;
+  const int64_t dq_numel = dq_rows * b_q_weight.size(1);
+  std::optional<torch::stable::Tensor> temp_dq;
+  half* temp_dq_ptr = nullptr;
+  if (vllm::gptq::uses_reconstruct(c.size(0), use_exllama, bit)) {
+    if (workspace.has_value() && workspace->numel() >= dq_numel) {
+      STD_TORCH_CHECK(workspace->scalar_type() == a.scalar_type() &&
+                          workspace->get_device_index() == a.get_device_index(),
+                      "GPTQ workspace must match the input dtype and device");
+      temp_dq_ptr = (half*)workspace->data_ptr();
+    } else {
+      temp_dq = torch::stable::empty({dq_rows, b_q_weight.size(1)},
+                                     a.scalar_type(), std::nullopt, a.device());
+      temp_dq_ptr = (half*)temp_dq->data_ptr();
+    }
+  }
 
   vllm::gptq::gemm_half_q_half_cuda(
       get_current_cuda_blas_handle(), (const half*)a.data_ptr(),
       (const uint32_t*)b_q_weight.data_ptr(),
       (const uint32_t*)b_gptq_qzeros.data_ptr(),
-      (const half*)b_gptq_scales.data_ptr(), (half*)c.data_ptr(),
-      (half*)temp_dq.data_ptr(),
+      (const half*)b_gptq_scales.data_ptr(), (half*)c.data_ptr(), temp_dq_ptr,
       c.size(0),  // m
       c.size(1),  // n
       a.size(1),  // k
