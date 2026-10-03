@@ -145,6 +145,27 @@ def test_capability_from_gcn_arch_raises_for_malformed(gcn_arch):
         _capability_from_gcn_arch(gcn_arch)
 
 
+@pytest.mark.parametrize("on_gfx10", [True, False])
+def test_gfx10_capability_does_not_match_blackwell(on_gfx10, monkeypatch):
+    """gfx1030 parses to (10, 3), the same as NVIDIA SM103; Blackwell-only
+    checks (cutlass warmups, B200 attention tiles) must not fire on RDNA2."""
+    import vllm.platforms.rocm as rocm
+    from vllm.platforms.interface import DeviceCapability
+
+    monkeypatch.setattr(rocm, "_ON_GFX10", on_gfx10)
+    monkeypatch.setattr(
+        rocm.RocmPlatform,
+        "get_device_capability",
+        classmethod(lambda cls, device_id=0: DeviceCapability(10, 3)),
+    )
+    platform = rocm.RocmPlatform
+    expected = not on_gfx10
+    assert platform.is_device_capability_family(100) is expected
+    assert platform.is_device_capability((10, 3)) is expected
+    assert platform.is_device_capability(103) is expected
+    assert platform.has_device_capability(90)
+
+
 # ---------------------------------------------------------------------------
 # AITER ops availability tests
 # ---------------------------------------------------------------------------

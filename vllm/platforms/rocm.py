@@ -85,6 +85,8 @@ _ROCM_DEVICE_ID_NAME_MAP: dict[str, str] = {
     # RDNA 4 discrete (Navi 48)
     "0x7550": "AMD_Radeon_RX9070XT",  # gfx1201
     "0x7551": "AMD_Radeon_R9700",  # gfx1201
+    # RDNA 2 (Navi 21)
+    "0x73a1": "AMD_Radeon_Pro_V620",  # gfx1030
 }
 
 
@@ -220,6 +222,10 @@ _ON_GFX90A = "gfx90a" in _GCN_ARCH
 _ON_GFX942 = "gfx942" in _GCN_ARCH
 _ON_GFX950 = "gfx950" in _GCN_ARCH
 _ON_GFX1250 = "gfx1250" in _GCN_ARCH
+# RDNA1/RDNA2. Deliberately not part of _ON_GFX1X: the gfx11/gfx12 kernels
+# need WMMA or bf16 dot instructions that gfx10 lacks.
+_ON_GFX10 = "gfx10" in _GCN_ARCH
+_ON_GFX1030 = "gfx1030" in _GCN_ARCH
 
 _ON_CDNA = any(arch in _GCN_ARCH for arch in ["gfx9", "gfx1250"])
 # RDNA = gfx11/gfx12 minus the CDNA-classified gfx1250.
@@ -300,6 +306,14 @@ def _capability_from_gcn_arch(gcn_arch: str) -> tuple[int, int] | None:
 
 def on_gfx1x() -> bool:
     return _ON_GFX1X and not _ON_CDNA
+
+
+def on_gfx10() -> bool:
+    return _ON_GFX10
+
+
+def on_gfx1030() -> bool:
+    return _ON_GFX1030
 
 
 def on_gfx11() -> bool:
@@ -888,6 +902,29 @@ class RocmPlatform(Platform):
         )
         major, minor = torch.cuda.get_device_capability(device_id)
         return DeviceCapability(major=major, minor=minor)
+
+    # gfx10xx parses to capability (10, x), which collides with NVIDIA
+    # Blackwell (10.0, 10.3) checks; none of those apply to RDNA1/RDNA2.
+    @classmethod
+    def is_device_capability(
+        cls,
+        capability: tuple[int, int] | int,
+        device_id: int = 0,
+    ) -> bool:
+        major = capability[0] if isinstance(capability, tuple) else capability // 10
+        if _ON_GFX10 and major == 10:
+            return False
+        return super().is_device_capability(capability, device_id)
+
+    @classmethod
+    def is_device_capability_family(
+        cls,
+        capability: int,
+        device_id: int = 0,
+    ) -> bool:
+        if _ON_GFX10 and capability // 10 == 10:
+            return False
+        return super().is_device_capability_family(capability, device_id)
 
     @classmethod
     @with_amdsmi_context
