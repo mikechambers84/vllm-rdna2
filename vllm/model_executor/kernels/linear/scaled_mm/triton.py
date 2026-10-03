@@ -131,9 +131,7 @@ class TritonInt8ScaledMMLinearKernel(CutlassInt8ScaledMMLinearKernel):
             x.contiguous(), i_s, i_zp, symmetric=symmetric
         )
 
-        out = triton_scaled_mm(
-            x_q, w_q, scale_a=x_s, scale_b=w_s, out_dtype=x.dtype, bias=bias
-        )
+        out = torch.ops.vllm.triton_int8_scaled_mm(x_q, w_q, x_s, w_s, x.dtype, bias)
 
         if azp_adj is not None:
             # Asymmetric quantization: subtract the zero-point correction.
@@ -154,6 +152,37 @@ class TritonInt8ScaledMMLinearKernel(CutlassInt8ScaledMMLinearKernel):
                 out -= (x_s * w_s_row * azp_adj).to(x.dtype)
 
         return out
+
+
+def _triton_int8_scaled_mm_func(
+    x_q: torch.Tensor,
+    w_q: torch.Tensor,
+    x_s: torch.Tensor,
+    w_s: torch.Tensor,
+    out_dtype: torch.dtype,
+    bias: torch.Tensor | None = None,
+) -> torch.Tensor:
+    return triton_scaled_mm(x_q, w_q, x_s, w_s, out_dtype, bias)
+
+
+def _triton_int8_scaled_mm_fake(
+    x_q: torch.Tensor,
+    w_q: torch.Tensor,
+    x_s: torch.Tensor,
+    w_s: torch.Tensor,
+    out_dtype: torch.dtype,
+    bias: torch.Tensor | None = None,
+) -> torch.Tensor:
+    return torch.empty((x_q.size(0), w_q.size(1)), dtype=out_dtype, device=x_q.device)
+
+
+# Opaque to Dynamo: triton_scaled_mm picks its tile from M, which must be the
+# runtime M, not the symbolic M that torch.compile traced with.
+direct_register_custom_op(
+    "triton_int8_scaled_mm",
+    _triton_int8_scaled_mm_func,
+    fake_impl=_triton_int8_scaled_mm_fake,
+)
 
 
 class TritonFp8BlockScaledMMKernel(Fp8BlockScaledMMLinearKernel):

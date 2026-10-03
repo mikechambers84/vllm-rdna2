@@ -839,6 +839,16 @@ def choose_mp_linear_kernel(
             compute_capability = _cc[0] * 10 + _cc[1]
 
     platform_kernels = _POSSIBLE_KERNELS.get(current_platform._enum, [])
+    if current_platform.is_rocm():
+        from vllm.platforms.rocm import on_gfx10
+
+        if on_gfx10():
+            # On RDNA2 the Exllama HIP kernel is several times faster than
+            # TritonW4A16 at both decode and prefill. It is fp16-only, so bf16
+            # configs still fall through to Triton.
+            platform_kernels = sorted(
+                platform_kernels, key=lambda k: k is not ExllamaLinearKernel
+            )
 
     # Apply --linear-backend filtering when set.
     platform_kernels = _resolve_backend_kernels(

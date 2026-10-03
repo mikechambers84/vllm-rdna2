@@ -2,13 +2,14 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 import builtins
 import logging
-from unittest.mock import mock_open, patch
+from unittest.mock import MagicMock, mock_open, patch
 
 import pytest
 
 from vllm.platforms import (
     _is_amd_zen_cpu,
     cpu_platform_plugin,
+    cuda_platform_plugin,
     resolve_current_platform_cls_qualname,
 )
 
@@ -156,3 +157,20 @@ def test_platform_plugin_failure_is_logged(caplog_vllm):
     assert platform == "vllm.platforms.interface.UnspecifiedPlatform"
     assert "Platform plugin cpu failed during detection" in caplog_vllm.text
     assert "RuntimeError: plugin exploded" in caplog_vllm.text
+
+
+@pytest.mark.parametrize(
+    "hip_version, expected",
+    [("7.14.0", None), (None, "vllm.platforms.cuda.CudaPlatform")],
+)
+def test_cuda_plugin_stays_off_under_rocm_torch(hip_version, expected):
+    """On a mixed AMD+NVIDIA host NVML still sees the NVIDIA GPU; a ROCm build of
+    torch must not also activate the CUDA platform next to ROCm."""
+    pynvml = MagicMock()
+    pynvml.nvmlDeviceGetCount.return_value = 1
+    with (
+        patch("vllm.env_override._get_torch_version_attr", return_value=hip_version),
+        patch("vllm.utils.import_utils.import_pynvml", return_value=pynvml),
+        patch("vllm.platforms.vllm_version_matches_substr", return_value=False),
+    ):
+        assert cuda_platform_plugin() == expected

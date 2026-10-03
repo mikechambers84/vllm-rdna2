@@ -24,6 +24,11 @@ void wvSplitKQ(const at::Tensor& in_a, const at::Tensor& in_b,
                const at::Tensor& scale_a, const at::Tensor& scale_b,
                const int64_t CuCount);
 
+torch::Tensor wvSplitK_rdna2(const at::Tensor& in_a, const at::Tensor& in_b,
+                             const std::optional<at::Tensor>& in_bias,
+                             const std::optional<at::ScalarType>& out_dtype,
+                             const std::optional<at::Tensor>& out_opt);
+
 torch::Tensor gptq_gemm_rdna3(torch::Tensor a, torch::Tensor b_q_weight,
                               torch::Tensor b_qzeros, torch::Tensor b_scales,
                               bool use_v2_format);

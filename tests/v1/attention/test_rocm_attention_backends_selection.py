@@ -31,7 +31,11 @@ def mock_vllm_config():
 @pytest.fixture
 def mock_get_cdna_version():
     """Mock cdna version arch detection to return True."""
-    with patch("vllm.platforms.rocm.get_cdna_version", return_value=3):
+    with (
+        patch("vllm.platforms.rocm.get_cdna_version", return_value=3),
+        # Pretending to be CDNA3 must also hold when the host GPU is gfx10.
+        patch("vllm.platforms.rocm._ON_GFX10", False),
+    ):
         yield
 
 
@@ -672,6 +676,20 @@ def test_auto_selection_for_kv_connector(
         )
 
     assert backend_path == expected_backend.get_path()
+
+
+@pytest.mark.parametrize("use_kv_connector", [False, True])
+def test_gfx10_prefers_triton_attn(use_kv_connector, monkeypatch):
+    """ROCM_ATTN's native paged-attention kernel is a stub on gfx10, so
+    TRITON_ATTN must be tried first there."""
+    import vllm.platforms.rocm as rocm
+
+    monkeypatch.setattr(rocm, "_ON_GFX10", True)
+    backends = rocm._get_backend_priorities(
+        use_mla=False, use_sparse=False, use_kv_connector=use_kv_connector
+    )
+    assert backends[0] == AttentionBackendEnum.TRITON_ATTN
+    assert (AttentionBackendEnum.ROCM_ATTN in backends) is not use_kv_connector
 
 
 def test_unified_attn_prefers_block_contiguous_layout():

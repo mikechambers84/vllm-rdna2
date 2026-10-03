@@ -53,6 +53,14 @@ TORCH_LIBRARY_EXPAND(TORCH_EXTENSION_NAME, rocm_ops) {
   rocm_ops.impl("wvSplitKQ", torch::kCUDA, &wvSplitKQ);
 #endif  // VLLM_SKIP_SKINNY_GEMMS
 
+#ifdef VLLM_ROCM_GFX1030
+  // fp16/bf16 skinny GEMV (N <= 16) for RDNA2, where wvSplitK is unavailable.
+  rocm_ops.def(
+      "wvSplitK_rdna2(Tensor in_a, Tensor in_b, Tensor? in_bias, "
+      "ScalarType? out_dtype, Tensor(a!)? out) -> Tensor");
+  rocm_ops.impl("wvSplitK_rdna2", torch::kCUDA, &wvSplitK_rdna2);
+#endif  // VLLM_ROCM_GFX1030
+
 #ifdef VLLM_ROCM_GFX1100
   // W4A16 GPTQ kernels for AMD RDNA3 (gfx1100).
   rocm_ops.def(

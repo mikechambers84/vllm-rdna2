@@ -19,7 +19,7 @@ from vllm.platforms import current_platform
 from vllm.platforms.cpu import CpuPlatform
 from vllm.platforms.cuda import CudaPlatform
 from vllm.platforms.interface import DeviceCapability
-from vllm.platforms.rocm import RocmPlatform, on_mi3xx
+from vllm.platforms.rocm import RocmPlatform, on_gfx10, on_mi3xx
 from vllm.utils.torch_utils import set_default_torch_dtype, set_random_seed
 from vllm.v1.attention.backends.registry import AttentionBackendEnum
 from vllm.v1.attention.selector import _cached_get_attn_backend
@@ -58,11 +58,26 @@ def test_mha_attn_platform(default_vllm_config, device: str):
             attn = MMEncoderAttention(16, 64, scale=1)
             assert attn.attn_backend == AttentionBackendEnum.TORCH_SDPA
     elif device == "hip":
+        # gfx10 has no flash attention path and SDPA's math fallback runs out of
+        # memory on the encoder profiling image.
         with (
             patch("vllm.model_executor.models.vision.current_platform", RocmPlatform()),
+            patch("vllm.platforms.rocm.on_cdna", return_value=False),
+            patch("vllm.platforms.rocm.on_gfx1x", return_value=False),
+            patch("vllm.platforms.rocm._ON_GFX10", True),
         ):
-            attn = MMEncoderAttention(16, 64, scale=1)
-            assert attn.attn_backend == AttentionBackendEnum.FLASH_ATTN
+            attn = MMEncoderAttention(16, 72, scale=1)
+            assert attn.attn_backend == AttentionBackendEnum.TRITON_ATTN
+
+        if not on_gfx10():
+            with (
+                patch(
+                    "vllm.model_executor.models.vision.current_platform",
+                    RocmPlatform(),
+                ),
+            ):
+                attn = MMEncoderAttention(16, 64, scale=1)
+                assert attn.attn_backend == AttentionBackendEnum.FLASH_ATTN
     else:
         # Test CUDA with head_size=64 (divisible by 32)
         # - should use vLLM's FlashAttention

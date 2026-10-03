@@ -2094,6 +2094,13 @@ def wvSplitK(
     return torch.ops._rocm_C.wvSplitK(a, b, bias, cu_count)
 
 
+def wvSplitK_rdna2(
+    a: torch.Tensor, b: torch.Tensor, bias: torch.Tensor | None = None
+) -> torch.Tensor:
+    """RDNA2 skinny GEMV: returns ``b @ a.T (+ bias)`` for ``b`` of <= 16 rows."""
+    return torch.ops._rocm_C.wvSplitK_rdna2(a, b, bias, None, None)
+
+
 def wvSplitK_int4_g(
     weight: torch.Tensor,
     activation: torch.Tensor,

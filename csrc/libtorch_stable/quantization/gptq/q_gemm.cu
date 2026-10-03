@@ -33,17 +33,25 @@ namespace gptq {
 
 #if defined(USE_ROCM)
   #include <hipblas/hipblas.h>
+// fp16 operands with fp32 accumulation. hipblasHgemm computes in fp16, which
+// costs ~1e-2 relative error at the K sizes the reconstruct path sees.
 __host__ __forceinline__ hipblasStatus_t __compat_hipblasHgemm(
     hipblasHandle_t handle, hipblasOperation_t transA,
     hipblasOperation_t transB, int m, int n, int k, const half* alpha,
     const half* AP, int lda, const half* BP, int ldb, const half* beta,
     half* CP, int ldc) {
-  return hipblasHgemm(handle, transA, transB, m, n, k,
-                      reinterpret_cast<const hipblasHalf*>(alpha),
-                      reinterpret_cast<const hipblasHalf*>(AP), lda,
-                      reinterpret_cast<const hipblasHalf*>(BP), ldb,
-                      reinterpret_cast<const hipblasHalf*>(beta),
-                      reinterpret_cast<hipblasHalf*>(CP), ldc);
+  #ifdef HIPBLAS_V2
+  constexpr auto kHalf = HIP_R_16F;
+  constexpr auto kCompute = HIPBLAS_COMPUTE_32F;
+  #else
+  constexpr auto kHalf = HIPBLAS_R_16F;
+  constexpr auto kCompute = HIPBLAS_R_32F;
+  #endif
+  const float alpha_f = __half2float(*alpha);
+  const float beta_f = __half2float(*beta);
+  return hipblasGemmEx(handle, transA, transB, m, n, k, &alpha_f, AP, kHalf,
+                       lda, BP, kHalf, ldb, &beta_f, CP, kHalf, ldc, kCompute,
+                       HIPBLAS_GEMM_DEFAULT);
 }
   #define hipblasHgemm __compat_hipblasHgemm
 

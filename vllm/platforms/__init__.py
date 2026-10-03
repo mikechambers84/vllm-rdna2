@@ -57,6 +57,13 @@ def tpu_platform_plugin() -> str | None:
 def cuda_platform_plugin() -> str | None:
     is_cuda = False
     logger.debug("Checking if CUDA platform is available.")
+    from vllm.env_override import _get_torch_version_attr
+
+    if _get_torch_version_attr("hip"):
+        # Mixed AMD+NVIDIA host: NVML can see the NVIDIA GPU, but a ROCm build
+        # of PyTorch cannot drive it.
+        logger.debug("CUDA platform is not available because torch is a ROCm build.")
+        return None
     try:
         from vllm.utils.import_utils import import_pynvml
 
