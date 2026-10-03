@@ -885,6 +885,12 @@ class RocmPlatform(Platform):
             )
             return AttentionBackendEnum.FLASH_ATTN
 
+        # SDPA falls back to the math kernel on gfx10, whose full score matrix
+        # does not fit for the encoder profiling image.
+        if _ON_GFX10:
+            logger.info_once("Using Triton attention backend for ViT model on gfx10.")
+            return AttentionBackendEnum.TRITON_ATTN
+
         logger.info_once("Using Torch SDPA backend for ViT model.")
         return AttentionBackendEnum.TORCH_SDPA
 
