@@ -997,6 +997,22 @@ def unified_attention(
         BLOCK_Q = BLOCK_M // num_queries_per_kv
         launch_num_warps = 8
         launch_num_stages = 2
+    elif (
+        head_size == 256
+        and q.dtype == torch.float16
+        and not use_3d
+        and max_seqlen_q > 16
+        and num_queries_per_kv <= 16
+        and _on_gfx10()
+    ):
+        # RDNA2 (64 KB LDS) fp16 prefill: a 128-row Q block with the default
+        # 32-wide KV tile, 8 warps and 2 stages is 2.7-2.8x faster than the
+        # defaults (5.7 vs 2.0 TFLOPS at 8K tokens, 24/4 heads, on a V620).
+        # bf16 has no dot instruction here and its fp32 operands overflow LDS.
+        BLOCK_M = 128
+        BLOCK_Q = BLOCK_M // num_queries_per_kv
+        launch_num_warps = 8
+        launch_num_stages = 2
     elif use_3d and head_size == 256 and q.dtype == torch.float16 and _on_gfx10():
         # RDNA2 split-KV decode / verify: single-stage, 4 warps, 16-wide KV tile
         # (with the backend's 32 segments, 1.5-1.8x over the defaults).
