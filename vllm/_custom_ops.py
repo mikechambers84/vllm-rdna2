@@ -2104,6 +2104,33 @@ def wvSplitK_rdna2(
     return torch.ops._rocm_C.wvSplitK_rdna2(a, b, bias, None, None)
 
 
+def w8a8_gemv_rdna2(
+    a: torch.Tensor,
+    w: torch.Tensor,
+    scale_a: torch.Tensor,
+    scale_b: torch.Tensor,
+    out_dtype: torch.dtype,
+    bias: torch.Tensor | None = None,
+) -> torch.Tensor:
+    """RDNA2 int8 GEMV: ``(a @ w.T) * scale_a * scale_b (+ bias)`` for int8
+    ``a`` [M <= 24, K] and ``w`` [N, K]; matches ``triton_scaled_mm`` exactly."""
+    return torch.ops._rocm_C.w8a8_gemv_rdna2(a, w, scale_a, scale_b, bias, out_dtype)
+
+
+def w8a8_gemm_rdna2(
+    a: torch.Tensor,
+    w: torch.Tensor,
+    scale_a: torch.Tensor,
+    scale_b: torch.Tensor,
+    out_dtype: torch.dtype,
+    bias: torch.Tensor | None = None,
+) -> torch.Tensor:
+    """RDNA2 int8 GEMM: ``(a @ w.T) * scale_a * scale_b (+ bias)`` for int8
+    ``a`` [M, K] and ``w`` [N, K], K % 64 == 0; matches ``triton_scaled_mm``
+    exactly."""
+    return torch.ops._rocm_C.w8a8_gemm_rdna2(a, w, scale_a, scale_b, bias, out_dtype)
+
+
 def wvSplitK_int4_g(
     weight: torch.Tensor,
     activation: torch.Tensor,

@@ -91,6 +91,7 @@ from vllm.model_executor.models.interfaces_base import (
 from vllm.model_executor.offloader import (
     create_offloader,
     get_offloader,
+    offload_input_embeddings,
     set_offloader,
 )
 from vllm.model_executor.warmup.jit_warmup import JitWarmupRegistry
@@ -5325,6 +5326,9 @@ class GPUModelRunner(
                         self.model_config,
                     )
                     eplb_models += 1
+
+                if envs.VLLM_UVA_INPUT_EMBEDDINGS:
+                    offload_input_embeddings(self.model)
 
                 time_after_load = time.perf_counter()
             self.model_memory_usage = m.consumed_memory

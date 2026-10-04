@@ -1545,7 +1545,9 @@ if(VLLM_GPU_LANG STREQUAL "HIP")
   set(VLLM_ROCM_HAS_GFX1030 OFF)
   if(VLLM_GPU_ARCHES MATCHES "gfx1030")
     set(VLLM_ROCM_HAS_GFX1030 ON)
-    list(APPEND VLLM_ROCM_EXT_SRC "csrc/rocm/skinny_gemms_rdna2.cu")
+    list(APPEND VLLM_ROCM_EXT_SRC "csrc/rocm/skinny_gemms_rdna2.cu"
+                                  "csrc/rocm/gemv_w8a8_rdna2.cu"
+                                  "csrc/rocm/gemm_w8a8_rdna2.cu")
   endif()
 
   define_extension_target(

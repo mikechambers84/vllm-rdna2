@@ -153,3 +153,47 @@ class UVAOffloader(BaseOffloader):
             module.forward = forward
 
         return module
+
+
+def offload_input_embeddings(model: nn.Module) -> int:
+    """Move untied input embedding tables to pinned host memory that the GPU
+    reads through UVA. A decode step gathers only a few rows, so this costs
+    microseconds per step but frees a vocabulary-sized table of device memory
+    (2.4 GiB for a 248K x 5120 fp16 embedding). Returns the bytes moved."""
+    from vllm.model_executor.layers.vocab_parallel_embedding import (
+        ParallelLMHead,
+        VocabParallelEmbedding,
+    )
+
+    if not is_uva_available():
+        logger.warning("UVA is unavailable; keeping input embeddings on device.")
+        return 0
+    lm_head_ptrs = {
+        m.weight.data_ptr()
+        for m in model.modules()
+        if isinstance(m, ParallelLMHead) and isinstance(m.weight, torch.Tensor)
+    }
+    moved = 0
+    for module in model.modules():
+        if isinstance(module, ParallelLMHead) or not isinstance(
+            module, VocabParallelEmbedding
+        ):
+            continue
+        weight = module.weight
+        if (
+            weight.device.type in ("cpu", "meta")
+            or getattr(weight, "_vllm_is_uva_offloaded", False)
+            or weight.data_ptr() in lm_head_ptrs
+        ):
+            continue
+        weight.data = get_accelerator_view_from_cpu_tensor(
+            weight.data.to("cpu").pin_memory()
+        )
+        weight._vllm_is_uva_offloaded = True
+        moved += weight.numel() * weight.element_size()
+    if moved:
+        torch.accelerator.empty_cache()
+        logger.info(
+            "Input embeddings moved to pinned host memory: %s", format_gib(moved)
+        )
+    return moved

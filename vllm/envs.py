@@ -158,6 +158,8 @@ if TYPE_CHECKING:
     VLLM_ROCM_USE_AITER_TRITON_GEMM: bool = True
     VLLM_ROCM_USE_SKINNY_GEMM: bool = True
     VLLM_MTP_DRAFT_VOCAB_SIZE: int = 0
+    VLLM_ROCM_W4A8_PREFILL: bool = False
+    VLLM_UVA_INPUT_EMBEDDINGS: bool = False
     VLLM_ROCM_FP8_PADDING: bool = True
     VLLM_ROCM_MOE_PADDING: bool = True
     VLLM_ROCM_SHUFFLE_KV_CACHE_LAYOUT: bool = False
@@ -1401,6 +1403,18 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # token. Target verification is unchanged; only acceptance can drop. TP=1.
     "VLLM_MTP_DRAFT_VOCAB_SIZE": lambda: int(
         os.getenv("VLLM_MTP_DRAFT_VOCAB_SIZE", "0")
+    ),
+    # gfx1030: run prefill GEMMs of 4-bit symmetric Exllama layers as int8 GEMMs
+    # (per-token int8 activations, per-channel int8 weights). ~1.7x faster
+    # prefill GEMMs at some accuracy cost; decode keeps the W4A16 kernels.
+    "VLLM_ROCM_W4A8_PREFILL": lambda: (
+        os.getenv("VLLM_ROCM_W4A8_PREFILL", "0").lower() in ("1", "true")
+    ),
+    # Keep untied input embedding tables in pinned host memory, read by the GPU
+    # over PCIe (UVA): frees a vocabulary-sized table of device memory for the
+    # KV cache (or a spec-decode drafter) at a few microseconds per decode step.
+    "VLLM_UVA_INPUT_EMBEDDINGS": lambda: (
+        os.getenv("VLLM_UVA_INPUT_EMBEDDINGS", "0").lower() in ("1", "true")
     ),
     # Pad the fp8 weights to 256 bytes for ROCm
     "VLLM_ROCM_FP8_PADDING": lambda: bool(int(os.getenv("VLLM_ROCM_FP8_PADDING", "1"))),
