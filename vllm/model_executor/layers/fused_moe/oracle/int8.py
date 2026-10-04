@@ -49,11 +49,15 @@ def backend_to_kernel_cls(
     backend: Int8MoeBackend,
 ) -> list[type[mk.FusedMoEExperts]]:
     if backend == Int8MoeBackend.TRITON:
+        from vllm.model_executor.layers.fused_moe.experts.rdna2_moe import (
+            Rdna2Int8Experts,
+        )
         from vllm.model_executor.layers.fused_moe.experts.triton_moe import (
             TritonExperts,
         )
 
-        return [TritonExperts]
+        # gfx1030 only (_supports_current_device): same weights, HIP decode.
+        return [Rdna2Int8Experts, TritonExperts]
 
     elif backend == Int8MoeBackend.HUMMING:
         from vllm.model_executor.layers.fused_moe.experts.fused_humming_moe import (

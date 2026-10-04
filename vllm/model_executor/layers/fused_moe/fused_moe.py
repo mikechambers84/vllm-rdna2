@@ -1293,6 +1293,45 @@ def should_moe_wna16_use_cuda(
     )
 
 
+def _on_gfx10() -> bool:
+    if not current_platform.is_rocm():
+        return False
+    from vllm.platforms.rocm import on_gfx10
+
+    return on_gfx10()
+
+
+def _gfx10_moe_config(M: int, E: int, topk: int, dtype: str) -> dict[str, int]:
+    """Tiles sized by the tokens each expert sees. Measured on a V620 (sweeps
+    at E=256/top-8, checked at E=8..256): the M-based BLOCK_SIZE_M=64/128
+    defaults leave most of each tile empty when there are many experts,
+    2-4x slower for int4 g32 and 1.4-2.3x for int8 W8A8 from 48 tokens up."""
+    tokens_per_expert = M * topk / max(E, 1)
+    if dtype == "int4_w4a16":
+        if tokens_per_expert <= 8:
+            block_m, block_n, num_warps = 16, 64, 4
+        elif tokens_per_expert <= 32:
+            block_m, block_n, num_warps = 32, 128, 4
+        else:
+            block_m, block_n, num_warps = 64, 128, 8
+        block_k, num_stages = 32, 1
+    else:  # int8_w8a8
+        block_m = (
+            16 if tokens_per_expert <= 8 else 32 if tokens_per_expert <= 32 else 64
+        )
+        block_n, block_k, num_warps = 128, 128, 4
+        num_stages = 1 if block_m == 16 else 2
+    return {
+        "BLOCK_SIZE_M": block_m,
+        "BLOCK_SIZE_N": block_n,
+        "BLOCK_SIZE_K": block_k,
+        "GROUP_SIZE_M": 1,
+        "SPLIT_K": 1,
+        "num_warps": num_warps,
+        "num_stages": num_stages,
+    }
+
+
 def get_default_config(
     M: int,
     E: int,
@@ -1354,7 +1393,9 @@ def get_default_config(
         # BLOCK_SIZE_N and BLOCK_SIZE_K would be set later
         bit = 4 if dtype == "int4_w4a16" else 8
         use_moe_wna16_cuda = should_moe_wna16_use_cuda(M * topk, block_shape[1], E, bit)
-        if use_moe_wna16_cuda:
+        if bit == 4 and not use_moe_wna16_cuda and _on_gfx10():
+            config = _gfx10_moe_config(M, E, topk, dtype)
+        elif use_moe_wna16_cuda:
             config = {
                 "BLOCK_SIZE_M": min(16, next_power_of_2(M)),
                 "GROUP_SIZE_M": 1,
@@ -1366,6 +1407,8 @@ def get_default_config(
             config = {"BLOCK_SIZE_M": 32, "GROUP_SIZE_M": 1, "SPLIT_K": 1}
         else:
             config = {"BLOCK_SIZE_M": 64, "GROUP_SIZE_M": 1, "SPLIT_K": 1}
+    elif dtype == "int8_w8a8" and block_shape is None and _on_gfx10():
+        config = _gfx10_moe_config(M, E, topk, dtype)
     else:
         # General defaults for bf16/fp16 and fp8 per-tensor.
         # Tile sizes scale with batch: small batches are memory-bound
@@ -1709,6 +1752,7 @@ def fused_experts_impl(
 
     config_dtype = _get_config_dtype_str(
         use_fp8_w8a8=use_fp8_w8a8,
+        use_int8_w8a8=use_int8_w8a8,
         use_int8_w8a16=use_int8_w8a16,
         use_int4_w4a16=use_int4_w4a16,
         dtype=hidden_states.dtype,

@@ -2131,6 +2131,62 @@ def w8a8_gemm_rdna2(
     return torch.ops._rocm_C.w8a8_gemm_rdna2(a, w, scale_a, scale_b, bias, out_dtype)
 
 
+def gemv_rdna2(
+    a: torch.Tensor, w: torch.Tensor, bias: torch.Tensor | None = None
+) -> torch.Tensor:
+    """RDNA2 fp16/bf16 GEMV: ``a @ w.T (+ bias)`` for ``a`` of at most 8 rows."""
+    return torch.ops._rocm_C.gemv_rdna2(a, w, bias)
+
+
+def gemv_w8a16_rdna2(
+    a: torch.Tensor,
+    w: torch.Tensor,
+    scale: torch.Tensor,
+    bias: torch.Tensor | None = None,
+) -> torch.Tensor:
+    """RDNA2 GEMV on int8 weights: ``a @ (w * scale[:, None]).T (+ bias)`` for
+    fp16/bf16 ``a`` of at most 8 rows and per-row fp32 ``scale``."""
+    return torch.ops._rocm_C.gemv_w8a16_rdna2(a, w, scale, bias)
+
+
+def moe_int8_decode_rdna2(
+    output: torch.Tensor,
+    x: torch.Tensor,
+    topk_ids: torch.Tensor,
+    topk_weights: torch.Tensor,
+    w13: torch.Tensor,
+    w13_scale: torch.Tensor,
+    w2: torch.Tensor,
+    w2_scale: torch.Tensor,
+    act: torch.Tensor,
+) -> None:
+    """RDNA2 int8-weight fused-MoE decode (SiLU, per-channel scales) into
+    ``output``, on the ``[E, N, K]`` int8 weights of the Triton int8 path, with
+    fp16 activations; ``act`` is a ``[M * topk, I]`` workspace."""
+    torch.ops._rocm_C.moe_int8_decode_rdna2(
+        output, x, topk_ids, topk_weights, w13, w13_scale, w2, w2_scale, act
+    )
+
+
+def moe_wna16_decode_rdna2(
+    output: torch.Tensor,
+    x: torch.Tensor,
+    topk_ids: torch.Tensor,
+    topk_weights: torch.Tensor,
+    w13: torch.Tensor,
+    w13_scale: torch.Tensor,
+    w2: torch.Tensor,
+    w2_scale: torch.Tensor,
+    act: torch.Tensor,
+) -> None:
+    """RDNA2 W4A16 fused-MoE decode (SiLU, symmetric int4 g32) into ``output``,
+    on the uint8-packed ``[E, N, K/2]`` weights of the Triton WNA16 backend;
+    ``act`` is a ``[M * topk, I]`` workspace."""
+    torch.ops._rocm_C.moe_wna16_decode_rdna2(
+        output, x, topk_ids, topk_weights, w13, w13_scale, w2, w2_scale, act
+    )
+
+
 def wvSplitK_int4_g(
     weight: torch.Tensor,
     activation: torch.Tensor,
