@@ -67,6 +67,14 @@ void moe_wna16_decode_rdna2(torch::Tensor& output, const torch::Tensor& x,
                             const torch::Tensor& w2, const torch::Tensor& s2,
                             torch::Tensor& act);
 
+void moe_wna16_gemm_rdna2(torch::Tensor& output, const torch::Tensor& a,
+                          const torch::Tensor& w, const torch::Tensor& scales,
+                          const torch::Tensor& sorted_ids,
+                          const torch::Tensor& expert_ids,
+                          const torch::Tensor& num_tokens_post_padded,
+                          const torch::Tensor& topk_weights, int64_t top_k,
+                          bool mul_routed_weight, int64_t block_m);
+
 torch::Tensor gptq_gemm_rdna3(torch::Tensor a, torch::Tensor b_q_weight,
                               torch::Tensor b_qzeros, torch::Tensor b_scales,
                               bool use_v2_format);

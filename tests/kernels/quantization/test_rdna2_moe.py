@@ -1,9 +1,10 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
-"""The gfx1030 fused-MoE decode kernels against fp32 references, on the
-weights the Triton paths keep (Qwen3.6-35B-A3B dims, E capped at 16):
+"""The gfx1030 fused-MoE kernels against fp32 references, on the weights the
+Triton paths keep (Qwen3.6-35B-A3B dims, E capped at 16): the decode kernels
 ``moe_wna16_decode_rdna2`` on uint8-packed ``[E, N, K/2]`` int4 g32 weights and
-``moe_int8_decode_rdna2`` on ``[E, N, K]`` int8 weights with channel scales."""
+``moe_int8_decode_rdna2`` on ``[E, N, K]`` int8 weights with channel scales, and
+the prefill GEMM ``moe_wna16_gemm_rdna2``."""
 
 import pytest
 import torch
@@ -21,11 +22,11 @@ pytestmark = pytest.mark.skipif(
 E, H, INTER, TOPK, GROUP = 16, 2048, 512, 8, 32
 
 
-def _experts(n, k):
+def _experts(n, k, group=GROUP):
     q = torch.randint(0, 16, (E, n, k), dtype=torch.uint8, device="cuda")
     packed = (q[..., 0::2] | (q[..., 1::2] << 4)).contiguous()
-    scales = (torch.rand(E, n, k // GROUP, device="cuda") * 0.004 + 1e-4).half()
-    ref = (q.float() - 8) * scales.float().repeat_interleave(GROUP, -1)
+    scales = (torch.rand(E, n, k // group, device="cuda") * 0.004 + 1e-4).half()
+    ref = (q.float() - 8) * scales.float().repeat_interleave(group, -1)
     return packed, scales, ref
 
 
@@ -87,3 +88,38 @@ def test_moe_int8_decode_rdna2_matches_reference(num_tokens):
 
     ref = _reference(x, topk_weights, topk_ids, w13.float() * s13, w2.float() * s2)
     assert ((out.float() - ref).norm() / ref.norm()).item() < 2e-3
+
+
+@pytest.mark.parametrize("group", [32, 128])
+@pytest.mark.parametrize("block_m", [16, 32, 64, 128])
+def test_moe_wna16_gemm_rdna2_prefill_matches_reference(block_m, group):
+    """The prefill path: both routed GEMMs over moe_align_block_size rows
+    (gathered activations, scattered outputs, top-k weights on the second),
+    with SiLU-and-mul and the top-k sum in between, for every tile height."""
+    from vllm import _custom_ops as ops
+    from vllm.model_executor.layers.fused_moe.moe_align_block_size import (
+        moe_align_block_size,
+    )
+
+    torch.manual_seed(0)
+    num_tokens = 96
+    w13, s13, w13_ref = _experts(2 * INTER, H, group)
+    w2, s2, w2_ref = _experts(H, INTER, group)
+    x = torch.randn(num_tokens, H, dtype=torch.float16, device="cuda") * 0.5
+    topk_weights, topk_ids = torch.topk(
+        torch.randn(num_tokens, E, device="cuda").softmax(-1), TOPK, dim=-1
+    )
+    topk_ids = topk_ids.int()
+    sorted_ids, expert_ids, num_post_padded = moe_align_block_size(topk_ids, block_m, E)
+    gate_up = torch.empty(num_tokens * TOPK, 2 * INTER, dtype=x.dtype, device="cuda")
+    act = torch.empty(num_tokens * TOPK, INTER, dtype=x.dtype, device="cuda")
+    down = torch.empty(num_tokens, TOPK, H, dtype=x.dtype, device="cuda")
+    args = (sorted_ids, expert_ids, num_post_padded, topk_weights)
+
+    ops.moe_wna16_gemm_rdna2(gate_up, x, w13, s13, *args, TOPK, False, block_m)
+    torch.ops._C.silu_and_mul(act, gate_up)
+    ops.moe_wna16_gemm_rdna2(down, act, w2, s2, *args, 1, True, block_m)
+
+    ref = _reference(x, topk_weights, topk_ids.long(), w13_ref, w2_ref)
+    out = down.float().sum(1)
+    assert ((out - ref).norm() / ref.norm()).item() < 2e-3

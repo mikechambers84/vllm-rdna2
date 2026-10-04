@@ -2205,6 +2205,37 @@ def moe_wna16_decode_rdna2(
     )
 
 
+def moe_wna16_gemm_rdna2(
+    output: torch.Tensor,
+    a: torch.Tensor,
+    w: torch.Tensor,
+    scales: torch.Tensor,
+    sorted_ids: torch.Tensor,
+    expert_ids: torch.Tensor,
+    num_tokens_post_padded: torch.Tensor,
+    topk_weights: torch.Tensor,
+    top_k: int,
+    mul_routed_weight: bool,
+    block_m: int,
+) -> None:
+    """RDNA2 grouped W4A16 GEMM for fused-MoE prefill: one routed GEMM of
+    ``TritonWNA16Experts`` (symmetric int4 [E, N, K/2] weights, group scales)
+    over moe_align_block_size(block_m) rows, into ``output`` [M * top_k, N]."""
+    torch.ops._rocm_C.moe_wna16_gemm_rdna2(
+        output,
+        a,
+        w,
+        scales,
+        sorted_ids,
+        expert_ids,
+        num_tokens_post_padded,
+        topk_weights,
+        top_k,
+        mul_routed_weight,
+        block_m,
+    )
+
+
 def wvSplitK_int4_g(
     weight: torch.Tensor,
     activation: torch.Tensor,
