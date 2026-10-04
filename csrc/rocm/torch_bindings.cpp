@@ -77,6 +77,11 @@ TORCH_LIBRARY_EXPAND(TORCH_EXTENSION_NAME, rocm_ops) {
       "gemv_w8a16_rdna2(Tensor a, Tensor w, Tensor scale, Tensor? bias) -> "
       "Tensor");
   rocm_ops.impl("gemv_w8a16_rdna2", torch::kCUDA, &gemv_w8a16_rdna2);
+  // 4-bit GPTQ GEMM for decode and small batches on Exllama's weight layout.
+  rocm_ops.def(
+      "gemm_w4a16_exl_rdna2(Tensor a, Tensor w, Tensor zeros, Tensor scales, "
+      "bool symmetric, bool use_v2_format, int cfg) -> Tensor");
+  rocm_ops.impl("gemm_w4a16_exl_rdna2", torch::kCUDA, &gemm_w4a16_exl_rdna2);
   // int8-weight fused-MoE decode (few tokens) on the Triton int8 layout.
   rocm_ops.def(
       "moe_int8_decode_rdna2(Tensor! output, Tensor x, Tensor topk_ids, "

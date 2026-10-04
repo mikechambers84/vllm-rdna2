@@ -30,20 +30,27 @@ def test_gptq_gemm_opcheck():
     opcheck(torch.ops._C.gptq_gemm, (a, weight, zeros, scales, use_exllama, False, bit))
 
 
-def _gptq_int4_sym(k: int, n: int, group_size: int):
-    """Random symmetric int4 GPTQ weights (GPTQv1: stored zero 7), shuffled for
-    the exllama kernel, and their fp32 dequantized reference."""
+def _gptq_int4_sym(k: int, n: int, group_size: int, random_zeros: bool = False):
+    """Random int4 GPTQ weights (GPTQv1: stored zero 7, or random stored zeros),
+    shuffled for the exllama kernel, and their fp32 dequantized reference."""
+
+    def pack(v, dim):
+        # Eight 4-bit values along dim per int32, low nibble first.
+        v = v.movedim(dim, -1).to(torch.int64)
+        packed = sum(v[..., i::8] << (4 * i) for i in range(8))
+        packed = torch.where(packed >= 2**31, packed - 2**32, packed).to(torch.int32)
+        return packed.movedim(-1, dim).contiguous()
+
     q = torch.randint(0, 16, (k, n), device="cuda", dtype=torch.int32)
-    packed = torch.zeros(k // 8, n, device="cuda", dtype=torch.int64)
-    for i in range(8):
-        packed |= q[i::8].to(torch.int64) << (4 * i)
-    w_q = torch.where(packed >= 2**31, packed - 2**32, packed).to(torch.int32)
+    w_q = pack(q, 0)
     ops.gptq_shuffle(w_q, 4)
-    zeros = torch.full(
-        (k // group_size, n // 8), 0x77777777, device="cuda", dtype=torch.int32
-    )
+    z = torch.full((k // group_size, n), 7, device="cuda", dtype=torch.int32)
+    if random_zeros:
+        z = torch.randint(0, 15, z.shape, device="cuda", dtype=torch.int32)
+    zeros = pack(z, 1)
     scales = (torch.rand(k // group_size, n, device="cuda") * 0.01 + 1e-3).half()
-    w_ref = (q - 8).float() * scales.float().repeat_interleave(group_size, 0)
+    w_ref = (q - z.repeat_interleave(group_size, 0) - 1).float()
+    w_ref *= scales.float().repeat_interleave(group_size, 0)
     return w_q, zeros, scales, w_ref
 
 
@@ -88,11 +95,62 @@ def test_gptq_gemm_reconstruct_path_cuda_graph():
     torch.testing.assert_close(out, eager)
 
 
+def _gfx1030_with(op: str) -> bool:
+    from vllm.platforms import current_platform
+
+    if not current_platform.is_rocm():
+        return False
+    from vllm.platforms.rocm import on_gfx1030
+
+    return on_gfx1030() and hasattr(torch.ops._rocm_C, op)
+
+
+gfx1030_only = pytest.mark.skipif(
+    not _gfx1030_with("gemm_w4a16_exl_rdna2"),
+    reason="requires gfx1030 with _rocm_C.gemm_w4a16_exl_rdna2 built",
+)
+
+
+@gfx1030_only
+@pytest.mark.parametrize("random_zeros", [False, True], ids=["sym", "zeros"])
+@pytest.mark.parametrize("group_size", [32, 128])
+@pytest.mark.parametrize("m", [1, 2, 3, 8, 16, 24, 64, 300])
+def test_gemm_w4a16_exl_rdna2_matches_reference(m, group_size, random_zeros):
+    """The gfx1030 GEMM on gptq_gemm's tensors, for each default tile config
+    (1-512 rows), symmetric (zeros ignored) and with stored zeros; N = 1000
+    leaves a partial 128-column tile."""
+    torch.manual_seed(0)
+    k, n = 2048, 1000
+    w_q, zeros, scales, w_ref = _gptq_int4_sym(k, n, group_size, random_zeros)
+    a = torch.randn(m, k, device="cuda", dtype=torch.float16)
+    out = ops.gemm_w4a16_exl_rdna2(a, w_q, zeros, scales, not random_zeros)
+    ref = a.float() @ w_ref
+    assert ((out.float() - ref).norm() / ref.norm()).item() < 2e-3
+
+
+@gfx1030_only
+@pytest.mark.parametrize("cfg", range(13))
+def test_gemm_w4a16_exl_rdna2_configs(cfg):
+    """Every tile config, with a partial token tile."""
+    torch.manual_seed(0)
+    k, n = 1024, 512
+    w_q, zeros, scales, w_ref = _gptq_int4_sym(k, n, 32, random_zeros=True)
+    a = torch.randn(37, k, device="cuda", dtype=torch.float16)
+    out = ops.gemm_w4a16_exl_rdna2(a, w_q, zeros, scales, False, False, cfg)
+    ref = a.float() @ w_ref
+    assert ((out.float() - ref).norm() / ref.norm()).item() < 2e-3
+
+
+@pytest.mark.skipif(
+    not _gfx1030_with("w8a8_gemm_rdna2"), reason="requires gfx1030 int8 GEMM"
+)
+@pytest.mark.parametrize("rdna2_rows", [0, 512], ids=["gptq_gemm", "rdna2"])
 @pytest.mark.parametrize("m", [16, 512])
-def test_exllama_w4a8_gemm_runs_int8_only_for_prefill(m):
-    """Opt-in W4A8 prefill: rows above the fused-kernel limit run as an int8
-    GEMM on the re-quantized weight (per-token activation quant costs ~1e-2;
-    a wrong nibble order would cost ~1), while decode rows stay W4A16."""
+def test_exllama_gfx1030_gemm_runs_int8_only_for_prefill(m, rdna2_rows):
+    """Opt-in W4A8 prefill: rows above the int8 threshold run as an int8 GEMM
+    on the re-quantized weight (per-token activation quant costs ~1e-2; a wrong
+    nibble order would cost ~1), while decode rows stay W4A16."""
+    from vllm.model_executor.kernels.linear.mixed_precision import exllama_rdna2
     from vllm.model_executor.kernels.linear.mixed_precision.exllama_w4a8 import (
         channel_scales,
         w4a8_gemm,
@@ -104,14 +162,80 @@ def test_exllama_w4a8_gemm_runs_int8_only_for_prefill(m):
     channel_scale = channel_scales(scales)
     workspace = torch.empty(k * n, device="cuda", dtype=torch.float16)
     a = torch.randn(m, k, device="cuda", dtype=torch.float16)
-    out = torch.ops.vllm.exllama_w4a8_gemm(
-        a, w_q, zeros, scales, channel_scale, workspace, group_size
+    min_rows = (
+        exllama_rdna2.W4A8_MIN_ROWS_RDNA2 if rdna2_rows else exllama_rdna2.W4A8_MIN_ROWS
+    )
+    out = torch.ops.vllm.exllama_gfx1030_gemm(
+        a,
+        w_q,
+        zeros,
+        scales,
+        channel_scale,
+        workspace,
+        group_size,
+        True,
+        rdna2_rows,
+        min_rows,
     )
     ref = a.float() @ w_ref
     err = ((out.float() - ref).norm() / ref.norm()).item()
-    if m > 50:
+    if m > min_rows:
         expected = w4a8_gemm(a, w_q, scales, channel_scale, group_size, workspace)
         torch.testing.assert_close(out, expected, rtol=0, atol=0)
         assert err < 2e-2
     else:
         assert err < 3e-3
+
+
+@gfx1030_only
+@pytest.mark.parametrize("m", [1, 40, 600])
+def test_exllama_linear_kernel_gfx1030(m, dist_init):
+    """ExllamaLinearKernel on a compressed-tensors layout layer: the gfx1030
+    GEMM up to 512 rows, gptq_gemm above."""
+    from vllm.model_executor.kernels.linear.mixed_precision.exllama import (
+        ExllamaLinearKernel,
+    )
+    from vllm.model_executor.kernels.linear.mixed_precision.MPLinearKernel import (
+        MPLinearLayerConfig,
+    )
+    from vllm.model_executor.layers.quantization.utils.quant_utils import (
+        pack_quantized_values_into_int32,
+    )
+    from vllm.model_executor.parameter import (
+        GroupQuantScaleParameter,
+        PackedvLLMParameter,
+    )
+    from vllm.scalar_type import scalar_types
+
+    torch.manual_seed(0)
+    k, n, group_size = 1024, 512, 128
+    q = torch.randint(0, 16, (n, k), device="cuda", dtype=torch.int32)
+    scales = (torch.rand(n, k // group_size, device="cuda") * 0.01 + 1e-3).half()
+    w_ref = (q - 8).float() * scales.float().repeat_interleave(group_size, 1)
+    layer = torch.nn.Module()
+    layer.w_q = PackedvLLMParameter(
+        data=pack_quantized_values_into_int32(q, scalar_types.uint4b8, 1),
+        weight_loader=None,
+        input_dim=1,
+        output_dim=0,
+        packed_dim=1,
+        packed_factor=8,
+    )
+    layer.w_s = GroupQuantScaleParameter(
+        data=scales, weight_loader=None, input_dim=1, output_dim=0
+    )
+    config = MPLinearLayerConfig(
+        full_weight_shape=(k, n),
+        partition_weight_shape=(k, n),
+        weight_type=scalar_types.uint4b8,
+        act_type=torch.float16,
+        group_size=group_size,
+        zero_points=False,
+    )
+    kernel = ExllamaLinearKernel(config, w_q_param_name="w_q", w_s_param_name="w_s")
+    kernel.process_weights_after_loading(layer)
+    x = torch.randn(m, k, device="cuda", dtype=torch.float16)
+    bias = torch.randn(n, device="cuda", dtype=torch.float16)
+    out = kernel.apply_weights(layer, x, bias)
+    ref = x.float() @ w_ref.t() + bias.float()
+    assert ((out.float() - ref).norm() / ref.norm()).item() < 2e-3

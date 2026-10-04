@@ -2149,6 +2149,24 @@ def gemv_w8a16_rdna2(
     return torch.ops._rocm_C.gemv_w8a16_rdna2(a, w, scale, bias)
 
 
+def gemm_w4a16_exl_rdna2(
+    a: torch.Tensor,
+    w: torch.Tensor,
+    zeros: torch.Tensor,
+    scales: torch.Tensor,
+    symmetric: bool,
+    use_v2_format: bool = False,
+    cfg: int = -1,
+) -> torch.Tensor:
+    """RDNA2 4-bit GPTQ GEMM for few rows of fp16 ``a``, on the tensors
+    ``gptq_gemm`` takes (``gptq_shuffle``d weights); same result as
+    ``gptq_gemm(a, w, zeros, scales, True, use_v2_format, 4)``. ``symmetric``
+    skips the zeros (all 8); ``cfg`` selects a tile config (-1: by row count)."""
+    return torch.ops._rocm_C.gemm_w4a16_exl_rdna2(
+        a, w, zeros, scales, symmetric, use_v2_format, cfg
+    )
+
+
 def moe_int8_decode_rdna2(
     output: torch.Tensor,
     x: torch.Tensor,

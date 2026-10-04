@@ -152,6 +152,10 @@ class ExllamaLinearKernel(MPLinearKernel):
             from .exllama_w4a8 import channel_scales
 
             layer.w4a8_channel_scale = channel_scales(getattr(layer, self.w_s_name))
+        from .exllama_rdna2 import RDNA2_MAX_ROWS, use_rdna2_gemm
+
+        self._rdna2_rows = RDNA2_MAX_ROWS if use_rdna2_gemm(c) else 0
+        self._gfx1030 = self._rdna2_rows > 0 or hasattr(layer, "w4a8_channel_scale")
 
     def apply_weights(
         self,
@@ -171,15 +175,20 @@ class ExllamaLinearKernel(MPLinearKernel):
         use_v2_format = False
 
         assert w_zp is not None, "Zero points are required by Exllama"
-        if hasattr(layer, "w4a8_channel_scale"):
-            output = torch.ops.vllm.exllama_w4a8_gemm(
+        if self._gfx1030:
+            from .exllama_rdna2 import W4A8_MIN_ROWS, W4A8_MIN_ROWS_RDNA2
+
+            output = torch.ops.vllm.exllama_gfx1030_gemm(
                 x_2d,
                 w_q,
                 w_zp,
                 w_s,
-                layer.w4a8_channel_scale,
+                getattr(layer, "w4a8_channel_scale", None),
                 _dq_workspaces[x_2d.device],
                 c.group_size,
+                not c.zero_points,
+                self._rdna2_rows,
+                W4A8_MIN_ROWS_RDNA2 if self._rdna2_rows else W4A8_MIN_ROWS,
             )
             if bias is not None:
                 output.add_(bias)
