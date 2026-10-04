@@ -3,10 +3,11 @@
 """W4A16 fused-MoE experts for RDNA2 (gfx1030).
 
 Same weights as ``TritonWNA16Experts`` (``[E, N, K/2]`` uint8, N-first group
-scales). Decode batches of symmetric int4 g32 experts with fp16 activations and
-SiLU run on ``moe_wna16_decode_rdna2`` (gate/up with SiLU fused, then down with
-the top-k sum in registers): 12-15x the Triton path on a V620 for 1-16 tokens.
-Everything else takes the Triton path.
+scales). Batches of symmetric int4 g32 experts with fp16 activations and SiLU
+run on ``moe_wna16_decode_rdna2`` (gate/up with SiLU fused, then down with the
+top-k sum in registers) up to MAX_DECODE_TOKENS: on a V620 (E=256, top-8) it beats
+tuned Triton 4.5x at 1-32 tokens, 3x at 64, 1.8x at 128 and breaks even near 256,
+since each token re-reads its experts. Larger batches take the Triton path.
 """
 
 import torch
@@ -28,7 +29,7 @@ def rdna2_moe_kernel_available() -> bool:
 
 
 class Rdna2WNA16Experts(TritonWNA16Experts):
-    MAX_DECODE_TOKENS = 16
+    MAX_DECODE_TOKENS = 192
 
     @staticmethod
     def _supports_current_device() -> bool:
