@@ -2138,6 +2138,25 @@ def gemv_rdna2(
     return torch.ops._rocm_C.gemv_rdna2(a, w, bias)
 
 
+def moe_int8_decode_rdna2(
+    output: torch.Tensor,
+    x: torch.Tensor,
+    topk_ids: torch.Tensor,
+    topk_weights: torch.Tensor,
+    w13: torch.Tensor,
+    w13_scale: torch.Tensor,
+    w2: torch.Tensor,
+    w2_scale: torch.Tensor,
+    act: torch.Tensor,
+) -> None:
+    """RDNA2 int8-weight fused-MoE decode (SiLU, per-channel scales) into
+    ``output``, on the ``[E, N, K]`` int8 weights of the Triton int8 path, with
+    fp16 activations; ``act`` is a ``[M * topk, I]`` workspace."""
+    torch.ops._rocm_C.moe_int8_decode_rdna2(
+        output, x, topk_ids, topk_weights, w13, w13_scale, w2, w2_scale, act
+    )
+
+
 def moe_wna16_decode_rdna2(
     output: torch.Tensor,
     x: torch.Tensor,
