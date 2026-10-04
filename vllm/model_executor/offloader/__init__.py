@@ -11,7 +11,7 @@ from vllm.model_executor.offloader.base import (
     should_pin_memory,
 )
 from vllm.model_executor.offloader.prefetch import PrefetchOffloader
-from vllm.model_executor.offloader.uva import UVAOffloader
+from vllm.model_executor.offloader.uva import UVAOffloader, offload_input_embeddings
 
 __all__ = [
     "BaseOffloader",
@@ -22,4 +22,5 @@ __all__ = [
     "get_offloader",
     "set_offloader",
     "should_pin_memory",
+    "offload_input_embeddings",
 ]

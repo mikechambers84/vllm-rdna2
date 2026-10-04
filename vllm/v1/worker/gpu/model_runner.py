@@ -50,6 +50,7 @@ from vllm.model_executor.models.interfaces import requires_raw_input_tokens
 from vllm.model_executor.offloader import (
     create_offloader,
     get_offloader,
+    offload_input_embeddings,
     set_offloader,
 )
 from vllm.model_executor.warmup.jit_warmup import JitWarmupRegistry
@@ -401,6 +402,8 @@ class GPUModelRunner(LoRAModelRunnerMixin):
                     eplb_models_added = self.eplb.maybe_register_speculator(
                         self.speculator, self.speculative_config, load_dummy_weights
                     )
+            if envs.VLLM_UVA_INPUT_EMBEDDINGS:
+                offload_input_embeddings(self.model)
         time_after_load = time.perf_counter()
 
         self.model_memory_usage = m.consumed_memory
