@@ -396,6 +396,32 @@ def test_rocm_wvsplitk_rdna2_kernel(n, k, m, dtype, with_bias):
     torch.testing.assert_close(out, ref, atol=atol, rtol=1e-2)
 
 
+@pytest.mark.parametrize("n", [1, 3, 8])
+@pytest.mark.parametrize(
+    "k,m",
+    [
+        (2048, 64),  # tiny layer
+        (4096, 1000),  # N not a multiple of the 8 rows per workgroup
+        (14336, 512),  # A staged in K chunks (16 KB of LDS per workgroup)
+    ],
+)
+@pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
+@pytest.mark.parametrize("with_bias", [False, True])
+@pytest.mark.skipif(not on_gfx1030(), reason="RDNA2 (gfx1030) kernel")
+def test_rocm_gemv_rdna2_kernel(n, k, m, dtype, with_bias):
+    torch.manual_seed(0)
+    xavier = math.sqrt(2 / k)
+    A = (torch.rand(n, k, dtype=dtype, device="cuda") * 2 - 1) * xavier
+    B = (torch.rand(m, k, dtype=dtype, device="cuda") * 2 - 1) * xavier
+    bias = torch.rand(m, dtype=dtype, device="cuda") if with_bias else None
+
+    out = ops.gemv_rdna2(A, B, bias)
+    ref_bias = bias.float() if bias is not None else None
+    ref = torch.nn.functional.linear(A.float(), B.float(), ref_bias).to(dtype)
+    atol = torch.finfo(dtype).eps * math.sqrt(k)
+    torch.testing.assert_close(out, ref, atol=atol, rtol=1e-2)
+
+
 @pytest.mark.parametrize("n,k,m", NKM_FACTORS_WVSPLITK_FP8)
 @pytest.mark.parametrize(
     "dtype,padded_a,padded_b,biased,xnorm",

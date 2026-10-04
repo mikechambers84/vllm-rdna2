@@ -2131,6 +2131,13 @@ def w8a8_gemm_rdna2(
     return torch.ops._rocm_C.w8a8_gemm_rdna2(a, w, scale_a, scale_b, bias, out_dtype)
 
 
+def gemv_rdna2(
+    a: torch.Tensor, w: torch.Tensor, bias: torch.Tensor | None = None
+) -> torch.Tensor:
+    """RDNA2 fp16/bf16 GEMV: ``a @ w.T (+ bias)`` for ``a`` of at most 8 rows."""
+    return torch.ops._rocm_C.gemv_rdna2(a, w, bias)
+
+
 def moe_wna16_decode_rdna2(
     output: torch.Tensor,
     x: torch.Tensor,

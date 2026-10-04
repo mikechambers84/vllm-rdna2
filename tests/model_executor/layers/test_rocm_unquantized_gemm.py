@@ -46,19 +46,21 @@ def test_rocm_unquantized_gemm_gfx1x_wvsplitk_path(monkeypatch, m):
 
 
 @pytest.mark.parametrize(
-    "n, m, k, expect_rdna2",
+    "n, m, k, expected",
     [
-        (1, 248320, 5120, True),  # lm_head
-        (8, 96, 5120, True),  # tiny projection, rocBLAS is launch-bound
-        (16, 248320, 5120, False),  # too many tokens for a GEMV
-        (1, 1024, 2048, False),  # mid-size weight at narrow K
+        (1, 248320, 5120, "gemv"),  # lm_head
+        (8, 96, 5120, "gemv"),  # tiny projection, rocBLAS is launch-bound
+        (1, 1024, 2048, "gemv"),  # mid-size weight at narrow K
+        (6, 4096, 14336, "wvsplitk"),  # long rows at 5-8 tokens
+        (16, 248320, 5120, "rocblas"),  # too many tokens for a GEMV
     ],
 )
+@pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
 def test_rocm_unquantized_gemm_gfx1030_rdna2_gemv_routing(
-    monkeypatch, n, m, k, expect_rdna2
+    monkeypatch, n, m, k, expected, dtype
 ):
-    x = torch.randn(n, k, dtype=torch.float16)
-    weight = torch.empty(m, k, dtype=torch.float16)
+    x = torch.randn(n, k, dtype=dtype)
+    weight = torch.empty(m, k, dtype=dtype)
 
     monkeypatch.setattr(utils, "use_aiter_triton_gemm", lambda *args: False)
     monkeypatch.setattr(utils.envs, "VLLM_ROCM_USE_SKINNY_GEMM", True)
@@ -66,15 +68,18 @@ def test_rocm_unquantized_gemm_gfx1030_rdna2_gemv_routing(
     monkeypatch.setattr("vllm.platforms.rocm.on_gfx1x", lambda: False)
     monkeypatch.setattr("vllm.platforms.rocm.on_gfx9", lambda: False)
     monkeypatch.setattr("vllm.platforms.rocm.on_gfx950", lambda: False)
-    rdna2_mock = MagicMock(return_value=torch.empty(n, m, dtype=torch.float16))
-    monkeypatch.setattr(utils.ops, "wvSplitK_rdna2", rdna2_mock)
-    linear_mock = MagicMock(return_value=torch.empty(n, m, dtype=torch.float16))
-    monkeypatch.setattr(torch.nn.functional, "linear", linear_mock)
+    mocks = {
+        "gemv": MagicMock(return_value=torch.empty(n, m, dtype=dtype)),
+        "wvsplitk": MagicMock(return_value=torch.empty(n, m, dtype=dtype)),
+        "rocblas": MagicMock(return_value=torch.empty(n, m, dtype=dtype)),
+    }
+    monkeypatch.setattr(utils.ops, "gemv_rdna2", mocks["gemv"])
+    monkeypatch.setattr(utils.ops, "wvSplitK_rdna2", mocks["wvsplitk"])
+    monkeypatch.setattr(torch.nn.functional, "linear", mocks["rocblas"])
 
     utils.rocm_unquantized_gemm_impl(x, weight, None)
 
-    assert rdna2_mock.called is expect_rdna2
-    assert linear_mock.called is not expect_rdna2
+    assert {name for name, mock in mocks.items() if mock.called} == {expected}
 
 
 @pytest.mark.skipif(not current_platform.is_rocm(), reason="ROCm-only kernel test")

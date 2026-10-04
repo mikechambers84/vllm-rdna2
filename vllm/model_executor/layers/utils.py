@@ -288,6 +288,13 @@ def wvsplitkrc_dispatch(n: int, k: int, m: int, cu_count: int) -> tuple[int, boo
     return chunkk, fits
 
 
+def _use_rdna2_gemv(n: int, k: int) -> bool:
+    """Where gemv_rdna2 beats wvSplitK_rdna2 and rocBLAS on a V620, fp16 and
+    bf16 alike (rocBLAS bf16 GEMVs are 5-15x slower than fp16 there): up to 8
+    tokens, except long rows at 5-8 tokens."""
+    return 0 < n <= 8 and not (k > 8192 and n > 4)
+
+
 def _use_rdna2_skinny_gemv(n: int, m: int, k: int) -> bool:
     """Where wvSplitK_rdna2 beats rocBLAS on a V620: a wide K (up to 8 tokens),
     or up to 4 tokens with a tiny weight (rocBLAS is launch-bound there) or a
@@ -379,11 +386,16 @@ def rocm_unquantized_gemm_impl(
         and weight.dtype == x.dtype
         and k % 8 == 0
         and skinny_operands_compatible
-        and _use_rdna2_skinny_gemv(n, m, k)
     ):
-        x_view = x.reshape(-1, x.size(-1)).contiguous()
-        out = ops.wvSplitK_rdna2(weight, x_view, bias)
-        return out.reshape(*x.shape[:-1], m)
+        if _use_rdna2_gemv(n, k) and weight.data_ptr() % 16 == 0:
+            x_view = x.reshape(-1, x.size(-1)).contiguous()
+            if x_view.data_ptr() % 16 == 0:
+                out = ops.gemv_rdna2(x_view, weight, bias)
+                return out.reshape(*x.shape[:-1], m)
+        if _use_rdna2_skinny_gemv(n, m, k):
+            x_view = x.reshape(-1, x.size(-1)).contiguous()
+            out = ops.wvSplitK_rdna2(weight, x_view, bias)
+            return out.reshape(*x.shape[:-1], m)
 
     if rocm_aiter_ops.is_tgemm_enabled():
         from aiter.tuned_gemm import tgemm
