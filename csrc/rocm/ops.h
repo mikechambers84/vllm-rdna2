@@ -44,6 +44,10 @@ torch::Tensor w8a8_gemm_rdna2(const at::Tensor& a, const at::Tensor& w,
 torch::Tensor gemv_rdna2(const at::Tensor& a, const at::Tensor& w,
                          const std::optional<at::Tensor>& bias);
 
+torch::Tensor gemv_w8a16_rdna2(const at::Tensor& a, const at::Tensor& w,
+                               const at::Tensor& scale,
+                               const std::optional<at::Tensor>& bias);
+
 void moe_int8_decode_rdna2(torch::Tensor& output, const torch::Tensor& x,
                            const torch::Tensor& topk_ids,
                            const torch::Tensor& topk_weights,

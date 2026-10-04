@@ -72,6 +72,11 @@ TORCH_LIBRARY_EXPAND(TORCH_EXTENSION_NAME, rocm_ops) {
   // fp16/bf16 GEMV (M <= 8).
   rocm_ops.def("gemv_rdna2(Tensor a, Tensor w, Tensor? bias) -> Tensor");
   rocm_ops.impl("gemv_rdna2", torch::kCUDA, &gemv_rdna2);
+  // int8-weight (per-channel scale) GEMV with fp16/bf16 activations (M <= 8).
+  rocm_ops.def(
+      "gemv_w8a16_rdna2(Tensor a, Tensor w, Tensor scale, Tensor? bias) -> "
+      "Tensor");
+  rocm_ops.impl("gemv_w8a16_rdna2", torch::kCUDA, &gemv_w8a16_rdna2);
   // int8-weight fused-MoE decode (few tokens) on the Triton int8 layout.
   rocm_ops.def(
       "moe_int8_decode_rdna2(Tensor! output, Tensor x, Tensor topk_ids, "

@@ -422,6 +422,29 @@ def test_rocm_gemv_rdna2_kernel(n, k, m, dtype, with_bias):
     torch.testing.assert_close(out, ref, atol=atol, rtol=1e-2)
 
 
+@pytest.mark.parametrize("n", [1, 3, 8])
+@pytest.mark.parametrize("k,m", [(2048, 64), (4096, 1000), (14336, 512)])
+@pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
+@pytest.mark.parametrize("with_bias", [False, True])
+@pytest.mark.skipif(not on_gfx1030(), reason="RDNA2 (gfx1030) kernel")
+def test_rocm_gemv_w8a16_rdna2_kernel(n, k, m, dtype, with_bias):
+    """int8 weights are converted exactly in registers, so the result matches
+    an fp32 GEMM on the dequantized weights to output rounding."""
+    torch.manual_seed(0)
+    A = torch.randn(n, k, dtype=dtype, device="cuda") * math.sqrt(2 / k)
+    W = torch.randint(-127, 128, (m, k), dtype=torch.int8, device="cuda")
+    scale = torch.rand(m, device="cuda") * 1e-2 + 1e-3
+    bias = torch.rand(m, dtype=dtype, device="cuda") if with_bias else None
+
+    out = ops.gemv_w8a16_rdna2(A, W, scale, bias)
+    ref_bias = bias.float() if bias is not None else None
+    ref = torch.nn.functional.linear(
+        A.float(), W.float() * scale[:, None], ref_bias
+    ).to(dtype)
+    atol = torch.finfo(dtype).eps * math.sqrt(k)
+    torch.testing.assert_close(out, ref, atol=atol, rtol=1e-2)
+
+
 @pytest.mark.parametrize("n,k,m", NKM_FACTORS_WVSPLITK_FP8)
 @pytest.mark.parametrize(
     "dtype,padded_a,padded_b,biased,xnorm",

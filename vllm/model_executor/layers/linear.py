@@ -214,6 +214,14 @@ class UnquantizedLinearMethod(LinearMethodBase):
             from vllm.model_executor.layers.utils import dispatch_cpu_unquantized_gemm
 
             dispatch_cpu_unquantized_gemm(layer, remove_weight=True)
+        elif current_platform.is_rocm():
+            from vllm.model_executor.kernels.linear.rdna2_w8a16 import (
+                quantize_weight,
+                use_rdna2_w8a16,
+            )
+
+            if use_rdna2_w8a16(layer.weight):
+                quantize_weight(layer)
         elif current_platform.is_xpu():
             # Opt-in: F.linear on XPU is faster with an N-contiguous (N, K) weight
             # when K > N, but oneDNN's ab-weights matmul is not run-to-run bitwise
@@ -236,6 +244,12 @@ class UnquantizedLinearMethod(LinearMethodBase):
             current_platform.is_cuda_alike() or current_platform.is_xpu()
         ):
             return linear_batch_invariant(x, layer.weight, bias)
+        if hasattr(layer, "w8a16_weight"):
+            from vllm.model_executor.kernels.linear.rdna2_w8a16 import (
+                apply_rdna2_w8a16,
+            )
+
+            return apply_rdna2_w8a16(layer, x, bias)
         return self._gemm_impl(layer, x, layer.weight, bias)
 
 

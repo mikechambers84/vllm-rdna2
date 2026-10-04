@@ -160,6 +160,7 @@ if TYPE_CHECKING:
     VLLM_MTP_DRAFT_VOCAB_SIZE: int = 0
     VLLM_ROCM_W4A8_PREFILL: bool = False
     VLLM_UVA_INPUT_EMBEDDINGS: bool = False
+    VLLM_ROCM_W8A16_UNQUANTIZED: bool = False
     VLLM_ROCM_FP8_PADDING: bool = True
     VLLM_ROCM_MOE_PADDING: bool = True
     VLLM_ROCM_SHUFFLE_KV_CACHE_LAYOUT: bool = False
@@ -1415,6 +1416,12 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # KV cache (or a spec-decode drafter) at a few microseconds per decode step.
     "VLLM_UVA_INPUT_EMBEDDINGS": lambda: (
         os.getenv("VLLM_UVA_INPUT_EMBEDDINGS", "0").lower() in ("1", "true")
+    ),
+    # gfx1030: store unquantized fp16/bf16 linear weights (e.g. the layers a
+    # partially quantized checkpoint leaves in 16 bits) as int8 with per-channel
+    # scales, weight-only: halves their decode bandwidth and memory.
+    "VLLM_ROCM_W8A16_UNQUANTIZED": lambda: (
+        os.getenv("VLLM_ROCM_W8A16_UNQUANTIZED", "0").lower() in ("1", "true")
     ),
     # Pad the fp8 weights to 256 bytes for ROCm
     "VLLM_ROCM_FP8_PADDING": lambda: bool(int(os.getenv("VLLM_ROCM_FP8_PADDING", "1"))),

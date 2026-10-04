@@ -7,6 +7,8 @@
 // fp32 accumulation, wave reduction.
 // fp16 uses v_dot2_f32_f16; bf16, which has no dot instruction on gfx1030,
 // widens to fp32 FMAs (free while the kernel is bandwidth-bound).
+// gemv_w8a16_rdna2 is the same GEMV on int8 weights with a per-row fp32
+// scale: each 16-byte load carries 16 weights, converted exactly in registers.
 
 #include <torch/all.h>
 #include <c10/cuda/CUDAGuard.h>
@@ -154,12 +156,139 @@ __global__ void __launch_bounds__(WAVES* WARP32)
   }
 }
 
+// acc + dot(a[0:16], w[0:16]) for 16 int8 weights (one 16-byte load) and 16
+// fp16 or bf16 activations at a. fp16: flip the sign bit, OR the byte into the
+// mantissa of 1024.0 and subtract 1152 (exact), then v_dot2_f32_f16. bf16: the
+// same trick into the mantissa of 2^23, then fp32 FMAs.
+template <typename T>
+__device__ __forceinline__ float dot16_i8(const int4& wv, const T* a,
+                                          float acc);
+
+template <>
+__device__ __forceinline__ float dot16_i8<__half>(const int4& wv,
+                                                  const __half* a, float acc) {
+  const uint32_t* q = reinterpret_cast<const uint32_t*>(&wv);
+  const half2 bias =
+      __halves2half2(__ushort_as_half(0x6480), __ushort_as_half(0x6480));
+  #pragma unroll
+  for (int c = 0; c < 2; c++) {
+    const int4 av = *reinterpret_cast<const int4*>(a + c * 8);
+    const half2* ah = reinterpret_cast<const half2*>(&av);
+  #pragma unroll
+    for (int w = 0; w < 2; w++) {
+      const uint32_t u = q[c * 2 + w] ^ 0x80808080u;
+      uint32_t lo = (u & 0xFFu) | ((u & 0xFF00u) << 8) | 0x64006400u;
+      uint32_t hi = ((u >> 16) & 0xFFu) | ((u >> 8) & 0xFF0000u) | 0x64006400u;
+      acc = __builtin_amdgcn_fdot2(
+          ah[2 * w], __hsub2(*reinterpret_cast<half2*>(&lo), bias), acc, false);
+      acc = __builtin_amdgcn_fdot2(
+          ah[2 * w + 1], __hsub2(*reinterpret_cast<half2*>(&hi), bias), acc,
+          false);
+    }
+  }
+  return acc;
+}
+
+template <>
+__device__ __forceinline__ float dot16_i8<__hip_bfloat16>(
+    const int4& wv, const __hip_bfloat16* a, float acc) {
+  const uint32_t* q = reinterpret_cast<const uint32_t*>(&wv);
+  #pragma unroll
+  for (int c = 0; c < 2; c++) {
+    const int4 av = *reinterpret_cast<const int4*>(a + c * 8);
+    const uint32_t* au = reinterpret_cast<const uint32_t*>(&av);
+  #pragma unroll
+    for (int w = 0; w < 2; w++) {
+      const uint32_t u = q[c * 2 + w] ^ 0x80808080u;
+  #pragma unroll
+      for (int b = 0; b < 4; b++) {
+        const float wf =
+            __uint_as_float(((u >> (8 * b)) & 0xFFu) | 0x4B000000u) - 8388736.f;
+        const uint32_t ab = au[2 * w + b / 2];
+        const float af = __uint_as_float(b % 2 ? ab & 0xffff0000u : ab << 16);
+        acc = fmaf(af, wf, acc);
+      }
+    }
+  }
+  return acc;
+}
+
+// One wave computes one output row (int8 weights, per-row fp32 scale) for all
+// M tokens; same structure as gemv_rdna2_kernel.
+template <typename T, int M>
+__global__ void __launch_bounds__(WAVES* WARP32)
+    gemv_w8a16_rdna2_kernel(const int8_t* __restrict__ W,
+                            const float* __restrict__ scale,
+                            const T* __restrict__ A, const T* __restrict__ bias,
+                            T* __restrict__ C, const int N, const int K,
+                            const int kc_len, const int lda, const int ldw,
+                            const int ldc) {
+  extern __shared__ __align__(16) unsigned char smem[];
+  T* sA = reinterpret_cast<T*>(smem);  // [M][kc_len]
+  const int tid = threadIdx.x;
+  const int lane = tid % WARP32;
+  const int n = blockIdx.x * WAVES + tid / WARP32;
+  constexpr int STEP = WARP32 * 16;  // K elements per wave-wide 16-byte load
+
+  float acc[M];
+  #pragma unroll
+  for (int i = 0; i < M; i++) acc[i] = 0.f;
+
+  for (int kc = 0; kc < K; kc += kc_len) {
+    const int klen = min(kc_len, K - kc);
+    if (kc > 0) __syncthreads();
+    for (int i = 0; i < M; i++)
+      for (int k = tid * 8; k < klen; k += blockDim.x * 8)
+        *reinterpret_cast<int4*>(sA + i * kc_len + k) =
+            *reinterpret_cast<const int4*>(A + (long)i * lda + kc + k);
+    __syncthreads();
+    if (n >= N) continue;  // wave-uniform
+
+    const int8_t* wrow = W + (long)n * ldw + kc;
+    int k = lane * 16;
+    for (; k + STEP < klen; k += 2 * STEP) {
+      const int4 w0 = *reinterpret_cast<const int4*>(wrow + k);
+      const int4 w1 = *reinterpret_cast<const int4*>(wrow + k + STEP);
+  #pragma unroll
+      for (int i = 0; i < M; i++) {
+        acc[i] = dot16_i8<T>(w0, sA + i * kc_len + k, acc[i]);
+        acc[i] = dot16_i8<T>(w1, sA + i * kc_len + k + STEP, acc[i]);
+      }
+    }
+    for (; k < klen; k += STEP) {
+      const int4 w0 = *reinterpret_cast<const int4*>(wrow + k);
+  #pragma unroll
+      for (int i = 0; i < M; i++)
+        acc[i] = dot16_i8<T>(w0, sA + i * kc_len + k, acc[i]);
+    }
+  }
+
+  #pragma unroll
+  for (int i = 0; i < M; i++)
+  #pragma unroll
+    for (int mask = WARP32 / 2; mask >= 1; mask >>= 1)
+      acc[i] += __shfl_xor(acc[i], mask);
+
+  if (lane == 0 && n < N) {
+    const float s = scale[n];
+    const float b = bias ? to_float<T>(bias[n]) : 0.f;
+  #pragma unroll
+    for (int i = 0; i < M; i++)
+      C[(long)i * ldc + n] = from_float<T>(acc[i] * s + b);
+  }
+}
+
 #else  // non-RDNA2 device pass: empty stub for symbol parity.
 
 template <typename T, int M>
 __global__ void gemv_rdna2_kernel(const T*, const T*, const T*, T*, const int,
                                   const int, const int, const int, const int,
                                   const int) {}
+template <typename T, int M>
+__global__ void gemv_w8a16_rdna2_kernel(const int8_t*, const float*, const T*,
+                                        const T*, T*, const int, const int,
+                                        const int, const int, const int,
+                                        const int) {}
 
 #endif  // __HIP__RDNA2__ || !__HIP_DEVICE_COMPILE__
 
@@ -235,5 +364,78 @@ torch::Tensor gemv_rdna2(const at::Tensor& a, const at::Tensor& w,
 
 #undef VLLM_GEMV_RDNA2_BY_M
 #undef VLLM_GEMV_RDNA2_CASE
+  return c;
+}
+
+// Requirements: a [M, K] fp16 or bf16 with M in [1, 8]; w [N, K] int8 and
+// scale [N] fp32 (W = w * scale per row); rows contiguous and 16-byte aligned
+// (K % 16 == 0); optional contiguous bias [N] of a's dtype. Returns [M, N].
+torch::Tensor gemv_w8a16_rdna2(const at::Tensor& a, const at::Tensor& w,
+                               const at::Tensor& scale,
+                               const std::optional<at::Tensor>& bias) {
+  using namespace vllm::gemv_rdna2;
+  TORCH_CHECK(a.dtype() == torch::kFloat16 || a.dtype() == torch::kBFloat16,
+              "gemv_w8a16_rdna2 needs fp16 or bf16 activations");
+  TORCH_CHECK(w.dtype() == torch::kInt8 && scale.dtype() == torch::kFloat32 &&
+                  scale.is_contiguous(),
+              "gemv_w8a16_rdna2 needs int8 weights and contiguous fp32 scales");
+  TORCH_CHECK(a.dim() == 2 && w.dim() == 2 && a.size(1) == w.size(1),
+              "gemv_w8a16_rdna2 needs a [M, K] and w [N, K]");
+  const int M = a.size(0);
+  const int K = a.size(1);
+  const int N = w.size(0);
+  TORCH_CHECK(M >= 1 && M <= MAX_M, "gemv_w8a16_rdna2 supports M in [1, ",
+              MAX_M, "]");
+  TORCH_CHECK(scale.numel() == N, "gemv_w8a16_rdna2 needs one scale per row");
+  TORCH_CHECK(K % 16 == 0 && a.stride(1) == 1 && w.stride(1) == 1 &&
+                  a.stride(0) % 8 == 0 && w.stride(0) % 16 == 0 &&
+                  reinterpret_cast<uintptr_t>(a.data_ptr()) % 16 == 0 &&
+                  reinterpret_cast<uintptr_t>(w.data_ptr()) % 16 == 0,
+              "gemv_w8a16_rdna2 needs 16-byte aligned, K-contiguous rows");
+  if (bias.has_value()) {
+    TORCH_CHECK(bias->dtype() == a.dtype() && bias->numel() == N &&
+                    bias->is_contiguous(),
+                "gemv_w8a16_rdna2 bias must be a contiguous [N] of a's dtype");
+  }
+
+  auto c = torch::empty({M, N}, a.options());
+  const at::cuda::OptionalCUDAGuard device_guard(device_of(a));
+  const cudaStream_t stream = at::cuda::getCurrentCUDAStream();
+  const int elem = a.element_size();
+  int kc_len = K;
+  if ((size_t)M * K * elem > (size_t)LDS_BYTES)
+    kc_len = LDS_BYTES / (M * elem) / 512 * 512;
+  const size_t lds = (size_t)M * kc_len * elem;
+  const dim3 grid((N + WAVES - 1) / WAVES);
+  const dim3 block(WAVES * WARP32);
+
+#define VLLM_GEMV_W8A16_CASE(T, MM)                                            \
+  case MM:                                                                     \
+    gemv_w8a16_rdna2_kernel<T, MM><<<grid, block, lds, stream>>>(              \
+        w.data_ptr<int8_t>(), scale.data_ptr<float>(), (const T*)a.data_ptr(), \
+        bias.has_value() ? (const T*)bias->data_ptr() : nullptr,               \
+        (T*)c.data_ptr(), N, K, kc_len, a.stride(0), w.stride(0),              \
+        c.stride(0));                                                          \
+    break;
+#define VLLM_GEMV_W8A16_BY_M(T) \
+  switch (M) {                  \
+    VLLM_GEMV_W8A16_CASE(T, 1)  \
+    VLLM_GEMV_W8A16_CASE(T, 2)  \
+    VLLM_GEMV_W8A16_CASE(T, 3)  \
+    VLLM_GEMV_W8A16_CASE(T, 4)  \
+    VLLM_GEMV_W8A16_CASE(T, 5)  \
+    VLLM_GEMV_W8A16_CASE(T, 6)  \
+    VLLM_GEMV_W8A16_CASE(T, 7)  \
+    VLLM_GEMV_W8A16_CASE(T, 8)  \
+  }
+
+  if (a.dtype() == torch::kFloat16) {
+    VLLM_GEMV_W8A16_BY_M(__half);
+  } else {
+    VLLM_GEMV_W8A16_BY_M(__hip_bfloat16);
+  }
+
+#undef VLLM_GEMV_W8A16_BY_M
+#undef VLLM_GEMV_W8A16_CASE
   return c;
 }
