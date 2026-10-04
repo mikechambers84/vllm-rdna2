@@ -35,7 +35,7 @@ def use_rdna2_gemm(c: MPLinearLayerConfig) -> bool:
     return (
         on_gfx1030()
         and hasattr(torch.ops._rocm_C, "gemm_w4a16_exl_rdna2")
-        and c.weight_type == scalar_types.uint4b8
+        and c.weight_type in (scalar_types.uint4b8, scalar_types.uint4)
         and c.act_type == torch.float16
         and c.group_size % 32 == 0
     )
@@ -50,6 +50,7 @@ def _exllama_gfx1030_gemm(
     workspace: torch.Tensor,
     group_size: int,
     symmetric: bool,
+    v2_format: bool,
     rdna2_rows: int,
     w4a8_min_rows: int,
 ) -> torch.Tensor:
@@ -59,8 +60,8 @@ def _exllama_gfx1030_gemm(
     if 0 < m <= rdna2_rows:
         if x.stride(1) != 1 or x.stride(0) % 8 or x.data_ptr() % 16:
             x = x.clone(memory_format=torch.contiguous_format)
-        return ops.gemm_w4a16_exl_rdna2(x, w_q, w_zp, w_s, symmetric)
-    return ops.gptq_gemm(x, w_q, w_zp, w_s, True, False, 4, workspace)
+        return ops.gemm_w4a16_exl_rdna2(x, w_q, w_zp, w_s, symmetric, v2_format)
+    return ops.gptq_gemm(x, w_q, w_zp, w_s, True, v2_format, 4, workspace)
 
 
 def _exllama_gfx1030_gemm_fake(
@@ -72,6 +73,7 @@ def _exllama_gfx1030_gemm_fake(
     workspace: torch.Tensor,
     group_size: int,
     symmetric: bool,
+    v2_format: bool,
     rdna2_rows: int,
     w4a8_min_rows: int,
 ) -> torch.Tensor:

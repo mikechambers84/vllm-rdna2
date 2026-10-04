@@ -306,6 +306,13 @@ class AutoAWQConfig(QuantizationConfig):
             # in process_weights_after_loading before being handed to the kernel.
             if current_platform.is_cpu() or current_platform.is_xpu():
                 return AutoAWQMarlinLinearMethod(self)
+            # On RDNA2 the mixed-precision kernels (Exllama with the gfx1030
+            # GEMM for fp16, Triton W4A16 otherwise) beat the AWQ Triton GEMM.
+            if current_platform.is_rocm():
+                from vllm.platforms.rocm import on_gfx10
+
+                if on_gfx10():
+                    return AutoAWQMarlinLinearMethod(self)
 
             # Check if Marlin is supported and not using batch invariant mode
             # (Marlin kernels are not batch invariant)
