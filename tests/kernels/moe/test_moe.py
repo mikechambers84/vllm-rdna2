@@ -9,6 +9,7 @@ import functools
 from collections.abc import Callable
 from dataclasses import dataclass
 from typing import Any
+from unittest import mock
 
 import pytest
 import torch
@@ -2233,3 +2234,27 @@ def test_unquantized_bf16_flashinfer_trtllm_backend(
 
     close = torch.isclose(trtllm_output, baseline_output, atol=1e-1, rtol=0.85)
     assert close.float().mean() > 0.925
+
+
+@pytest.mark.parametrize(
+    "dtype,block_shape", [("int4_w4a16", [0, 32]), ("int8_w8a8", None)]
+)
+@pytest.mark.parametrize(
+    "M,E,topk,block_m",
+    [
+        (256, 256, 8, 16),  # 8 tokens per expert
+        (1024, 256, 8, 32),  # 32 tokens per expert
+        (4096, 8, 2, 64),  # Mixtral-like: 1024 tokens per expert
+    ],
+)
+def test_gfx10_moe_default_tiles_follow_tokens_per_expert(
+    dtype, block_shape, M, E, topk, block_m
+):
+    """On gfx10 int4 and int8 MoE tiles are sized by the tokens each expert
+    sees: the M-based 64/128-row tiles left most rows empty with many experts
+    (1.4-4x slower on a V620 across E=8..256)."""
+    with mock.patch.object(fused_moe_module, "_on_gfx10", return_value=True):
+        config = fused_moe_module.get_default_config(
+            M, E, 1024, 2048, topk, dtype, block_shape
+        )
+    assert config["BLOCK_SIZE_M"] == block_m
