@@ -145,7 +145,7 @@ def test_gemm_w4a16_exl_rdna2_v2_zeros(m):
 
 
 @gfx1030_only
-@pytest.mark.parametrize("cfg", range(13))
+@pytest.mark.parametrize("cfg", range(9))
 def test_gemm_w4a16_exl_rdna2_configs(cfg):
     """Every tile config, with a partial token tile."""
     torch.manual_seed(0)

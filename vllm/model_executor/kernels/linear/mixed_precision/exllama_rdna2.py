@@ -3,8 +3,9 @@
 """gfx1030 dispatch for ExllamaLinearKernel's 4-bit layers, by row count.
 
 Up to RDNA2_MAX_ROWS rows run ``gemm_w4a16_exl_rdna2`` on Exllama's own
-tensors (1.2x gptq_gemm at 1 row, 1.6-2.7x at 8-64 rows on Qwen3.8-27B, at
-parity by 1024); larger batches run gptq_gemm's reconstruct + GEMM. With
+tensors (summed over the linear layers of eight 1.5B-70B models, 1.04-1.5x
+gptq_gemm at 1 row, 1.5-3x at 8-64 rows, 1.06-1.25x at 512, near parity by
+1024); larger batches run gptq_gemm's reconstruct + GEMM. With
 VLLM_ROCM_W4A8_PREFILL, larger batches run the int8 GEMM on the re-quantized
 weight instead.
 """
