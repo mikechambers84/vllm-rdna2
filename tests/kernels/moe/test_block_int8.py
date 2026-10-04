@@ -161,3 +161,22 @@ def test_block_int8_quantization_truncates_fractional_values(dtype):
     torch.testing.assert_close(ref_q, expected, atol=0, rtol=0)
     torch.testing.assert_close(scale, torch.ones_like(scale), atol=0, rtol=0)
     torch.testing.assert_close(ref_s, scale, atol=0, rtol=0)
+
+
+def test_int8_w8a8_moe_looks_up_int8_tuned_configs():
+    """int8 W8A8 MoE must find dtype=int8_w8a8 config files; without the dtype
+    it silently used the unquantized (fp16) configs or the defaults."""
+    from vllm.model_executor.layers.fused_moe.config import (
+        int8_w8a8_moe_quant_config,
+    )
+    from vllm.model_executor.layers.fused_moe.fused_moe import get_config_file_name
+
+    quant_config = int8_w8a8_moe_quant_config(
+        w1_scale=torch.ones(1),
+        w2_scale=torch.ones(1),
+        a1_scale=None,
+        a2_scale=None,
+        per_act_token_quant=True,
+    )
+    name = get_config_file_name(256, 512, quant_config.config_name(torch.float16))
+    assert name.endswith(",dtype=int8_w8a8.json")
