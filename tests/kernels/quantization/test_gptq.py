@@ -86,3 +86,32 @@ def test_gptq_gemm_reconstruct_path_cuda_graph():
     graph.replay()
     torch.accelerator.synchronize()
     torch.testing.assert_close(out, eager)
+
+
+@pytest.mark.parametrize("m", [16, 512])
+def test_exllama_w4a8_gemm_runs_int8_only_for_prefill(m):
+    """Opt-in W4A8 prefill: rows above the fused-kernel limit run as an int8
+    GEMM on the re-quantized weight (per-token activation quant costs ~1e-2;
+    a wrong nibble order would cost ~1), while decode rows stay W4A16."""
+    from vllm.model_executor.kernels.linear.mixed_precision.exllama_w4a8 import (
+        channel_scales,
+        w4a8_gemm,
+    )
+
+    torch.manual_seed(0)
+    k, n, group_size = 5120, 1024, 32
+    w_q, zeros, scales, w_ref = _gptq_int4_sym(k, n, group_size)
+    channel_scale = channel_scales(scales)
+    workspace = torch.empty(k * n, device="cuda", dtype=torch.float16)
+    a = torch.randn(m, k, device="cuda", dtype=torch.float16)
+    out = torch.ops.vllm.exllama_w4a8_gemm(
+        a, w_q, zeros, scales, channel_scale, workspace, group_size
+    )
+    ref = a.float() @ w_ref
+    err = ((out.float() - ref).norm() / ref.norm()).item()
+    if m > 50:
+        expected = w4a8_gemm(a, w_q, scales, channel_scale, group_size, workspace)
+        torch.testing.assert_close(out, expected, rtol=0, atol=0)
+        assert err < 2e-2
+    else:
+        assert err < 3e-3

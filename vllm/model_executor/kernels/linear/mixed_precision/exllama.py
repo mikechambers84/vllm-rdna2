@@ -4,6 +4,7 @@
 
 import torch
 
+import vllm.envs as envs
 from vllm import _custom_ops as ops
 from vllm.model_executor.layers.quantization.utils.quant_utils import (
     pack_quantized_values_into_int32,
@@ -24,6 +25,20 @@ def _reserve_dq_workspace(numel: int, dtype: torch.dtype, device: torch.device):
     workspace = _dq_workspaces.get(device)
     if workspace is None or workspace.numel() < numel or workspace.dtype != dtype:
         _dq_workspaces[device] = torch.empty(numel, dtype=dtype, device=device)
+
+
+def _use_w4a8_prefill(c: MPLinearLayerConfig) -> bool:
+    if not (envs.VLLM_ROCM_W4A8_PREFILL and current_platform.is_rocm()):
+        return False
+    from vllm.platforms.rocm import on_gfx1030
+
+    return (
+        on_gfx1030()
+        and c.weight_type == scalar_types.uint4b8
+        and not c.zero_points
+        and c.group_size > 0
+        and c.group_size % 8 == 0
+    )
 
 
 class ExllamaLinearKernel(MPLinearKernel):
@@ -133,6 +148,10 @@ class ExllamaLinearKernel(MPLinearKernel):
 
         k, n = c.partition_weight_shape
         _reserve_dq_workspace(k * n, c.act_type, getattr(layer, self.w_q_name).device)
+        if _use_w4a8_prefill(c):
+            from .exllama_w4a8 import channel_scales
+
+            layer.w4a8_channel_scale = channel_scales(getattr(layer, self.w_s_name))
 
     def apply_weights(
         self,
@@ -152,6 +171,19 @@ class ExllamaLinearKernel(MPLinearKernel):
         use_v2_format = False
 
         assert w_zp is not None, "Zero points are required by Exllama"
+        if hasattr(layer, "w4a8_channel_scale"):
+            output = torch.ops.vllm.exllama_w4a8_gemm(
+                x_2d,
+                w_q,
+                w_zp,
+                w_s,
+                layer.w4a8_channel_scale,
+                _dq_workspaces[x_2d.device],
+                c.group_size,
+            )
+            if bias is not None:
+                output.add_(bias)
+            return output.reshape(out_shape)
         output = ops.gptq_gemm(
             x_2d,
             w_q,
