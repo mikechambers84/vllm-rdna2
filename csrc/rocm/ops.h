@@ -35,6 +35,12 @@ torch::Tensor w8a8_gemv_rdna2(const at::Tensor& a, const at::Tensor& w,
                               const std::optional<at::Tensor>& bias,
                               at::ScalarType out_dtype);
 
+torch::Tensor w8a8_gemm_rdna2(const at::Tensor& a, const at::Tensor& w,
+                              const at::Tensor& scale_a,
+                              const at::Tensor& scale_b,
+                              const std::optional<at::Tensor>& bias,
+                              at::ScalarType out_dtype);
+
 torch::Tensor gptq_gemm_rdna3(torch::Tensor a, torch::Tensor b_q_weight,
                               torch::Tensor b_qzeros, torch::Tensor b_scales,
                               bool use_v2_format);

@@ -4,8 +4,8 @@
 
 Prefill GEMMs (above Exllama's fused-kernel row limit) quantize activations to
 int8 per token, re-quantize the int4 group-quantized weight to int8 with one
-scale per output channel, and run the int8 GEMM on v_dot4. On a V620 the
-Qwen3.8-27B prefill GEMMs run 1.7x faster than dequant + fp16 GEMM, at the cost
+scale per output channel, and run the W8A8 int8 GEMM on v_dot4. On a V620 the
+Qwen3.8-27B prefill GEMMs run ~2x faster than dequant + fp16 GEMM, at the cost
 of per-token activation quantization (as in W8A8 checkpoints) and a per-channel
 weight scale.
 """
@@ -13,8 +13,8 @@ weight scale.
 import torch
 
 from vllm import _custom_ops as ops
-from vllm.model_executor.layers.quantization.compressed_tensors.triton_scaled_mm import (  # noqa: E501
-    triton_scaled_mm,
+from vllm.model_executor.kernels.linear.scaled_mm.triton import (
+    _triton_int8_scaled_mm_func,
 )
 from vllm.triton_utils import tl, triton
 from vllm.utils.torch_utils import direct_register_custom_op
@@ -33,7 +33,8 @@ def _requant_int4_to_int8_kernel(
     BN: tl.constexpr,
 ):
     # q: [K/8, N] int32 in Exllama's shuffled nibble order; s: [K/GROUP, N]
-    # fp16 group scales; inv: [N] fp32 inverse channel scales; out: [K, N] int8.
+    # fp16 group scales; inv: [N] fp32 inverse channel scales; out: [N, K] int8,
+    # the layout of W8A8 checkpoint weights.
     offs_k = tl.program_id(0) * BK + tl.arange(0, BK)
     offs_n = tl.program_id(1) * BN + tl.arange(0, BN)
     mask = (offs_k[:, None] < K) & (offs_n[None, :] < N)
@@ -45,7 +46,7 @@ def _requant_int4_to_int8_kernel(
     inv = tl.load(inv_ptr + offs_n, mask=offs_n < N)
     value = (nib - 8).to(tl.float32) * scale.to(tl.float32) * inv[None, :]
     tl.store(
-        out_ptr + offs_k[:, None] * N + offs_n[None, :],
+        out_ptr + offs_n[None, :] * K + offs_k[:, None],
         tl.floor(value + 0.5).to(tl.int8),
         mask=mask,
     )
@@ -66,13 +67,15 @@ def w4a8_gemm(
 ) -> torch.Tensor:
     """Int8 GEMM of x [M, K] and the re-quantized w_q; workspace >= K*N bytes."""
     k, n = x.shape[1], w_q.shape[1]
-    w8 = workspace.view(torch.int8)[: k * n].view(k, n)
+    w8 = workspace.view(torch.int8)[: k * n].view(n, k)
     grid = (triton.cdiv(k, 64), triton.cdiv(n, 128))
     _requant_int4_to_int8_kernel[grid](
         w_q, w_s, 1.0 / channel_scale, w8, k, n, GROUP=group_size, BK=64, BN=128
     )
     x_q, x_s, _ = ops.scaled_int8_quant(x.contiguous(), None, None, symmetric=True)
-    return triton_scaled_mm(x_q, w8, x_s, channel_scale.view(-1, 1), x.dtype)
+    return _triton_int8_scaled_mm_func(
+        x_q, w8.t(), x_s, channel_scale.view(-1, 1), x.dtype
+    )
 
 
 def _exllama_w4a8_gemm(

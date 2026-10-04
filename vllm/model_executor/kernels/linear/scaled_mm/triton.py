@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
+from collections.abc import Callable
 from functools import cache
 
 import torch
@@ -157,31 +158,42 @@ class TritonInt8ScaledMMLinearKernel(CutlassInt8ScaledMMLinearKernel):
 
 
 @cache
-def _rdna2_w8a8_gemv_available() -> bool:
+def _rdna2_w8a8_ops_available() -> bool:
     if not (current_platform.is_rocm() and envs.VLLM_ROCM_USE_SKINNY_GEMM):
         return False
     from vllm.platforms.rocm import on_gfx1030
 
-    return on_gfx1030() and hasattr(torch.ops._rocm_C, "w8a8_gemv_rdna2")
+    return on_gfx1030() and hasattr(torch.ops._rocm_C, "w8a8_gemm_rdna2")
 
 
-def _use_rdna2_w8a8_gemv(
+def _rdna2_w8a8_op(
     x_q: torch.Tensor,
     w_q: torch.Tensor,
     x_s: torch.Tensor,
     w_s: torch.Tensor,
     out_dtype: torch.dtype,
-) -> bool:
-    # w_q is the [K, N] view of [N, K] weight rows.
-    return (
-        x_q.shape[0] <= 8
-        and x_q.shape[1] % 16 == 0
-        and x_q.is_contiguous()
-        and w_q.stride(0) == 1
+) -> Callable[..., torch.Tensor] | None:
+    """The gfx1030 v_dot4 kernel for this int8 GEMM, or None for Triton.
+
+    Both kernels give results identical to Triton's (int32 accumulation).
+    The GEMV streams decode weights at ~95% of bandwidth (2.1-2.3x Triton);
+    the GEMM runs prefill 1.4-1.8x faster. Triton's 16-row decode tiles win
+    for 9-16 rows.
+    """
+    if not (
+        x_q.is_contiguous()
+        and w_q.stride(0) == 1  # the [K, N] view of [N, K] weight rows
         and x_s.dtype == w_s.dtype == torch.float32
         and out_dtype in (torch.float16, torch.bfloat16)
-        and _rdna2_w8a8_gemv_available()
-    )
+        and _rdna2_w8a8_ops_available()
+    ):
+        return None
+    m, k = x_q.shape
+    if m <= 8 and k % 16 == 0:
+        return ops.w8a8_gemv_rdna2
+    if m > 16 and k % 64 == 0:
+        return ops.w8a8_gemm_rdna2
+    return None
 
 
 def _triton_int8_scaled_mm_func(
@@ -192,10 +204,9 @@ def _triton_int8_scaled_mm_func(
     out_dtype: torch.dtype,
     bias: torch.Tensor | None = None,
 ) -> torch.Tensor:
-    # gfx1030 decode: the v_dot4 GEMV streams the weights at ~95% of bandwidth,
-    # 2.1-2.3x the Triton kernel, with identical (int32-accumulated) results.
-    if _use_rdna2_w8a8_gemv(x_q, w_q, x_s, w_s, out_dtype):
-        return ops.w8a8_gemv_rdna2(
+    rdna2_op = _rdna2_w8a8_op(x_q, w_q, x_s, w_s, out_dtype)
+    if rdna2_op is not None:
+        return rdna2_op(
             x_q, w_q.t(), x_s.contiguous(), w_s.contiguous(), out_dtype, bias
         )
     return triton_scaled_mm(x_q, w_q, x_s, w_s, out_dtype, bias)

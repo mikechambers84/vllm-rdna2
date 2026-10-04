@@ -213,28 +213,37 @@ def test_triton_int8_scaled_mm_opcheck():
     )
 
 
-def _rdna2_w8a8_gemv_available() -> bool:
+def _rdna2_w8a8_ops_available() -> bool:
     if not current_platform.is_rocm():
         return False
     from vllm.platforms.rocm import on_gfx1030
 
-    return on_gfx1030() and hasattr(torch.ops._rocm_C, "w8a8_gemv_rdna2")
+    return on_gfx1030() and hasattr(torch.ops._rocm_C, "w8a8_gemm_rdna2")
 
 
-# The gfx1030 decode GEMV must reproduce triton_scaled_mm bit for bit: both
-# accumulate exactly in int32 and scale in fp32 once.
-@pytest.mark.skipif(not _rdna2_w8a8_gemv_available(), reason="gfx1030 only")
-@pytest.mark.parametrize("m", [1, 3, 8])
+# The gfx1030 decode GEMV and prefill GEMM must reproduce triton_scaled_mm bit
+# for bit: all accumulate exactly in int32 and scale in fp32 once.
+@pytest.mark.skipif(not _rdna2_w8a8_ops_available(), reason="gfx1030 only")
 @pytest.mark.parametrize(
-    "n,k",
+    "op,m,n,k",
     [
-        (1000, 4096),  # N not a multiple of the 16 rows per workgroup
-        (512, 17408),  # M x K overflows LDS at M = 8, so A is staged in chunks
+        # GEMV: N not a multiple of the 16 rows per workgroup
+        ("w8a8_gemv_rdna2", 1, 1000, 4096),
+        ("w8a8_gemv_rdna2", 3, 1000, 4096),
+        ("w8a8_gemv_rdna2", 8, 1000, 4096),
+        # GEMV: M x K overflows LDS at M = 8, so A is staged in chunks
+        ("w8a8_gemv_rdna2", 1, 512, 17408),
+        ("w8a8_gemv_rdna2", 8, 512, 17408),
+        # GEMM: partial row and column tiles
+        ("w8a8_gemm_rdna2", 17, 1000, 320),
+        ("w8a8_gemm_rdna2", 300, 4096, 5120),
+        # GEMM: enough tiles for the 128 x 256 tile
+        ("w8a8_gemm_rdna2", 2048, 17408, 5120),
     ],
 )
 @pytest.mark.parametrize("per_tensor_scales", [False, True])
 @pytest.mark.parametrize("out_dtype", [torch.float16, torch.bfloat16])
-def test_rdna2_w8a8_gemv_matches_triton(m, n, k, per_tensor_scales, out_dtype):
+def test_rdna2_w8a8_matches_triton(op, m, n, k, per_tensor_scales, out_dtype):
     from vllm import _custom_ops as ops
 
     dev = current_platform.device_type
@@ -246,5 +255,5 @@ def test_rdna2_w8a8_gemv_matches_triton(m, n, k, per_tensor_scales, out_dtype):
     bias = torch.randn(n, device=dev, dtype=out_dtype)
 
     ref = triton_scaled_mm(a, w.t(), scale_a, scale_b, out_dtype, bias)
-    out = ops.w8a8_gemv_rdna2(a, w, scale_a, scale_b, out_dtype, bias)
+    out = getattr(ops, op)(a, w, scale_a, scale_b, out_dtype, bias)
     torch.testing.assert_close(out, ref, rtol=0, atol=0)
