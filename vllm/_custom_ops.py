@@ -2113,7 +2113,7 @@ def w8a8_gemv_rdna2(
     bias: torch.Tensor | None = None,
 ) -> torch.Tensor:
     """RDNA2 int8 GEMV: ``(a @ w.T) * scale_a * scale_b (+ bias)`` for int8
-    ``a`` [M <= 8, K] and ``w`` [N, K]; matches ``triton_scaled_mm`` exactly."""
+    ``a`` [M <= 24, K] and ``w`` [N, K]; matches ``triton_scaled_mm`` exactly."""
     return torch.ops._rocm_C.w8a8_gemv_rdna2(a, w, scale_a, scale_b, bias, out_dtype)
 
 

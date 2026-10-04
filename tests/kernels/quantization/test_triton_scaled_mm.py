@@ -234,6 +234,9 @@ def _rdna2_w8a8_ops_available() -> bool:
         # GEMV: M x K overflows LDS at M = 8, so A is staged in chunks
         ("w8a8_gemv_rdna2", 1, 512, 17408),
         ("w8a8_gemv_rdna2", 8, 512, 17408),
+        # GEMV above 8 tokens: M padded to a multiple of 4, 4 rows per wave
+        ("w8a8_gemv_rdna2", 9, 1000, 4096),
+        ("w8a8_gemv_rdna2", 24, 512, 17408),
         # GEMM: partial row and column tiles
         ("w8a8_gemm_rdna2", 17, 1000, 320),
         ("w8a8_gemm_rdna2", 300, 4096, 5120),

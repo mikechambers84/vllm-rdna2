@@ -5,7 +5,8 @@
 // (+ bias), int8 A and W with int32 accumulation through v_dot4_i32_i8, fp32
 // per-token (or per-tensor) sa and per-channel (or per-tensor) sb. Each wave
 // streams R weight rows with 16-byte loads; A is staged in LDS, in K chunks
-// when M x K exceeds it, so it is read from global once per workgroup.
+// when M x K exceeds it, so it is read from global once per workgroup. Up to
+// 24 tokens (batched decode, speculative-decoding verification).
 
 #include <torch/all.h>
 #include <c10/cuda/CUDAGuard.h>
@@ -25,7 +26,7 @@ namespace gemv_w8a8_rdna2 {
 static constexpr int WARP32 = 32;
 static constexpr int WAVES = 8;  // 256 threads per workgroup
 static constexpr int LDS_BYTES = 64 * 1024;
-static constexpr int MAX_M = 8;
+static constexpr int MAX_M = 24;
 
 template <typename T>
 __device__ __forceinline__ T from_float(float v);
@@ -51,18 +52,16 @@ __device__ __forceinline__ float to_float<__hip_bfloat16>(__hip_bfloat16 v) {
 
 #if defined(__HIP__RDNA2__) || !defined(__HIP_DEVICE_COMPILE__)
 
-// One wave computes R consecutive output channels for all M tokens. kc_len is
-// the number of K bytes per LDS chunk (K itself when A fits).
+// One wave computes R consecutive output channels for all M tokens, of which
+// the first m are real (M is padded above 8 to limit instantiations). kc_len
+// is the number of K bytes per LDS chunk (K itself when A fits).
 template <typename TOut, int M, int R>
-__global__ void __launch_bounds__(WAVES* WARP32)
-    gemv_w8a8_rdna2_kernel(const int8_t* __restrict__ W,
-                           const int8_t* __restrict__ A,
-                           const float* __restrict__ sa,
-                           const float* __restrict__ sb,
-                           const TOut* __restrict__ bias, TOut* __restrict__ C,
-                           const int N, const int K, const int kc_len,
-                           const int lda, const int ldw, const int ldc,
-                           const int sa_stride, const int sb_stride) {
+__global__ void __launch_bounds__(WAVES* WARP32) gemv_w8a8_rdna2_kernel(
+    const int8_t* __restrict__ W, const int8_t* __restrict__ A,
+    const float* __restrict__ sa, const float* __restrict__ sb,
+    const TOut* __restrict__ bias, TOut* __restrict__ C, const int m,
+    const int N, const int K, const int kc_len, const int lda, const int ldw,
+    const int ldc, const int sa_stride, const int sb_stride) {
   extern __shared__ __align__(16) int8_t sA[];  // [M][kc_len]
   const int tid = threadIdx.x;
   const int lane = tid & (WARP32 - 1);
@@ -81,7 +80,8 @@ __global__ void __launch_bounds__(WAVES* WARP32)
     for (int i = 0; i < M; i++)
       for (int k = tid * 16; k < klen; k += blockDim.x * 16)
         *reinterpret_cast<int4*>(sA + i * kc_len + k) =
-            *reinterpret_cast<const int4*>(A + (long)i * lda + kc + k);
+            i < m ? *reinterpret_cast<const int4*>(A + (long)i * lda + kc + k)
+                  : make_int4(0, 0, 0, 0);
     __syncthreads();
 
   #pragma unroll 2
@@ -122,12 +122,14 @@ __global__ void __launch_bounds__(WAVES* WARP32)
       const float s = sb[n * sb_stride];
   #pragma unroll
       for (int i = 0; i < M; i++) {
-        // Round, then add the bias in the output dtype, as triton_scaled_mm
-        // does, so both give identical results.
-        TOut v = from_float<TOut>((float)acc[i][r] * sa[i * sa_stride] * s);
-        if (bias)
-          v = from_float<TOut>(to_float<TOut>(v) + to_float<TOut>(bias[n]));
-        C[(long)i * ldc + n] = v;
+        if (i < m) {
+          // Round, then add the bias in the output dtype, as triton_scaled_mm
+          // does, so both give identical results.
+          TOut v = from_float<TOut>((float)acc[i][r] * sa[i * sa_stride] * s);
+          if (bias)
+            v = from_float<TOut>(to_float<TOut>(v) + to_float<TOut>(bias[n]));
+          C[(long)i * ldc + n] = v;
+        }
       }
     }
   }
@@ -140,14 +142,14 @@ __global__ void gemv_w8a8_rdna2_kernel(const int8_t*, const int8_t*,
                                        const float*, const float*, const TOut*,
                                        TOut*, const int, const int, const int,
                                        const int, const int, const int,
-                                       const int, const int) {}
+                                       const int, const int, const int) {}
 
 #endif  // __HIP__RDNA2__ || !__HIP_DEVICE_COMPILE__
 
 }  // namespace gemv_w8a8_rdna2
 }  // namespace vllm
 
-// Requirements: a int8 [M, K] with M in [1, 8] and contiguous rows; w int8
+// Requirements: a int8 [M, K] with M in [1, 24] and contiguous rows; w int8
 // [N, K] with contiguous rows (an int8 linear's [K, N] weight view,
 // transposed); K % 16 == 0 and 16-byte aligned rows; scale_a fp32 with 1 or M
 // elements, scale_b fp32 with 1 or N elements; optional bias [N] in out_dtype.
@@ -194,14 +196,16 @@ torch::Tensor w8a8_gemv_rdna2(const at::Tensor& a, const at::Tensor& w,
   const at::cuda::OptionalCUDAGuard device_guard(device_of(a));
   const cudaStream_t stream = at::cuda::getCurrentCUDAStream();
 
+  // Above 8 tokens M is padded to a multiple of 4 (the extra rows are zero).
+  const int MP = M <= 8 ? M : (M + 3) / 4 * 4;
   // A in LDS: all of it when it fits, else K chunks (multiples of 512 bytes,
   // one wave-wide 16-byte load per lane) sized to fill the LDS.
   int kc_len = K;
-  if ((size_t)M * K > (size_t)LDS_BYTES) kc_len = LDS_BYTES / M / 512 * 512;
-  const size_t lds = (size_t)M * kc_len;
-  // Two rows per wave reuse each staged A load across both; at one or two
+  if ((size_t)MP * K > (size_t)LDS_BYTES) kc_len = LDS_BYTES / MP / 512 * 512;
+  const size_t lds = (size_t)MP * kc_len;
+  // More rows per wave reuse each staged A load across them; at one or two
   // tokens a single row keeps more waves in flight per weight byte.
-  const int R = M <= 2 ? 1 : 2;
+  const int R = M <= 2 ? 1 : M <= 8 ? 2 : 4;
   const dim3 grid((N + WAVES * R - 1) / (WAVES * R));
   const dim3 block(WAVES * WARP32);
   const int sa_stride = scale_a.numel() == 1 ? 0 : 1;
@@ -212,25 +216,26 @@ torch::Tensor w8a8_gemv_rdna2(const at::Tensor& a, const at::Tensor& w,
       w.data_ptr<int8_t>(), a.data_ptr<int8_t>(), scale_a.data_ptr<float>(), \
       scale_b.data_ptr<float>(),                                             \
       bias.has_value() ? (const TOUT*)bias->data_ptr() : nullptr,            \
-      (TOUT*)c.data_ptr(), N, K, kc_len, a.stride(0), w.stride(0),           \
+      (TOUT*)c.data_ptr(), M, N, K, kc_len, a.stride(0), w.stride(0),        \
       c.stride(0), sa_stride, sb_stride)
-#define VLLM_W8A8_GEMV_CASE(TOUT, MM)     \
+#define VLLM_W8A8_GEMV_CASE(TOUT, MM, RR) \
   case MM:                                \
-    if (R == 1)                           \
-      VLLM_W8A8_GEMV_LAUNCH(TOUT, MM, 1); \
-    else                                  \
-      VLLM_W8A8_GEMV_LAUNCH(TOUT, MM, 2); \
+    VLLM_W8A8_GEMV_LAUNCH(TOUT, MM, RR);  \
     break;
-#define VLLM_W8A8_GEMV_BY_M(TOUT) \
-  switch (M) {                    \
-    VLLM_W8A8_GEMV_CASE(TOUT, 1)  \
-    VLLM_W8A8_GEMV_CASE(TOUT, 2)  \
-    VLLM_W8A8_GEMV_CASE(TOUT, 3)  \
-    VLLM_W8A8_GEMV_CASE(TOUT, 4)  \
-    VLLM_W8A8_GEMV_CASE(TOUT, 5)  \
-    VLLM_W8A8_GEMV_CASE(TOUT, 6)  \
-    VLLM_W8A8_GEMV_CASE(TOUT, 7)  \
-    VLLM_W8A8_GEMV_CASE(TOUT, 8)  \
+#define VLLM_W8A8_GEMV_BY_M(TOUT)    \
+  switch (MP) {                      \
+    VLLM_W8A8_GEMV_CASE(TOUT, 1, 1)  \
+    VLLM_W8A8_GEMV_CASE(TOUT, 2, 1)  \
+    VLLM_W8A8_GEMV_CASE(TOUT, 3, 2)  \
+    VLLM_W8A8_GEMV_CASE(TOUT, 4, 2)  \
+    VLLM_W8A8_GEMV_CASE(TOUT, 5, 2)  \
+    VLLM_W8A8_GEMV_CASE(TOUT, 6, 2)  \
+    VLLM_W8A8_GEMV_CASE(TOUT, 7, 2)  \
+    VLLM_W8A8_GEMV_CASE(TOUT, 8, 2)  \
+    VLLM_W8A8_GEMV_CASE(TOUT, 12, 4) \
+    VLLM_W8A8_GEMV_CASE(TOUT, 16, 4) \
+    VLLM_W8A8_GEMV_CASE(TOUT, 20, 4) \
+    VLLM_W8A8_GEMV_CASE(TOUT, 24, 4) \
   }
 
   if (out_dtype == torch::kFloat16) {

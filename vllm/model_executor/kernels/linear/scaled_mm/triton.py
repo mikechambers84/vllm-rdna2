@@ -176,9 +176,8 @@ def _rdna2_w8a8_op(
     """The gfx1030 v_dot4 kernel for this int8 GEMM, or None for Triton.
 
     Both kernels give results identical to Triton's (int32 accumulation).
-    The GEMV streams decode weights at ~95% of bandwidth (2.1-2.3x Triton);
-    the GEMM runs prefill 1.4-1.8x faster. Triton's 16-row decode tiles win
-    for 9-16 rows.
+    The GEMV streams decode weights at ~95% of bandwidth (2.1-2.3x Triton)
+    and stays ~2x ahead up to 24 rows; the GEMM runs prefill 1.4-1.8x faster.
     """
     if not (
         x_q.is_contiguous()
@@ -189,9 +188,9 @@ def _rdna2_w8a8_op(
     ):
         return None
     m, k = x_q.shape
-    if m <= 8 and k % 16 == 0:
+    if m <= 24 and k % 16 == 0:
         return ops.w8a8_gemv_rdna2
-    if m > 16 and k % 64 == 0:
+    if m > 24 and k % 64 == 0:
         return ops.w8a8_gemm_rdna2
     return None
 
