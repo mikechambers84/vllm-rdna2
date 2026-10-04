@@ -3,6 +3,7 @@
 """Inference-only Qwen3_5 MTP model."""
 
 from collections.abc import Iterable
+from contextlib import nullcontext
 
 import torch
 from torch import nn
@@ -55,6 +56,13 @@ from .utils import (
 logger = init_logger(__name__)
 
 
+def _vocab_layers_device():
+    """With one pipeline stage the proposer replaces the drafter's embedding
+    and lm_head with the target model's, so build them on the meta device: two
+    transient ~2.4 GiB copies do not fit beside a 27B target on a 32 GB GPU."""
+    return torch.device("meta") if get_pp_group().world_size == 1 else nullcontext()
+
+
 @support_torch_compile(
     dynamic_arg_dims={
         "input_ids": 0,
@@ -84,10 +92,11 @@ class Qwen3_5MultiTokenPredictor(nn.Module):
         self.mtp_start_layer_idx = config.num_hidden_layers
         self.num_mtp_layers = getattr(config, "mtp_num_hidden_layers", 1)
 
-        self.embed_tokens = VocabParallelEmbedding(
-            self.vocab_size,
-            config.hidden_size,
-        )
+        with _vocab_layers_device():
+            self.embed_tokens = VocabParallelEmbedding(
+                self.vocab_size,
+                config.hidden_size,
+            )
 
         # Workaround: mtp.fc is stored as BF16 in NVFP4 checkpoints but is
         # missing from hf_quant_config.json exclude_modules. Force unquantized.
@@ -238,12 +247,13 @@ class Qwen3_5MTP(LocalArgmaxMixin, nn.Module, SupportsMultiModal, SupportsPP):
         )
 
         if get_pp_group().is_last_rank:
-            self.lm_head = ParallelLMHead(
-                config.vocab_size,
-                config.hidden_size,
-                quant_config=self.quant_config,
-                prefix=maybe_prefix(prefix, "lm_head"),
-            )
+            with _vocab_layers_device():
+                self.lm_head = ParallelLMHead(
+                    config.vocab_size,
+                    config.hidden_size,
+                    quant_config=self.quant_config,
+                    prefix=maybe_prefix(prefix, "lm_head"),
+                )
             if config.tie_word_embeddings:
                 self.lm_head = self.lm_head.tie_weights(self.model.embed_tokens)
         else:
@@ -329,6 +339,8 @@ class Qwen3_5MTP(LocalArgmaxMixin, nn.Module, SupportsMultiModal, SupportsPP):
                 if name.startswith("mtp."):
                     name = name.replace("mtp.", "model.")
                 elif any(key in name for key in ["embed_tokens", "lm_head"]):
+                    if get_pp_group().world_size == 1:
+                        continue  # replaced by the target model's
                     if "embed_tokens" in name:
                         name = name.replace("language_model.", "")
                 else:
