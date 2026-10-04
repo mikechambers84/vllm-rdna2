@@ -69,6 +69,13 @@ TORCH_LIBRARY_EXPAND(TORCH_EXTENSION_NAME, rocm_ops) {
       "w8a8_gemm_rdna2(Tensor a, Tensor w, Tensor scale_a, Tensor scale_b, "
       "Tensor? bias, ScalarType out_dtype) -> Tensor");
   rocm_ops.impl("w8a8_gemm_rdna2", torch::kCUDA, &w8a8_gemm_rdna2);
+  // W4A16 fused-MoE decode (few tokens) on the Triton WNA16 weight layout.
+  rocm_ops.def(
+      "moe_wna16_decode_rdna2(Tensor! output, Tensor x, Tensor topk_ids, "
+      "Tensor topk_weights, Tensor w13, Tensor s13, Tensor w2, Tensor s2, "
+      "Tensor! act) -> ()");
+  rocm_ops.impl("moe_wna16_decode_rdna2", torch::kCUDA,
+                &moe_wna16_decode_rdna2);
 #endif  // VLLM_ROCM_GFX1030
 
 #ifdef VLLM_ROCM_GFX1100

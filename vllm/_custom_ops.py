@@ -2131,6 +2131,25 @@ def w8a8_gemm_rdna2(
     return torch.ops._rocm_C.w8a8_gemm_rdna2(a, w, scale_a, scale_b, bias, out_dtype)
 
 
+def moe_wna16_decode_rdna2(
+    output: torch.Tensor,
+    x: torch.Tensor,
+    topk_ids: torch.Tensor,
+    topk_weights: torch.Tensor,
+    w13: torch.Tensor,
+    w13_scale: torch.Tensor,
+    w2: torch.Tensor,
+    w2_scale: torch.Tensor,
+    act: torch.Tensor,
+) -> None:
+    """RDNA2 W4A16 fused-MoE decode (SiLU, symmetric int4 g32) into ``output``,
+    on the uint8-packed ``[E, N, K/2]`` weights of the Triton WNA16 backend;
+    ``act`` is a ``[M * topk, I]`` workspace."""
+    torch.ops._rocm_C.moe_wna16_decode_rdna2(
+        output, x, topk_ids, topk_weights, w13, w13_scale, w2, w2_scale, act
+    )
+
+
 def wvSplitK_int4_g(
     weight: torch.Tensor,
     activation: torch.Tensor,

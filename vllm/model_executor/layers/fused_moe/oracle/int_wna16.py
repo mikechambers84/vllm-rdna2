@@ -87,7 +87,12 @@ def backend_to_kernel_cls(
     elif backend == WNA16MoEBackend.FLASHINFER_TRTLLM:
         return [TrtLlmMxint4ExpertsMonolithic]
     elif backend == WNA16MoEBackend.TRITON:
-        return [TritonWNA16Experts]
+        from vllm.model_executor.layers.fused_moe.experts.rdna2_moe import (
+            Rdna2WNA16Experts,
+        )
+
+        # gfx1030 only (_supports_current_device): same weights, HIP decode.
+        return [Rdna2WNA16Experts, TritonWNA16Experts]
     elif backend == WNA16MoEBackend.XPU:
         from vllm.model_executor.layers.fused_moe.experts.xpu_moe import (
             XPUExpertsWNA16,
@@ -426,6 +431,9 @@ def make_wna16_moe_kernel(
     from vllm.model_executor.layers.fused_moe.experts.int4_emulation_moe import (
         Int4EmulationTritonExperts,
     )
+    from vllm.model_executor.layers.fused_moe.experts.rdna2_moe import (
+        Rdna2WNA16Experts,
+    )
     from vllm.model_executor.layers.fused_moe.experts.rdna3_moe import (
         Rdna3WNA16Experts,
     )
@@ -449,6 +457,7 @@ def make_wna16_moe_kernel(
         CPUExpertsInt4,
         ZentorchExpertsInt4,
         Int4EmulationTritonExperts,
+        Rdna2WNA16Experts,
         Rdna3WNA16Experts,
     )
     if backend == WNA16MoEBackend.HUMMING:
