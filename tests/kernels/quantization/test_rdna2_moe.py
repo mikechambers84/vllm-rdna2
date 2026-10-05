@@ -4,13 +4,15 @@
 Triton paths keep (Qwen3.6-35B-A3B dims, E capped at 16): the decode kernels
 ``moe_wna16_decode_rdna2`` on uint8-packed ``[E, N, K/2]`` int4 weights (group
 size 32 or 128, symmetric or with zero points) and
-``moe_int8_decode_rdna2`` on ``[E, N, K]`` int8 weights with channel scales, and
-the prefill GEMM ``moe_wna16_gemm_rdna2``."""
+``moe_int8_decode_rdna2`` on ``[E, N, K]`` int8 weights with channel scales,
+the prefill GEMM ``moe_wna16_gemm_rdna2``, and the weight-only FP8 experts
+(``Rdna2Fp8Experts``) on both kinds of kernels."""
 
 import pytest
 import torch
 import torch.nn.functional as F
 
+from vllm.model_executor.layers.fused_moe.activation import MoEActivation
 from vllm.model_executor.layers.fused_moe.experts.rdna2_moe import (
     rdna2_moe_kernel_available,
 )
@@ -219,3 +221,92 @@ def test_moe_int8_gemm_rdna2_prefill_matches_triton(block_m):
             out, a, a_s.view(-1), w, w_s, *align, topk_weights, top_k, mul, block_m
         )
         torch.testing.assert_close(out, ref, rtol=2e-3, atol=1e-3)
+
+
+def _fp8_experts(n, k, kind):
+    """fp8 weights with per-expert, per-channel or 128x128 block scales, and
+    the (block_n, block_k) the quant config reports for them."""
+    w = (torch.randn(E, n, k, device="cuda") * 2).to(torch.float8_e4m3fn)
+    if kind == "block":
+        s = torch.rand(E, n // 128, k // 128, device="cuda") * 2e-3 + 1e-4
+        full = s.repeat_interleave(128, 1).repeat_interleave(128, 2)
+        return w, s, w.float() * full, [128, 128]
+    if kind == "channel":
+        s = torch.rand(E, n, 1, device="cuda") * 2e-3 + 1e-4
+    else:
+        s = torch.rand(E, device="cuda") * 2e-3 + 1e-4
+    return w, s, w.float() * s.view(E, -1, 1), None
+
+
+@pytest.mark.parametrize("kind", ["block", "channel", "expert"])
+@pytest.mark.parametrize("num_tokens", [1, 3, 64])
+@torch.inference_mode()
+def test_rdna2_fp8_experts_match_reference(kind, num_tokens):
+    """FP8 experts run weight-only on gfx1030 (fp8 widened exactly to fp16,
+    activations unquantized): the decode kernel (<= 4 routed rows per expert)
+    and the routed GEMMs both stay at fp16-rounding error."""
+    from tests.kernels.moe.utils import make_dummy_moe_config
+    from vllm.model_executor.layers.fused_moe.config import (
+        fp8_w8a16_moe_quant_config,
+    )
+    from vllm.model_executor.layers.fused_moe.experts.rdna2_moe import (
+        Rdna2Fp8Experts,
+    )
+
+    torch.manual_seed(0)
+    w13, s13, w13_ref, block_shape = _fp8_experts(2 * INTER, H, kind)
+    w2, s2, w2_ref, _ = _fp8_experts(H, INTER, kind)
+    experts = Rdna2Fp8Experts(
+        make_dummy_moe_config(),
+        fp8_w8a16_moe_quant_config(s13, s2, block_shape=block_shape),
+    )
+    x = torch.randn(num_tokens, H, dtype=torch.float16, device="cuda") * 0.5
+    topk_weights, topk_ids = torch.topk(
+        torch.randn(num_tokens, E, device="cuda").softmax(-1), TOPK, dim=-1
+    )
+    ws = torch.empty(
+        num_tokens * TOPK * max(2 * INTER, H), dtype=x.dtype, device="cuda"
+    )
+    out = torch.empty(num_tokens, H, dtype=x.dtype, device="cuda")
+
+    experts.apply(
+        out,
+        x,
+        w13,
+        w2,
+        topk_weights,
+        topk_ids,
+        MoEActivation.SILU,
+        E,
+        None,
+        None,
+        None,
+        ws,
+        ws.clone(),
+        None,
+        False,
+    )
+
+    ref = _reference(x, topk_weights, topk_ids, w13_ref, w2_ref)
+    assert ((out.float() - ref).norm() / ref.norm()).item() < 2e-3
+
+
+def test_fp8_moe_selects_rdna2_backend():
+    """Block-scaled FP8 MoE layers pick the weight-only gfx1030 experts."""
+    from tests.kernels.moe.utils import make_dummy_moe_config
+    from vllm.model_executor.layers.fused_moe.oracle.fp8 import (
+        Fp8MoeBackend,
+        select_fp8_moe_backend,
+    )
+    from vllm.model_executor.layers.quantization.utils.quant_utils import (
+        kFp8Dynamic128Sym,
+        kFp8Static128BlockSym,
+    )
+
+    config = make_dummy_moe_config(
+        num_experts=E, experts_per_token=TOPK, hidden_dim=H, in_dtype=torch.float16
+    )
+    backend, _ = select_fp8_moe_backend(
+        config, kFp8Static128BlockSym, kFp8Dynamic128Sym
+    )
+    assert backend == Fp8MoeBackend.RDNA2

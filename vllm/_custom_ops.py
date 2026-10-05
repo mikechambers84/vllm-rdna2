@@ -2212,6 +2212,38 @@ def moe_int8_decode_rdna2(
     )
 
 
+def moe_fp8_decode_rdna2(
+    output: torch.Tensor,
+    x: torch.Tensor,
+    topk_ids: torch.Tensor,
+    topk_weights: torch.Tensor,
+    w13: torch.Tensor,
+    w13_scale: torch.Tensor,
+    w2: torch.Tensor,
+    w2_scale: torch.Tensor,
+    block_n: int,
+    block_k: int,
+    act: torch.Tensor,
+) -> None:
+    """RDNA2 fp8-weight fused-MoE decode (SiLU) into ``output``, on ``[E, N,
+    K]`` float8_e4m3fn weights with fp32 scales ``[E]`` or ``[E, ceil(N /
+    block_n), S]`` (S == 1 or ceil(K / block_k)), with fp16 activations;
+    ``act`` is a ``[M * topk, I]`` workspace."""
+    torch.ops._rocm_C.moe_fp8_decode_rdna2(
+        output,
+        x,
+        topk_ids,
+        topk_weights,
+        w13,
+        w13_scale,
+        w2,
+        w2_scale,
+        block_n,
+        block_k,
+        act,
+    )
+
+
 def moe_wna16_decode_rdna2(
     output: torch.Tensor,
     x: torch.Tensor,
@@ -2267,6 +2299,40 @@ def moe_wna16_gemm_rdna2(
         w,
         scales,
         zeros,
+        sorted_ids,
+        expert_ids,
+        num_tokens_post_padded,
+        topk_weights,
+        top_k,
+        mul_routed_weight,
+        block_m,
+    )
+
+
+def moe_fp8_gemm_rdna2(
+    output: torch.Tensor,
+    a: torch.Tensor,
+    w: torch.Tensor,
+    scales: torch.Tensor,
+    block_n: int,
+    block_k: int,
+    sorted_ids: torch.Tensor,
+    expert_ids: torch.Tensor,
+    num_tokens_post_padded: torch.Tensor,
+    topk_weights: torch.Tensor,
+    top_k: int,
+    mul_routed_weight: bool,
+    block_m: int,
+) -> None:
+    """``moe_wna16_gemm_rdna2`` on ``[E, N, K]`` float8_e4m3fn weights with
+    fp32 scales as in ``moe_fp8_decode_rdna2``."""
+    torch.ops._rocm_C.moe_fp8_gemm_rdna2(
+        output,
+        a,
+        w,
+        scales,
+        block_n,
+        block_k,
         sorted_ids,
         expert_ids,
         num_tokens_post_padded,

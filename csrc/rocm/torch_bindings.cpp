@@ -98,6 +98,18 @@ TORCH_LIBRARY_EXPAND(TORCH_EXTENSION_NAME, rocm_ops) {
       "Tensor topk_weights, Tensor w13, Tensor s13, Tensor w2, Tensor s2, "
       "Tensor! act) -> ()");
   rocm_ops.impl("moe_int8_decode_rdna2", torch::kCUDA, &moe_int8_decode_rdna2);
+  // fp8-weight fused-MoE decode and prefill GEMM (fp16 activations).
+  rocm_ops.def(
+      "moe_fp8_decode_rdna2(Tensor! output, Tensor x, Tensor topk_ids, "
+      "Tensor topk_weights, Tensor w13, Tensor s13, Tensor w2, Tensor s2, "
+      "int block_n, int block_k, Tensor! act) -> ()");
+  rocm_ops.impl("moe_fp8_decode_rdna2", torch::kCUDA, &moe_fp8_decode_rdna2);
+  rocm_ops.def(
+      "moe_fp8_gemm_rdna2(Tensor! output, Tensor a, Tensor w, Tensor scales, "
+      "int block_n, int block_k, Tensor sorted_ids, Tensor expert_ids, "
+      "Tensor num_tokens_post_padded, Tensor topk_weights, int top_k, "
+      "bool mul_routed_weight, int block_m) -> ()");
+  rocm_ops.impl("moe_fp8_gemm_rdna2", torch::kCUDA, &moe_fp8_gemm_rdna2);
   // W4A16 fused-MoE decode (few tokens) on the Triton WNA16 weight layout.
   rocm_ops.def(
       "moe_wna16_decode_rdna2(Tensor! output, Tensor x, Tensor topk_ids, "

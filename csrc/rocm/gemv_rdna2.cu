@@ -21,6 +21,8 @@
 #include <hip/hip_fp16.h>
 #include <hip/hip_bf16.h>
 
+#include "rdna2_fp8.cuh"
+
 #if defined(__HIPCC__) && defined(__gfx1030__)
   #define __HIP__RDNA2__
 #endif
@@ -232,23 +234,9 @@ __device__ __forceinline__ float dot16_i8<__hip_bfloat16>(
   return acc;
 }
 
-// Two e4m3fn bytes of q (picked by the v_perm selector) widened exactly to an
-// fp16 pair scaled by 2^-8: each byte lands in the high byte of a 16-bit lane,
-// an arithmetic shift by one puts sign, exponent and mantissa in fp16 position
-// (e4m3 subnormals become fp16 subnormals), and the mask clears the copy of
-// the sign that the shift leaves in the top exponent bit.
-__device__ __forceinline__ half2 fp8x2_to_half2(uint32_t q, uint32_t sel) {
-  typedef short short2_t __attribute__((ext_vector_type(2)));
-  const short2_t v =
-      __builtin_bit_cast(short2_t, __builtin_amdgcn_perm(q, q, sel)) >> 1;
-  uint32_t h = __builtin_bit_cast(uint32_t, v) & 0xBFFFBFFFu;
-  return *reinterpret_cast<half2*>(&h);
-}
-
-// v_perm selectors placing bytes 0, 1 (resp. 2, 3) in the high byte of each
-// 16-bit lane.
-static constexpr uint32_t FP8_LO = 0x010c000cu;
-static constexpr uint32_t FP8_HI = 0x030c020cu;
+using rdna2::FP8_HI;
+using rdna2::FP8_LO;
+using rdna2::fp8x2_to_half2;
 
 // acc + 2^-8 * dot(a[0:16], w[0:16]) for 16 fp8 e4m3fn weights; fp16 uses
 // v_dot2_f32_f16, bf16 widens both sides to fp32.
