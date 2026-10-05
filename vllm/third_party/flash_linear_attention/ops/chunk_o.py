@@ -18,6 +18,14 @@ from .index import prepare_chunk_indices
 from .op import exp
 from .utils import FLA_CHUNK_SIZE, check_shared_mem, is_nvidia_hopper
 
+
+def _on_gfx10() -> bool:
+    if not torch.version.hip:
+        return False
+    from vllm.platforms.rocm import on_gfx10
+
+    return on_gfx10()
+
 BKV_LIST = [64, 128] if check_shared_mem() else [32, 64]
 NUM_WARPS = [2, 4] if is_nvidia_hopper else [2, 4, 8]
 
@@ -59,8 +67,12 @@ def chunk_fwd_kernel_o(
     BV: tl.constexpr,
     USE_G: tl.constexpr,
     IS_VARLEN: tl.constexpr,
+    HEADS_FIRST: tl.constexpr = False,
 ):
-    i_v, i_t, i_bh = tl.program_id(0), tl.program_id(1), tl.program_id(2)
+    if HEADS_FIRST:
+        i_v, i_bh, i_t = tl.program_id(0), tl.program_id(1), tl.program_id(2)
+    else:
+        i_v, i_t, i_bh = tl.program_id(0), tl.program_id(1), tl.program_id(2)
     i_b, i_h = i_bh // H, i_bh % H
 
     if IS_VARLEN:
@@ -167,7 +179,13 @@ def chunk_fwd_o(
     else:
         o = torch.empty_like(v)
 
+    # RDNA2: with heads ahead of chunks in the grid, concurrent programs read
+    # neighbouring heads of the same rows (1.47x at 8K tokens on a V620).
+    heads_first = _on_gfx10()
+
     def grid(meta):
+        if heads_first:
+            return (triton.cdiv(V, meta["BV"]), B * H, NT)
         return (triton.cdiv(V, meta["BV"]), NT, B * H)
 
     chunk_fwd_kernel_o[grid](
@@ -186,5 +204,6 @@ def chunk_fwd_o(
         K=K,
         V=V,
         BT=BT,
+        HEADS_FIRST=heads_first,
     )
     return o

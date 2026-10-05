@@ -92,13 +92,14 @@ TORCH_LIBRARY_EXPAND(TORCH_EXTENSION_NAME, rocm_ops) {
   rocm_ops.def(
       "moe_wna16_decode_rdna2(Tensor! output, Tensor x, Tensor topk_ids, "
       "Tensor topk_weights, Tensor w13, Tensor s13, Tensor w2, Tensor s2, "
-      "Tensor! act) -> ()");
+      "Tensor? z13, Tensor? z2, Tensor! act) -> ()");
   rocm_ops.impl("moe_wna16_decode_rdna2", torch::kCUDA,
                 &moe_wna16_decode_rdna2);
   // Grouped W4A16 GEMM for fused-MoE prefill on the Triton WNA16 layout.
   rocm_ops.def(
       "moe_wna16_gemm_rdna2(Tensor! output, Tensor a, Tensor w, Tensor scales, "
-      "Tensor sorted_ids, Tensor expert_ids, Tensor num_tokens_post_padded, "
+      "Tensor? zeros, Tensor sorted_ids, Tensor expert_ids, Tensor "
+      "num_tokens_post_padded, "
       "Tensor topk_weights, int top_k, bool mul_routed_weight, int block_m) -> "
       "()");
   rocm_ops.impl("moe_wna16_gemm_rdna2", torch::kCUDA, &moe_wna16_gemm_rdna2);
@@ -109,6 +110,46 @@ TORCH_LIBRARY_EXPAND(TORCH_EXTENSION_NAME, rocm_ops) {
       "Tensor num_tokens_post_padded, Tensor topk_weights, int top_k, "
       "bool mul_routed_weight, int block_m) -> ()");
   rocm_ops.impl("moe_int8_gemm_rdna2", torch::kCUDA, &moe_int8_gemm_rdna2);
+  // Paged causal GQA attention for prefill (fp16, head 64/128/256; sliding
+  // window, softcap, sinks).
+  rocm_ops.def(
+      "unified_attention_rdna2(Tensor! out, Tensor q, Tensor k_cache, "
+      "Tensor v_cache, Tensor cu_seqlens_q, Tensor seqused_k, "
+      "Tensor block_table, float scale, int window, float softcap, "
+      "Tensor? sinks) -> ()");
+  rocm_ops.impl("unified_attention_rdna2", torch::kCUDA,
+                &unified_attention_rdna2);
+  // Split-KV decode / spec-verify attention, head 256 (segment partials).
+  rocm_ops.def(
+      "decode_attention_rdna2(Tensor q, Tensor k_cache, Tensor v_cache, "
+      "Tensor! segm_out, Tensor! segm_max, Tensor! segm_sum, "
+      "Tensor cu_seqlens_q, Tensor seqused_k, Tensor block_table, int tile, "
+      "int max_seqlen_q, float scale) -> ()");
+  rocm_ops.impl("decode_attention_rdna2", torch::kCUDA,
+                &decode_attention_rdna2);
+  // Gated DeltaNet prefill: post-conv1d q/k/v split, l2 norm and gating.
+  rocm_ops.def(
+      "gdn_post_conv_rdna2(Tensor conv_output, Tensor a, Tensor b, "
+      "Tensor A_log, Tensor dt_bias, Tensor! q, Tensor! k, Tensor! v, "
+      "Tensor! g, Tensor! beta, bool apply_l2norm, bool output_g_exp, "
+      "float eps) -> ()");
+  rocm_ops.impl("gdn_post_conv_rdna2", torch::kCUDA, &gdn_post_conv_rdna2);
+  // Gated DeltaNet prefill: fused chunk-local cumsum + WY representation.
+  rocm_ops.def(
+      "gdn_wy_rdna2(Tensor k, Tensor v, Tensor beta, Tensor g, Tensor! g_cum, "
+      "Tensor! w, Tensor! u, Tensor cu_seqlens, Tensor chunk_indices) -> ()");
+  rocm_ops.impl("gdn_wy_rdna2", torch::kCUDA, &gdn_wy_rdna2);
+  // Gated DeltaNet prefill: chunk state recurrence and chunk output.
+  rocm_ops.def(
+      "gdn_fwd_h_rdna2(Tensor k, Tensor w, Tensor u, Tensor g_cum, Tensor? h0, "
+      "Tensor! h, Tensor! v_new, Tensor(a!)? ht, Tensor cu_seqlens, "
+      "Tensor chunk_offsets) -> ()");
+  rocm_ops.impl("gdn_fwd_h_rdna2", torch::kCUDA, &gdn_fwd_h_rdna2);
+  rocm_ops.def(
+      "gdn_fwd_o_rdna2(Tensor q, Tensor k, Tensor v_new, Tensor h, "
+      "Tensor g_cum, Tensor! o, Tensor cu_seqlens, Tensor chunk_indices, "
+      "float scale) -> ()");
+  rocm_ops.impl("gdn_fwd_o_rdna2", torch::kCUDA, &gdn_fwd_o_rdna2);
 #endif  // VLLM_ROCM_GFX1030
 
 #ifdef VLLM_ROCM_GFX1100

@@ -118,8 +118,24 @@ __global__ void __launch_bounds__(WAVES* WARP32)
 
     const T* wrow = W + (long)n * ldw + kc;
     int k = lane * 8;
-    // Issue four loads before using any, so each wave keeps 64 bytes per lane
-    // in flight; short rows (K = 2048) are otherwise latency-bound at M = 1.
+    // Issue eight (then four) loads before using any, so each wave keeps up to
+    // 128 bytes per lane in flight; short rows (K = 2048-4096) are otherwise
+    // latency-bound at M = 1. Above 4 tokens the eight-load batch costs more
+    // in registers than it gains.
+    if constexpr (M <= 4)
+      for (; k + 7 * STEP < klen; k += 8 * STEP) {
+        int4 w[8];
+  #pragma unroll
+        for (int u = 0; u < 8; u++)
+          w[u] = *reinterpret_cast<const int4*>(wrow + k + u * STEP);
+  #pragma unroll
+        for (int u = 0; u < 8; u++)
+  #pragma unroll
+          for (int i = 0; i < M; i++)
+            acc[i] = dot8<T>(
+                *reinterpret_cast<const int4*>(sA + i * kc_len + k + u * STEP),
+                w[u], acc[i]);
+      }
     for (; k + 3 * STEP < klen; k += 4 * STEP) {
       int4 w[4];
   #pragma unroll
@@ -246,6 +262,31 @@ __global__ void __launch_bounds__(WAVES* WARP32)
 
     const int8_t* wrow = W + (long)n * ldw + kc;
     int k = lane * 16;
+    // Up to eight loads (128 bytes per lane) in flight, as in the fp16 GEMV.
+    if constexpr (M <= 4)
+      for (; k + 7 * STEP < klen; k += 8 * STEP) {
+        int4 w[8];
+  #pragma unroll
+        for (int u = 0; u < 8; u++)
+          w[u] = *reinterpret_cast<const int4*>(wrow + k + u * STEP);
+  #pragma unroll
+        for (int u = 0; u < 8; u++)
+  #pragma unroll
+          for (int i = 0; i < M; i++)
+            acc[i] = dot16_i8<T>(w[u], sA + i * kc_len + k + u * STEP, acc[i]);
+      }
+    if constexpr (M <= 4)
+      for (; k + 3 * STEP < klen; k += 4 * STEP) {
+        int4 w[4];
+  #pragma unroll
+        for (int u = 0; u < 4; u++)
+          w[u] = *reinterpret_cast<const int4*>(wrow + k + u * STEP);
+  #pragma unroll
+        for (int u = 0; u < 4; u++)
+  #pragma unroll
+          for (int i = 0; i < M; i++)
+            acc[i] = dot16_i8<T>(w[u], sA + i * kc_len + k + u * STEP, acc[i]);
+      }
     for (; k + STEP < klen; k += 2 * STEP) {
       const int4 w0 = *reinterpret_cast<const int4*>(wrow + k);
       const int4 w1 = *reinterpret_cast<const int4*>(wrow + k + STEP);

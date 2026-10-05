@@ -5,13 +5,15 @@ weights.
 
 W4A16:
 Same weights as ``TritonWNA16Experts`` (``[E, N, K/2]`` uint8, N-first group
-scales). Batches of symmetric int4 g32 experts with fp16 activations and SiLU
+scales, optional N-packed zero points). Batches of int4 experts (group size a
+multiple of 32, symmetric or with zero points) with fp16 activations and SiLU
 run on ``moe_wna16_decode_rdna2`` (gate/up with SiLU fused, then down with the
-top-k sum in registers) up to MAX_DECODE_TOKENS: on a V620 (E=256, top-8) it beats
-tuned Triton 4.5x at 1-32 tokens, 3x at 64, 1.8x at 128 and breaks even near 256,
-since each token re-reads its experts. Larger batches of symmetric int4 experts
-(group size a multiple of 32) run the two routed GEMMs on
-``moe_wna16_gemm_rdna2``: 1.4x Triton at 512 tokens, 1.8x at 2048, 2.1x at 8192.
+top-k sum in registers) while each expert gets at most MAX_DECODE_ROWS_PER_EXPERT
+routed rows (each token re-reads its experts): on a V620 it beats tuned Triton
+5-7x at 1 token and 1.5-2.3x at 2-4 rows per expert (E=8-256, group size 32 or
+128). Larger batches run the two routed GEMMs on ``moe_wna16_gemm_rdna2``,
+which beats Triton at every batch size: 1.2-1.4x up to ~16 rows per expert,
+1.8-2.2x at 1024+ tokens.
 """
 
 import torch
@@ -39,11 +41,31 @@ def rdna2_moe_kernel_available(op: str = "moe_wna16_decode_rdna2") -> bool:
 
 
 class Rdna2WNA16Experts(TritonWNA16Experts):
-    MAX_DECODE_TOKENS = 192
+    # The decode kernel beats the routed GEMMs up to ~4-5 rows per expert and
+    # loses 20-60% at 6-8 (qwen3.6-35b-a3b, qwen3-30b-a3b, Mixtral shapes).
+    MAX_DECODE_ROWS_PER_EXPERT = 4
 
     @staticmethod
     def _supports_current_device() -> bool:
         return rdna2_moe_kernel_available()
+
+    def _zeros_ok(self, w1: torch.Tensor, w2: torch.Tensor, group: int) -> bool:
+        """No zero points, or both in the contiguous [E, N/2, K/G] uint8 layout
+        the kernels read (two columns per byte)."""
+        z1, z2 = self.w1_zp, self.w2_zp
+        if z1 is None and z2 is None:
+            return True
+        if z1 is None or z2 is None or group <= 0:
+            return False
+        e, n1, n2 = w1.size(0), w1.size(1), w2.size(1)
+        k1, k2 = w1.size(2) * 2, w2.size(2) * 2
+        return (
+            z1.dtype == z2.dtype == torch.uint8
+            and z1.is_contiguous()
+            and z2.is_contiguous()
+            and tuple(z1.shape) == (e, n1 // 2, k1 // group)
+            and tuple(z2.shape) == (e, n2 // 2, k2 // group)
+        )
 
     def _use_decode_kernel(
         self,
@@ -56,12 +78,18 @@ class Rdna2WNA16Experts(TritonWNA16Experts):
         apply_router_weight_on_input: bool,
     ) -> bool:
         intermediate = w2.size(2) * 2
+        group = self.block_shape[1] if self.block_shape else 0
         return (
-            topk_ids.size(0) <= self.MAX_DECODE_TOKENS
+            topk_ids.numel() <= self.MAX_DECODE_ROWS_PER_EXPERT * w1.size(0)
             and hidden_states.dtype == torch.float16
             and self.quant_config.use_int4_w4a16
-            and self.block_shape == [0, 32]
-            and self.quant_config.w1_zp is None
+            and self.block_shape is not None
+            and self.block_shape[0] == 0
+            and group > 0
+            and group % 32 == 0
+            and hidden_states.size(1) % group == 0
+            and intermediate % group == 0
+            and self._zeros_ok(w1, w2, group)
             and activation == MoEActivation.SILU
             and expert_map is None
             and not apply_router_weight_on_input
@@ -85,8 +113,9 @@ class Rdna2WNA16Experts(TritonWNA16Experts):
             and self.quant_config.use_int4_w4a16
             and block_shape is not None
             and block_shape[0] == 0
+            and block_shape[1] > 0
             and block_shape[1] % 32 == 0
-            and self.quant_config.w1_zp is None
+            and self._zeros_ok(w1, w2, block_shape[1])
             and self.w1_bias is None
             and self.w2_bias is None
             and expert_map is None
@@ -135,6 +164,7 @@ class Rdna2WNA16Experts(TritonWNA16Experts):
             hidden_states,
             w1,
             self.w1_scale,
+            self.w1_zp,
             sorted_ids,
             expert_ids,
             num_post_padded,
@@ -154,6 +184,7 @@ class Rdna2WNA16Experts(TritonWNA16Experts):
             cache2,
             w2,
             self.w2_scale,
+            self.w2_zp,
             sorted_ids,
             expert_ids,
             num_post_padded,
@@ -233,6 +264,8 @@ class Rdna2WNA16Experts(TritonWNA16Experts):
             w2,
             self.w2_scale,
             act,
+            self.w1_zp,
+            self.w2_zp,
         )
 
 

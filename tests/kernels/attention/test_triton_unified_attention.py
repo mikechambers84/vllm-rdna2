@@ -1039,3 +1039,251 @@ def test_triton_unified_attn_fp16_verify_decode_prefill(
         scale=scale,
     )
     torch.testing.assert_close(output, ref_output, atol=1.5e-2, rtol=1e-2)
+
+
+def _rdna2_attention() -> bool:
+    from vllm.v1.attention.ops.triton_unified_attention import (
+        _rdna2_attention_available,
+    )
+
+    return _rdna2_attention_available()
+
+
+def ref_paged_attn_sinks(
+    query,
+    key_cache,
+    value_cache,
+    query_lens,
+    kv_lens,
+    block_tables,
+    scale,
+    sliding_window,
+    soft_cap,
+    sinks,
+):
+    """ref_paged_attn with a per-query-head sink logit in each softmax
+    normalizer (fp32)."""
+    out = ref_paged_attn(
+        query=query.float(),
+        key_cache=key_cache.float(),
+        value_cache=value_cache.float(),
+        query_lens=query_lens,
+        kv_lens=kv_lens,
+        block_tables=block_tables,
+        scale=scale,
+        sliding_window=sliding_window,
+        soft_cap=soft_cap,
+    )
+    if sinks is None:
+        return out
+    # Redo the softmax with the sink: out_sink = out * Z / (Z + exp(sink)),
+    # Z = sum_k exp(s_k), recomputed per row from the same scores.
+    num_kv_heads, head_size = key_cache.shape[2], key_cache.shape[3]
+    block_size = key_cache.shape[1]
+    res, start = [], 0
+    for i, (ql, kl) in enumerate(zip(query_lens, kv_lens)):
+        q = query[start : start + ql].float() * scale
+        blocks = block_tables[i, : (kl + block_size - 1) // block_size].long()
+        k = key_cache[blocks].reshape(-1, num_kv_heads, head_size)[:kl].float()
+        k = k.repeat_interleave(q.shape[1] // num_kv_heads, dim=1)
+        s = torch.einsum("qhd,khd->hqk", q, k)
+        if soft_cap is not None and soft_cap > 0:
+            s = soft_cap * torch.tanh(s / soft_cap)
+        pos = torch.arange(kl, device=s.device)
+        qpos = torch.arange(ql, device=s.device)[:, None] + kl - ql
+        mask = pos[None, :] > qpos
+        if sliding_window is not None:
+            mask |= qpos - pos[None, :] >= sliding_window
+        s = s.masked_fill(mask, float("-inf"))
+        m = torch.maximum(s.amax(-1), sinks.float()[:, None])
+        z = torch.exp(s - m[..., None]).sum(-1)
+        frac = z / (z + torch.exp(sinks.float()[:, None] - m))  # [h, q]
+        res.append(out[start : start + ql] * frac.t()[..., None])
+        start += ql
+    return torch.cat(res)
+
+
+@pytest.mark.skipif(not _rdna2_attention(), reason="gfx1030 HIP attention only")
+@pytest.mark.parametrize(
+    "seq_lens", [[(1, 1328), (37, 37), (129, 463), (300, 300)], [(97, 2000)]]
+)
+@pytest.mark.parametrize("num_heads", [(16, 2), (24, 4), (8, 8)])
+@pytest.mark.parametrize("head_size", [64, 128, 256])
+@pytest.mark.parametrize("block_size", [16, 784])
+@pytest.mark.parametrize(
+    "sliding_window,soft_cap,use_sinks",
+    [
+        (None, None, False),
+        (128, None, False),
+        (None, 30.0, False),
+        (None, None, True),
+        (40, 30.0, True),
+    ],
+)
+@torch.inference_mode()
+def test_unified_attn_rdna2_prefill(
+    seq_lens: list[tuple[int, int]],
+    num_heads: tuple[int, int],
+    head_size: int,
+    block_size: int,
+    sliding_window: int | None,
+    soft_cap: float | None,
+    use_sinks: bool,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """fp16 prefill batches on gfx1030 run the HIP kernel, with sliding window,
+    softcap and sinks, and match the reference, decode rows of mixed batches
+    included."""
+    from vllm import _custom_ops as ops
+
+    torch.set_default_device(DEVICE_TYPE)
+    set_random_seed(0)
+    query_lens = [x[0] for x in seq_lens]
+    kv_lens = [x[1] for x in seq_lens]
+    num_query_heads, num_kv_heads = num_heads
+    num_blocks = 4096 // block_size + 64
+    query = torch.randn(
+        sum(query_lens), num_query_heads, head_size, dtype=torch.float16
+    )
+    key_cache = torch.randn(
+        num_blocks, block_size, num_kv_heads, head_size, dtype=torch.float16
+    )
+    value_cache = torch.randn_like(key_cache)
+    cu_query_lens = torch.tensor([0] + query_lens, dtype=torch.int32).cumsum(
+        dim=0, dtype=torch.int32
+    )
+    max_blocks = (max(kv_lens) + block_size - 1) // block_size
+    block_tables = torch.randint(
+        0, num_blocks, (len(seq_lens), max_blocks), dtype=torch.int32
+    )
+    sinks = torch.randn(num_query_heads) * 2 if use_sinks else None
+    output = torch.empty_like(query)
+    scale = head_size**-0.5
+
+    calls = []
+    hip_attention = ops.unified_attention_rdna2
+
+    def spy(*args, **kwargs) -> None:
+        calls.append(args)
+        hip_attention(*args, **kwargs)
+
+    monkeypatch.setattr(ops, "unified_attention_rdna2", spy)
+    unified_attention(
+        q=query,
+        k=key_cache,
+        v=value_cache,
+        out=output,
+        cu_seqlens_q=cu_query_lens,
+        seqused_k=torch.tensor(kv_lens, dtype=torch.int32),
+        max_seqlen_q=max(query_lens),
+        max_seqlen_k=max(kv_lens),
+        softmax_scale=scale,
+        causal=True,
+        window_size=(sliding_window - 1, 0) if sliding_window else (-1, -1),
+        block_table=block_tables,
+        softcap=soft_cap or 0,
+        q_descale=None,
+        k_descale=None,
+        v_descale=None,
+        sinks=sinks,
+    )
+    assert len(calls) == 1
+
+    ref_output = ref_paged_attn_sinks(
+        query,
+        key_cache,
+        value_cache,
+        query_lens,
+        kv_lens,
+        block_tables,
+        scale,
+        sliding_window,
+        soft_cap,
+        sinks,
+    )
+    torch.testing.assert_close(output.float(), ref_output, atol=1.5e-2, rtol=1e-2)
+
+
+@pytest.mark.skipif(not _rdna2_attention(), reason="gfx1030 HIP attention only")
+@pytest.mark.parametrize("q_len", [1, 3])
+@pytest.mark.parametrize("num_heads", [(24, 4), (16, 2)])
+@pytest.mark.parametrize("block_size", [16, 784])
+@torch.inference_mode()
+def test_unified_attn_rdna2_decode(
+    q_len: int, num_heads: tuple[int, int], block_size: int, monkeypatch
+) -> None:
+    """Head-256 decode and spec-decode verify batches (the 3D split-KV path) on
+    gfx1030 run the HIP segment kernel and match the reference."""
+    from vllm import _custom_ops as ops
+
+    torch.set_default_device(DEVICE_TYPE)
+    set_random_seed(0)
+    head_size, segments = 256, 32
+    kv_lens = [37, 900, 3000, 8192]
+    query_lens = [q_len] * len(kv_lens)
+    num_query_heads, num_kv_heads = num_heads
+    num_blocks = sum(kv_lens) // block_size + 64
+    query = torch.randn(
+        sum(query_lens), num_query_heads, head_size, dtype=torch.float16
+    )
+    key_cache = torch.randn(
+        num_blocks, block_size, num_kv_heads, head_size, dtype=torch.float16
+    )
+    value_cache = torch.randn_like(key_cache)
+    cu_query_lens = torch.tensor([0] + query_lens, dtype=torch.int32).cumsum(
+        dim=0, dtype=torch.int32
+    )
+    max_blocks = (max(kv_lens) + block_size - 1) // block_size
+    block_tables = torch.randint(
+        0, num_blocks, (len(kv_lens), max_blocks), dtype=torch.int32
+    )
+    output = torch.empty_like(query)
+    scale = head_size**-0.5
+    rows = query.shape[0]
+
+    calls = []
+    hip_decode = ops.decode_attention_rdna2
+
+    def spy(*args) -> None:
+        calls.append(args)
+        hip_decode(*args)
+
+    monkeypatch.setattr(ops, "decode_attention_rdna2", spy)
+    unified_attention(
+        q=query,
+        k=key_cache,
+        v=value_cache,
+        out=output,
+        cu_seqlens_q=cu_query_lens,
+        seqused_k=torch.tensor(kv_lens, dtype=torch.int32),
+        max_seqlen_q=q_len,
+        max_seqlen_k=max(kv_lens),
+        softmax_scale=scale,
+        causal=True,
+        window_size=(-1, -1),
+        block_table=block_tables,
+        softcap=0,
+        q_descale=None,
+        k_descale=None,
+        v_descale=None,
+        seq_threshold_3D=len(kv_lens),
+        num_par_softmax_segments=segments,
+        softmax_segm_output=torch.empty(
+            rows, num_query_heads, segments, head_size, dtype=torch.float32
+        ),
+        softmax_segm_max=torch.empty(rows, num_query_heads, segments),
+        softmax_segm_expsum=torch.empty(rows, num_query_heads, segments),
+        max_seqlen_q_3d=q_len,
+    )
+    assert len(calls) == 1
+
+    ref_output = ref_paged_attn(
+        query=query,
+        key_cache=key_cache,
+        value_cache=value_cache,
+        query_lens=query_lens,
+        kv_lens=kv_lens,
+        block_tables=block_tables,
+        scale=scale,
+    )
+    torch.testing.assert_close(output, ref_output, atol=1.5e-2, rtol=1e-2)

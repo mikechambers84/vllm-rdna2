@@ -2196,12 +2196,25 @@ def moe_wna16_decode_rdna2(
     w2: torch.Tensor,
     w2_scale: torch.Tensor,
     act: torch.Tensor,
+    w13_zeros: torch.Tensor | None = None,
+    w2_zeros: torch.Tensor | None = None,
 ) -> None:
-    """RDNA2 W4A16 fused-MoE decode (SiLU, symmetric int4 g32) into ``output``,
-    on the uint8-packed ``[E, N, K/2]`` weights of the Triton WNA16 backend;
-    ``act`` is a ``[M * topk, I]`` workspace."""
+    """RDNA2 W4A16 fused-MoE decode (SiLU, int4 with group size a multiple of
+    32, optional ``[E, N/2, K/G]`` zero points) into ``output``, on the
+    uint8-packed ``[E, N, K/2]`` weights of the Triton WNA16 backend; ``act`` is
+    a ``[M * topk, I]`` workspace."""
     torch.ops._rocm_C.moe_wna16_decode_rdna2(
-        output, x, topk_ids, topk_weights, w13, w13_scale, w2, w2_scale, act
+        output,
+        x,
+        topk_ids,
+        topk_weights,
+        w13,
+        w13_scale,
+        w2,
+        w2_scale,
+        w13_zeros,
+        w2_zeros,
+        act,
     )
 
 
@@ -2210,6 +2223,7 @@ def moe_wna16_gemm_rdna2(
     a: torch.Tensor,
     w: torch.Tensor,
     scales: torch.Tensor,
+    zeros: torch.Tensor | None,
     sorted_ids: torch.Tensor,
     expert_ids: torch.Tensor,
     num_tokens_post_padded: torch.Tensor,
@@ -2226,6 +2240,7 @@ def moe_wna16_gemm_rdna2(
         a,
         w,
         scales,
+        zeros,
         sorted_ids,
         expert_ids,
         num_tokens_post_padded,
@@ -2267,6 +2282,163 @@ def moe_int8_gemm_rdna2(
         top_k,
         mul_routed_weight,
         block_m,
+    )
+
+
+def unified_attention_rdna2(
+    out: torch.Tensor,
+    q: torch.Tensor,
+    k_cache: torch.Tensor,
+    v_cache: torch.Tensor,
+    cu_seqlens_q: torch.Tensor,
+    seqused_k: torch.Tensor,
+    block_table: torch.Tensor,
+    scale: float,
+    window: int = 0,
+    softcap: float = 0.0,
+    sinks: torch.Tensor | None = None,
+) -> None:
+    """RDNA2 paged causal GQA attention: fp16 ``q`` [tokens, heads, D] against
+    ``k_cache`` / ``v_cache`` [blocks, block_size, kv_heads, D] (D in 64, 128,
+    256) with unified_attention's varlen metadata, into ``out``. ``window`` > 0
+    keeps each query's last ``window`` keys; ``softcap`` > 0 caps the scores;
+    ``sinks`` (fp32, one per query head) join each softmax normalizer."""
+    torch.ops._rocm_C.unified_attention_rdna2(
+        out,
+        q,
+        k_cache,
+        v_cache,
+        cu_seqlens_q,
+        seqused_k,
+        block_table,
+        scale,
+        window,
+        softcap,
+        sinks,
+    )
+
+
+def decode_attention_rdna2(
+    q: torch.Tensor,
+    k_cache: torch.Tensor,
+    v_cache: torch.Tensor,
+    segm_out: torch.Tensor,
+    segm_max: torch.Tensor,
+    segm_sum: torch.Tensor,
+    cu_seqlens_q: torch.Tensor,
+    seqused_k: torch.Tensor,
+    block_table: torch.Tensor,
+    tile: int,
+    max_seqlen_q: int,
+    scale: float,
+) -> None:
+    """RDNA2 split-KV decode / spec-verify attention (head 256): writes the
+    per-segment partials of unified_attention's 3D path for reduce_segments."""
+    torch.ops._rocm_C.decode_attention_rdna2(
+        q,
+        k_cache,
+        v_cache,
+        segm_out,
+        segm_max,
+        segm_sum,
+        cu_seqlens_q,
+        seqused_k,
+        block_table,
+        tile,
+        max_seqlen_q,
+        scale,
+    )
+
+
+def gdn_post_conv_rdna2(
+    conv_output: torch.Tensor,
+    a: torch.Tensor,
+    b: torch.Tensor,
+    A_log: torch.Tensor,
+    dt_bias: torch.Tensor,
+    q: torch.Tensor,
+    k: torch.Tensor,
+    v: torch.Tensor,
+    g: torch.Tensor,
+    beta: torch.Tensor,
+    apply_l2norm: bool,
+    output_g_exp: bool,
+    eps: float,
+) -> None:
+    """RDNA2 Gated DeltaNet post-conv1d prep: split ``conv_output`` into
+    ``q`` / ``k`` (l2-normalized if ``apply_l2norm``) / ``v`` and write the
+    gates ``g`` (``exp(g)`` if ``output_g_exp``) and ``beta``."""
+    torch.ops._rocm_C.gdn_post_conv_rdna2(
+        conv_output,
+        a,
+        b,
+        A_log,
+        dt_bias,
+        q,
+        k,
+        v,
+        g,
+        beta,
+        apply_l2norm,
+        output_g_exp,
+        eps,
+    )
+
+
+def gdn_wy_rdna2(
+    k: torch.Tensor,
+    v: torch.Tensor,
+    beta: torch.Tensor,
+    g: torch.Tensor,
+    g_cum: torch.Tensor,
+    w: torch.Tensor,
+    u: torch.Tensor,
+    cu_seqlens: torch.Tensor,
+    chunk_indices: torch.Tensor,
+) -> None:
+    """RDNA2 WY step of the varlen chunked gated delta rule (FLA's chunk-local
+    cumsum, kkt, solve_tril and recompute_w_u in one kernel): writes the
+    chunk-local cumsum of ``g`` into ``g_cum`` and ``w``, ``u``."""
+    torch.ops._rocm_C.gdn_wy_rdna2(
+        k, v, beta, g, g_cum, w, u, cu_seqlens, chunk_indices
+    )
+
+
+def gdn_fwd_h_rdna2(
+    k: torch.Tensor,
+    w: torch.Tensor,
+    u: torch.Tensor,
+    g_cum: torch.Tensor,
+    h0: torch.Tensor | None,
+    h: torch.Tensor,
+    v_new: torch.Tensor,
+    ht: torch.Tensor | None,
+    cu_seqlens: torch.Tensor,
+    chunk_offsets: torch.Tensor,
+) -> None:
+    """RDNA2 chunk state recurrence of the varlen gated delta rule (FLA's
+    chunk_gated_delta_rule_fwd_h): writes the per-chunk states ``h``,
+    ``v_new`` and, if given, the final states ``ht``."""
+    torch.ops._rocm_C.gdn_fwd_h_rdna2(
+        k, w, u, g_cum, h0, h, v_new, ht, cu_seqlens, chunk_offsets
+    )
+
+
+def gdn_fwd_o_rdna2(
+    q: torch.Tensor,
+    k: torch.Tensor,
+    v_new: torch.Tensor,
+    h: torch.Tensor,
+    g_cum: torch.Tensor,
+    o: torch.Tensor,
+    cu_seqlens: torch.Tensor,
+    chunk_indices: torch.Tensor,
+    scale: float,
+) -> None:
+    """RDNA2 chunk output of the varlen gated delta rule (FLA's
+    chunk_fwd_o) into ``o``."""
+    torch.ops._rocm_C.gdn_fwd_o_rdna2(
+        q, k, v_new, h, g_cum, o, cu_seqlens, chunk_indices, scale
     )
 
 

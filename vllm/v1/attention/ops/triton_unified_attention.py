@@ -7,6 +7,7 @@
 #  - Chih-Chieh Yang <chih.chieh.yang@ibm.com>
 #  - Thomas Parnell <tpa@zurich.ibm.com>
 
+from functools import cache
 from typing import Any
 
 import torch
@@ -41,6 +42,32 @@ def _on_gfx10() -> bool:
     from vllm.platforms.rocm import on_gfx10
 
     return on_gfx10()
+
+
+@cache
+def _rdna2_attention_available() -> bool:
+    if not (current_platform.is_rocm() and envs.VLLM_ROCM_RDNA2_ATTENTION):
+        return False
+    import vllm._custom_ops  # noqa: F401  (loads _rocm_C)
+    from vllm.platforms.rocm import on_gfx1030
+
+    return on_gfx1030() and hasattr(torch.ops._rocm_C, "unified_attention_rdna2")
+
+
+# Segment granularity of the gfx1030 decode kernel (its key tile): segments of
+# whole tiles, so short contexts take a few full workgroups instead of 32
+# mostly empty ones (2.4-2.8x at 512 keys, same at 8K).
+RDNA2_DECODE_TILE = 64
+
+
+def _rdna2_attention_operands_ok(*tensors: torch.Tensor) -> bool:
+    return all(
+        t.dtype == torch.float16
+        and t.stride(-1) == 1
+        and t.data_ptr() % 16 == 0
+        and all(st % 8 == 0 for st in t.stride()[:-1])
+        for t in tensors
+    )
 
 
 @triton.jit
@@ -966,6 +993,41 @@ def unified_attention(
         or is_batch_invariant
     )
 
+    if (
+        not use_3d
+        and max_seqlen_q > 16
+        and head_size in (64, 128, 256)
+        and num_queries_per_kv <= 64
+        and use_causal
+        and not use_per_seq_causal
+        and not (use_alibi_slopes or use_qq_bias or use_mm_prefix or use_rswa)
+        and chunk_lookback < 0
+        and kv_quant_mode == KVQuantMode.NONE
+        and output_scale is None
+        and not use_td
+        and not is_batch_invariant
+        and _rdna2_attention_available()
+        and _rdna2_attention_operands_ok(q, k, v, out)
+        and block_table.dtype == torch.int32
+        and block_table.stride(1) == 1
+    ):
+        from vllm import _custom_ops as ops
+
+        ops.unified_attention_rdna2(
+            out,
+            q,
+            k,
+            v,
+            cu_seqlens_q,
+            seqused_k,
+            block_table,
+            softmax_scale,
+            window=1 + window_size[0] if window_size[0] >= 0 else 0,
+            softcap=softcap or 0.0,
+            sinks=None if sinks is None else sinks.float().contiguous(),
+        )
+        return
+
     BLOCK_M = (
         16 if num_queries_per_kv <= 16 else triton.next_power_of_2(num_queries_per_kv)
     )
@@ -1136,84 +1198,121 @@ def unified_attention(
     if launch_num_stages is not None:
         launch_kwargs["num_stages"] = launch_num_stages
 
-    kernel_unified_attention[grid](
-        output_ptr=out,
-        segm_output_ptr=segm_output_ptr,
-        segm_max_ptr=segm_max_ptr,
-        segm_expsum_ptr=segm_expsum_ptr,
-        query_ptr=q,
-        key_cache_ptr=k,
-        value_cache_ptr=v,
-        sink_ptr=sinks,
-        block_tables_ptr=block_table,
-        seq_lens_ptr=seqused_k,
-        alibi_slopes_ptr=alibi_slopes,
-        qq_bias_ptr=qq_bias,
-        k_scale_cache_ptr=k_scale_ptr,
-        v_scale_cache_ptr=v_scale_ptr,
-        scale=softmax_scale,
-        q_scale=q_descale,
-        k_scale=k_descale,
-        v_scale=v_descale,
-        out_scale=1 / output_scale if output_scale is not None else 1.0,
-        softcap=softcap,
-        num_query_heads=num_query_heads,
-        num_queries_per_kv=num_queries_per_kv,
-        block_table_stride=block_table.stride(0),
-        query_stride_0=q.stride(0),
-        query_stride_1=q.stride(1),
-        output_stride_0=out.stride(0),
-        output_stride_1=out.stride(1),
-        qq_bias_stride_0=qq_bias.stride(0) if use_qq_bias else 0,
-        BLOCK_SIZE=block_size,
-        TILE_SIZE=tile_size,
-        HEAD_SIZE=head_size,
-        HEAD_SIZE_PADDED=head_size_padded,
-        USE_ALIBI_SLOPES=use_alibi_slopes,
-        USE_ALIBI_SQRT=use_alibi_sqrt,
-        USE_QQ_BIAS=use_qq_bias,
-        USE_SOFTCAP=(softcap > 0),
-        USE_SINKS=(sinks is not None),
-        SLIDING_WINDOW=(1 + window_size[0]),
-        USE_CAUSAL=use_causal,
-        USE_PER_SEQ_CAUSAL=use_per_seq_causal,
-        per_seq_causal_ptr=per_seq_causal_ptr,
-        USE_MM_PREFIX=use_mm_prefix,
-        MAX_MM_RANGES=max_mm_ranges,
-        mm_prefix_range_ptr=mm_prefix_range,
-        rswa_prefix_lens_ptr=rswa_prefix_lens if use_rswa else seqused_k,
-        R_SWA_WINDOW=rswa_window or 0,
-        USE_R_SWA=use_rswa,
-        stride_k_cache_0=k.stride(0),
-        stride_k_cache_1=k.stride(1),
-        stride_k_cache_2=k.stride(2),
-        stride_k_cache_3=k.stride(3),
-        stride_v_cache_0=v.stride(0),
-        stride_v_cache_1=v.stride(1),
-        stride_v_cache_2=v.stride(2),
-        stride_v_cache_3=v.stride(3),
-        stride_ks_blk=ks_blk,
-        stride_ks_slot=ks_slot,
-        stride_ks_head=ks_head,
-        stride_vs_blk=vs_blk,
-        stride_vs_slot=vs_slot,
-        stride_vs_head=vs_head,
-        query_start_len_ptr=cu_seqlens_q,
-        BLOCK_Q=BLOCK_Q,
-        num_seqs=num_seqs,
-        BLOCK_M=BLOCK_M,
-        NUM_SEGMENTS_PER_SEQ=num_segments,
-        USE_FP8=output_scale is not None,
-        IS_3D=use_3d,
-        KV_QUANT_MODE=kv_quant_mode,
-        Q_IS_FP8=(q.dtype == current_platform.fp8_dtype()),
-        CHUNK_LOOKBACK=chunk_lookback,
-        CHUNK_SIZE=chunk_size,
-        USE_TD=use_td,
-        USE_TD_QO=use_td_qo,
-        MM_PREFIX_CLAMP_SW=mm_prefix_clamp_sliding_window,
-        **launch_kwargs,
+    rdna2_decode = (
+        use_3d
+        and head_size == 256
+        and use_causal
+        and not use_per_seq_causal
+        and window_size[0] < 0
+        and not softcap
+        and sinks is None
+        and not (use_alibi_slopes or use_qq_bias or use_mm_prefix or use_rswa)
+        and chunk_lookback < 0
+        and kv_quant_mode == KVQuantMode.NONE
+        and not use_td
+        and _rdna2_attention_available()
+        and _rdna2_attention_operands_ok(q, k, v)
+        and block_table.dtype == torch.int32
+        and block_table.stride(1) == 1
+        and softmax_segm_output.dtype == torch.float32
+        and softmax_segm_output.shape[-1] == head_size
     )
+    if rdna2_decode:
+        from vllm import _custom_ops as ops
+
+        ops.decode_attention_rdna2(
+            q,
+            k,
+            v,
+            softmax_segm_output,
+            softmax_segm_max,
+            softmax_segm_expsum,
+            cu_seqlens_q,
+            seqused_k,
+            block_table,
+            RDNA2_DECODE_TILE,
+            max_seqlen_q,
+            softmax_scale,
+        )
+    else:
+        kernel_unified_attention[grid](
+            output_ptr=out,
+            segm_output_ptr=segm_output_ptr,
+            segm_max_ptr=segm_max_ptr,
+            segm_expsum_ptr=segm_expsum_ptr,
+            query_ptr=q,
+            key_cache_ptr=k,
+            value_cache_ptr=v,
+            sink_ptr=sinks,
+            block_tables_ptr=block_table,
+            seq_lens_ptr=seqused_k,
+            alibi_slopes_ptr=alibi_slopes,
+            qq_bias_ptr=qq_bias,
+            k_scale_cache_ptr=k_scale_ptr,
+            v_scale_cache_ptr=v_scale_ptr,
+            scale=softmax_scale,
+            q_scale=q_descale,
+            k_scale=k_descale,
+            v_scale=v_descale,
+            out_scale=1 / output_scale if output_scale is not None else 1.0,
+            softcap=softcap,
+            num_query_heads=num_query_heads,
+            num_queries_per_kv=num_queries_per_kv,
+            block_table_stride=block_table.stride(0),
+            query_stride_0=q.stride(0),
+            query_stride_1=q.stride(1),
+            output_stride_0=out.stride(0),
+            output_stride_1=out.stride(1),
+            qq_bias_stride_0=qq_bias.stride(0) if use_qq_bias else 0,
+            BLOCK_SIZE=block_size,
+            TILE_SIZE=tile_size,
+            HEAD_SIZE=head_size,
+            HEAD_SIZE_PADDED=head_size_padded,
+            USE_ALIBI_SLOPES=use_alibi_slopes,
+            USE_ALIBI_SQRT=use_alibi_sqrt,
+            USE_QQ_BIAS=use_qq_bias,
+            USE_SOFTCAP=(softcap > 0),
+            USE_SINKS=(sinks is not None),
+            SLIDING_WINDOW=(1 + window_size[0]),
+            USE_CAUSAL=use_causal,
+            USE_PER_SEQ_CAUSAL=use_per_seq_causal,
+            per_seq_causal_ptr=per_seq_causal_ptr,
+            USE_MM_PREFIX=use_mm_prefix,
+            MAX_MM_RANGES=max_mm_ranges,
+            mm_prefix_range_ptr=mm_prefix_range,
+            rswa_prefix_lens_ptr=rswa_prefix_lens if use_rswa else seqused_k,
+            R_SWA_WINDOW=rswa_window or 0,
+            USE_R_SWA=use_rswa,
+            stride_k_cache_0=k.stride(0),
+            stride_k_cache_1=k.stride(1),
+            stride_k_cache_2=k.stride(2),
+            stride_k_cache_3=k.stride(3),
+            stride_v_cache_0=v.stride(0),
+            stride_v_cache_1=v.stride(1),
+            stride_v_cache_2=v.stride(2),
+            stride_v_cache_3=v.stride(3),
+            stride_ks_blk=ks_blk,
+            stride_ks_slot=ks_slot,
+            stride_ks_head=ks_head,
+            stride_vs_blk=vs_blk,
+            stride_vs_slot=vs_slot,
+            stride_vs_head=vs_head,
+            query_start_len_ptr=cu_seqlens_q,
+            BLOCK_Q=BLOCK_Q,
+            num_seqs=num_seqs,
+            BLOCK_M=BLOCK_M,
+            NUM_SEGMENTS_PER_SEQ=num_segments,
+            USE_FP8=output_scale is not None,
+            IS_3D=use_3d,
+            KV_QUANT_MODE=kv_quant_mode,
+            Q_IS_FP8=(q.dtype == current_platform.fp8_dtype()),
+            CHUNK_LOOKBACK=chunk_lookback,
+            CHUNK_SIZE=chunk_size,
+            USE_TD=use_td,
+            USE_TD_QO=use_td_qo,
+            MM_PREFIX_CLAMP_SW=mm_prefix_clamp_sliding_window,
+            **launch_kwargs,
+        )
 
     if use_3d:
         reduce_segments[(q.shape[0], num_query_heads)](
@@ -1228,7 +1327,7 @@ def unified_attention(
             output_stride_0=out.stride(0),
             output_stride_1=out.stride(1),
             block_table_stride=block_table.stride(0),
-            TILE_SIZE=TILE_SIZE_DECODE,
+            TILE_SIZE=RDNA2_DECODE_TILE if rdna2_decode else TILE_SIZE_DECODE,
             HEAD_SIZE=head_size,
             HEAD_SIZE_PADDED=head_size_padded,
             query_start_len_ptr=cu_seqlens_q,
