@@ -6,6 +6,7 @@ import torch
 
 import vllm.envs as envs
 from vllm import _custom_ops as ops
+from vllm.model_executor.layers.quantization.utils import replace_parameter
 from vllm.model_executor.layers.quantization.utils.quant_utils import (
     pack_quantized_values_into_int32,
 )
@@ -25,6 +26,16 @@ def _reserve_dq_workspace(numel: int, dtype: torch.dtype, device: torch.device):
     workspace = _dq_workspaces.get(device)
     if workspace is None or workspace.numel() < numel or workspace.dtype != dtype:
         _dq_workspaces[device] = torch.empty(numel, dtype=dtype, device=device)
+
+
+def _asymmetric_uint4(c: MPLinearLayerConfig) -> bool:
+    """uint4 with stored zeros (AWQ, compressed-tensors asymmetric) on RDNA2:
+    gptq_gemm and the gfx1030 GEMM take the zeros as stored (GPTQv2)."""
+    if not (current_platform.is_rocm() and c.weight_type == scalar_types.uint4):
+        return False
+    from vllm.platforms.rocm import on_gfx10
+
+    return c.zero_points and on_gfx10()
 
 
 def _use_w4a8_prefill(c: MPLinearLayerConfig) -> bool:
@@ -69,7 +80,7 @@ class ExllamaLinearKernel(MPLinearKernel):
         if c.act_type != torch.float16:
             return False, "Exllama only supports float16 activations"
 
-        if c.weight_type not in cls.SUPPORTED_QUANT_TYPES:
+        if c.weight_type not in cls.SUPPORTED_QUANT_TYPES and not _asymmetric_uint4(c):
             return (
                 False,
                 f"Quant type ({c.weight_type}) not supported by "
@@ -145,6 +156,18 @@ class ExllamaLinearKernel(MPLinearKernel):
         # Repack weights and scales for Machete
         self._transform_param(layer, self.w_q_name, transform_w_q)
         self._transform_param(layer, self.w_s_name, transform_w_s)
+        if c.zero_points:
+            # gptq_gemm takes [K / G, N / 8] zeros (packed along N), the layout
+            # of GPTQ checkpoints; compressed-tensors and converted AWQ zeros
+            # are [N / 8, K / G].
+            assert self.w_zp_name is not None
+            zp = getattr(layer, self.w_zp_name)
+            if getattr(zp, "output_dim", 1) != 1:
+                replace_parameter(
+                    layer,
+                    self.w_zp_name,
+                    torch.nn.Parameter(zp.data.t().contiguous(), requires_grad=False),
+                )
 
         k, n = c.partition_weight_shape
         _reserve_dq_workspace(k * n, c.act_type, getattr(layer, self.w_q_name).device)
@@ -152,6 +175,10 @@ class ExllamaLinearKernel(MPLinearKernel):
             from .exllama_w4a8 import channel_scales
 
             layer.w4a8_channel_scale = channel_scales(getattr(layer, self.w_s_name))
+        from .exllama_rdna2 import RDNA2_MAX_ROWS, use_rdna2_gemm
+
+        self._rdna2_rows = RDNA2_MAX_ROWS if use_rdna2_gemm(c) else 0
+        self._gfx1030 = self._rdna2_rows > 0 or hasattr(layer, "w4a8_channel_scale")
 
     def apply_weights(
         self,
@@ -166,20 +193,27 @@ class ExllamaLinearKernel(MPLinearKernel):
 
         w_q, w_s, w_zp = self._get_weight_params(layer)
         # gptq_gemm supports GPTQv2 format by passing use_v2_format=True.
-        # However, the MPLinearLayerConfig doesn't contain format info.
-        # So hardcode GPTQv1 format here, to keep its behavior unchanged.
-        use_v2_format = False
+        # However, the MPLinearLayerConfig doesn't contain format info, so
+        # types with a bias (GPTQ checkpoints) keep GPTQv1's zero + 1; uint4
+        # zeros (AWQ, compressed-tensors) are the zeros as stored.
+        use_v2_format = not c.weight_type.has_bias()
 
         assert w_zp is not None, "Zero points are required by Exllama"
-        if hasattr(layer, "w4a8_channel_scale"):
-            output = torch.ops.vllm.exllama_w4a8_gemm(
+        if self._gfx1030:
+            from .exllama_rdna2 import W4A8_MIN_ROWS, W4A8_MIN_ROWS_RDNA2
+
+            output = torch.ops.vllm.exllama_gfx1030_gemm(
                 x_2d,
                 w_q,
                 w_zp,
                 w_s,
-                layer.w4a8_channel_scale,
+                getattr(layer, "w4a8_channel_scale", None),
                 _dq_workspaces[x_2d.device],
                 c.group_size,
+                not c.zero_points,
+                use_v2_format,
+                self._rdna2_rows,
+                W4A8_MIN_ROWS_RDNA2 if self._rdna2_rows else W4A8_MIN_ROWS,
             )
             if bias is not None:
                 output.add_(bias)

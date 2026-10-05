@@ -1068,7 +1068,12 @@ def compute_causal_conv1d_metadata(
     nums_dict: dict[int, dict[str, Any]] = {}
     batch_ptr = None
     token_chunk_offset_ptr = None
-    for BLOCK_M in [8]:  # cover all BLOCK_M values
+    # One BLOCK_M: the entries share the program buffers below.
+    from vllm.model_executor.layers.mamba.ops.causal_conv1d import (
+        conv1d_prefill_block_m,
+    )
+
+    for BLOCK_M in [conv1d_prefill_block_m()]:
         nums = -(-seqlens // BLOCK_M)
         nums_dict[BLOCK_M] = {}
         nums_dict[BLOCK_M]["nums"] = nums

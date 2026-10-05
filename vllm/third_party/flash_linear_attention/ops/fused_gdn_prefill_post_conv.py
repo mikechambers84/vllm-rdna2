@@ -16,6 +16,14 @@ import torch
 from vllm.triton_utils import tl, triton
 
 
+def _on_gfx10() -> bool:
+    if not torch.version.hip:
+        return False
+    from vllm.platforms.rocm import on_gfx10
+
+    return on_gfx10()
+
+
 @triton.jit
 def _fused_post_conv_kernel(
     # ---- inputs ----
@@ -208,7 +216,11 @@ def fused_post_conv_prep(
     # ---- Kernel config ----
     BK = triton.next_power_of_2(K)
     BV = triton.next_power_of_2(V)
-    BLOCK_T = 16  # tokens per block
+    # Tokens per block. On RDNA2 64 tokens with one warp per block is 2.1-2.2x
+    # faster than 16 with four at 8K tokens (Qwen3.6-35B-A3B / Qwen3.8-27B
+    # heads, V620).
+    on_gfx10 = _on_gfx10()
+    BLOCK_T = 64 if on_gfx10 else 16
 
     # Single kernel: blocks [0,H) do Q/K, blocks [H, H+HV) do V+gating
     grid = (triton.cdiv(L, BLOCK_T), H + HV)
@@ -241,8 +253,8 @@ def fused_post_conv_prep(
         BLOCK_T=BLOCK_T,
         BK=BK,
         BV=BV,
-        num_warps=4,
-        num_stages=2,
+        num_warps=1 if on_gfx10 else 4,
+        num_stages=1 if on_gfx10 else 2,
     )
 
     return q, k, v, g, beta

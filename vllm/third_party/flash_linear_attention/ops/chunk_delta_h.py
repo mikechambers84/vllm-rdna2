@@ -21,6 +21,31 @@ NUM_WARPS = [2, 4, 8, 16]
 _CHUNK_DELTA_H_NUM_STAGES = [2, 3] if torch.version.hip else [2, 3, 4]
 
 
+def _on_gfx10() -> bool:
+    if not torch.version.hip:
+        return False
+    from vllm.platforms.rocm import on_gfx10
+
+    return on_gfx10()
+
+
+# The recurrence runs one program per (value block, head), so on RDNA2 FLA's
+# configs leave the GPU mostly idle: 16-wide value blocks with 8 warps are
+# 2.9-3.3x faster at 8K tokens (Qwen3.6-35B-A3B / Qwen3.8-27B heads, V620).
+if _on_gfx10():
+    _CHUNK_DELTA_H_CONFIGS = [
+        triton.Config({"BV": BV}, num_warps=8, num_stages=num_stages)
+        for BV, num_stages in ((16, 2), (16, 1), (32, 1))
+    ]
+else:
+    _CHUNK_DELTA_H_CONFIGS = [
+        triton.Config({"BV": BV}, num_warps=num_warps, num_stages=num_stages)
+        for num_warps in [2, 4]
+        for num_stages in _CHUNK_DELTA_H_NUM_STAGES
+        for BV in [32, 64]
+    ]
+
+
 @triton.heuristics(
     {
         "USE_G": lambda args: args["g"] is not None,
@@ -32,12 +57,7 @@ _CHUNK_DELTA_H_NUM_STAGES = [2, 3] if torch.version.hip else [2, 3, 4]
     }
 )
 @triton.autotune(
-    configs=[
-        triton.Config({"BV": BV}, num_warps=num_warps, num_stages=num_stages)
-        for num_warps in [2, 4]
-        for num_stages in _CHUNK_DELTA_H_NUM_STAGES
-        for BV in [32, 64]
-    ],
+    configs=_CHUNK_DELTA_H_CONFIGS,
     key=["H", "K", "V", "BT"],
     use_cuda_graph=use_cuda_graph,
 )

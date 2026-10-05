@@ -242,7 +242,7 @@ def test_causal_conv1d_update_with_batch_gather(
     assert torch.allclose(out[:batch_size], out_ref, rtol=rtol, atol=atol)
 
 
-@pytest.mark.parametrize("itype", [torch.bfloat16])
+@pytest.mark.parametrize("itype", [torch.float16, torch.bfloat16])
 @pytest.mark.parametrize("silu_activation", [True])
 @pytest.mark.parametrize("has_bias", [True])
 @pytest.mark.parametrize("width", [4])
@@ -259,6 +259,9 @@ def test_causal_conv1d_varlen(
     rtol, atol = (3e-4, 1e-3) if itype == torch.float32 else (3e-3, 5e-3)
     if itype == torch.bfloat16:
         rtol, atol = 1e-2, 5e-2
+    elif itype == torch.float16:
+        # Outputs reach ~16, where an fp16 ulp is 1.6e-2.
+        rtol, atol = 3e-3, 2e-2
     # set seed
     set_random_seed(0)
     seqlens = []

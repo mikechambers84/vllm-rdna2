@@ -33,6 +33,7 @@ from vllm.v1.worker.utils import (
     bind_kv_cache,
     bind_kv_cache_to_layers,
     copy_kv_cache_blocks_inplace,
+    narrow_storage_for_buffer_ops,
     request_memory,
 )
 
@@ -1407,3 +1408,31 @@ def test_request_memory_charges_external_weights():
         request_memory(
             _memory_snapshot(total_gib=100, free_gib=10), cache_config, 70 * GiB_bytes
         )
+
+
+@pytest.mark.skipif(
+    not torch.cuda.is_available() or torch.version.hip is None, reason="ROCm only"
+)
+def test_narrow_storage_for_buffer_ops_aliases_layer_view():
+    """A layer's view of a > 2 GiB KV cache allocation is re-aliased over a
+    storage covering just its extent, which lets Triton's AMD backend use
+    32-bit buffer ops on it; it still writes the shared allocation."""
+    from triton.backends.amd.compiler import HIPBackend
+
+    buf = torch.zeros(2**31 + 8192, dtype=torch.int8, device="cuda")
+    view = buf[4096 : 4096 + 2 * 1024 * 64].view(2, 1024, 64)[:, :, :32]
+    narrow = narrow_storage_for_buffer_ops(view)
+
+    assert not HIPBackend.is_within_2gb(view)
+    assert HIPBackend.is_within_2gb(narrow)
+    assert narrow.untyped_storage().nbytes() == 1 * 65536 + 1023 * 64 + 31 + 1
+    assert (narrow.data_ptr(), narrow.shape, narrow.stride()) == (
+        view.data_ptr(),
+        view.shape,
+        view.stride(),
+    )
+    narrow.fill_(7)
+    assert torch.equal(view, narrow)
+    assert int(buf.sum()) == 7 * view.numel()
+    small = torch.zeros(16, device="cuda")
+    assert narrow_storage_for_buffer_ops(small) is small

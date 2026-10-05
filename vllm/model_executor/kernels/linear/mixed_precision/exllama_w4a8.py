@@ -17,7 +17,6 @@ from vllm.model_executor.kernels.linear.scaled_mm.triton import (
     _triton_int8_scaled_mm_func,
 )
 from vllm.triton_utils import tl, triton
-from vllm.utils.torch_utils import direct_register_custom_op
 
 
 @triton.jit
@@ -76,37 +75,3 @@ def w4a8_gemm(
     return _triton_int8_scaled_mm_func(
         x_q, w8.t(), x_s, channel_scale.view(-1, 1), x.dtype
     )
-
-
-def _exllama_w4a8_gemm(
-    x: torch.Tensor,
-    w_q: torch.Tensor,
-    w_zp: torch.Tensor,
-    w_s: torch.Tensor,
-    channel_scale: torch.Tensor,
-    workspace: torch.Tensor,
-    group_size: int,
-) -> torch.Tensor:
-    # Above Exllama's fused-kernel limit (50 rows for 4-bit) gptq_gemm would
-    # dequantize to fp16 and run an fp16 GEMM; run the int8 GEMM instead.
-    if x.shape[0] > 50:
-        return w4a8_gemm(x, w_q, w_s, channel_scale, group_size, workspace)
-    return ops.gptq_gemm(x, w_q, w_zp, w_s, True, False, 4, workspace)
-
-
-def _exllama_w4a8_gemm_fake(
-    x: torch.Tensor,
-    w_q: torch.Tensor,
-    w_zp: torch.Tensor,
-    w_s: torch.Tensor,
-    channel_scale: torch.Tensor,
-    workspace: torch.Tensor,
-    group_size: int,
-) -> torch.Tensor:
-    return torch.empty((x.shape[0], w_q.shape[1]), dtype=x.dtype, device=x.device)
-
-
-# Opaque to Dynamo, so the prefill/decode split follows the runtime row count.
-direct_register_custom_op(
-    "exllama_w4a8_gemm", _exllama_w4a8_gemm, fake_impl=_exllama_w4a8_gemm_fake
-)

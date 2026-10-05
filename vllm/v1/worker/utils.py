@@ -684,6 +684,39 @@ def bind_kv_cache(
     )
 
 
+_MAX_32BIT_RANGE = 2**31 - 1
+
+
+def narrow_storage_for_buffer_ops(t: torch.Tensor) -> torch.Tensor:
+    """Alias ``t`` over a storage that covers only its own extent.
+
+    Triton's AMD backend uses 32-bit buffer loads/stores only for tensors whose
+    whole storage fits in 2 GiB, but every layer's view of the shared KV cache
+    allocation reports that (multi-GiB) allocation's storage. Kernels reading
+    the cache then fall back to 64-bit global accesses: prefill attention ran
+    2.3x slower on gfx1030 at a 6.5 GiB cache. The alias does not own memory;
+    the original allocation must stay alive.
+    """
+    if (
+        not current_platform.is_rocm()
+        or not isinstance(t, torch.Tensor)
+        or t.numel() == 0
+        or t.untyped_storage().nbytes() <= _MAX_32BIT_RANGE
+        or any(stride < 0 for stride in t.stride())
+    ):
+        return t
+    extent = sum((size - 1) * stride for size, stride in zip(t.shape, t.stride()))
+    extent = (extent + 1) * t.element_size()
+    if extent > _MAX_32BIT_RANGE:
+        return t
+    storage = torch._C._construct_storage_from_data_pointer(
+        t.data_ptr(), t.device, extent
+    )
+    return torch.empty(0, dtype=t.dtype, device=t.device).set_(
+        storage, 0, t.shape, t.stride()
+    )
+
+
 def bind_kv_cache_to_layers(
     kv_caches: dict[str, torch.Tensor],
     forward_context: dict[str, Attention],
@@ -696,7 +729,9 @@ def bind_kv_cache_to_layers(
     # splits conv/ssm), so the kv_caches dict can hold a single tensor per
     # layer for the KV connector to register.
     for layer_name, kv_cache in kv_caches.items():
-        forward_context[layer_name].bind_kv_cache(kv_cache)
+        forward_context[layer_name].bind_kv_cache(
+            narrow_storage_for_buffer_ops(kv_cache)
+        )
 
     ordered_layer_names = sorted(
         kv_caches, key=lambda name: extract_layer_index(name, num_attn_module)

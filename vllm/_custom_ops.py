@@ -2149,6 +2149,24 @@ def gemv_w8a16_rdna2(
     return torch.ops._rocm_C.gemv_w8a16_rdna2(a, w, scale, bias)
 
 
+def gemm_w4a16_exl_rdna2(
+    a: torch.Tensor,
+    w: torch.Tensor,
+    zeros: torch.Tensor,
+    scales: torch.Tensor,
+    symmetric: bool,
+    use_v2_format: bool = False,
+    cfg: int = -1,
+) -> torch.Tensor:
+    """RDNA2 4-bit GPTQ GEMM for few rows of fp16 ``a``, on the tensors
+    ``gptq_gemm`` takes (``gptq_shuffle``d weights); same result as
+    ``gptq_gemm(a, w, zeros, scales, True, use_v2_format, 4)``. ``symmetric``
+    skips the zeros (all 8); ``cfg`` selects a tile config (-1: by row count)."""
+    return torch.ops._rocm_C.gemm_w4a16_exl_rdna2(
+        a, w, zeros, scales, symmetric, use_v2_format, cfg
+    )
+
+
 def moe_int8_decode_rdna2(
     output: torch.Tensor,
     x: torch.Tensor,
@@ -2184,6 +2202,71 @@ def moe_wna16_decode_rdna2(
     ``act`` is a ``[M * topk, I]`` workspace."""
     torch.ops._rocm_C.moe_wna16_decode_rdna2(
         output, x, topk_ids, topk_weights, w13, w13_scale, w2, w2_scale, act
+    )
+
+
+def moe_wna16_gemm_rdna2(
+    output: torch.Tensor,
+    a: torch.Tensor,
+    w: torch.Tensor,
+    scales: torch.Tensor,
+    sorted_ids: torch.Tensor,
+    expert_ids: torch.Tensor,
+    num_tokens_post_padded: torch.Tensor,
+    topk_weights: torch.Tensor,
+    top_k: int,
+    mul_routed_weight: bool,
+    block_m: int,
+) -> None:
+    """RDNA2 grouped W4A16 GEMM for fused-MoE prefill: one routed GEMM of
+    ``TritonWNA16Experts`` (symmetric int4 [E, N, K/2] weights, group scales)
+    over moe_align_block_size(block_m) rows, into ``output`` [M * top_k, N]."""
+    torch.ops._rocm_C.moe_wna16_gemm_rdna2(
+        output,
+        a,
+        w,
+        scales,
+        sorted_ids,
+        expert_ids,
+        num_tokens_post_padded,
+        topk_weights,
+        top_k,
+        mul_routed_weight,
+        block_m,
+    )
+
+
+def moe_int8_gemm_rdna2(
+    output: torch.Tensor,
+    a: torch.Tensor,
+    a_scale: torch.Tensor,
+    w: torch.Tensor,
+    w_scale: torch.Tensor,
+    sorted_ids: torch.Tensor,
+    expert_ids: torch.Tensor,
+    num_tokens_post_padded: torch.Tensor,
+    topk_weights: torch.Tensor,
+    top_k: int,
+    mul_routed_weight: bool,
+    block_m: int,
+) -> None:
+    """RDNA2 grouped W8A8 GEMM for fused-MoE prefill: one routed GEMM of the
+    Triton int8 path (int8 [E, N, K] weights with channel scales, int8
+    activations with row scales) over moe_align_block_size(block_m) rows,
+    into ``output`` [M * top_k, N]."""
+    torch.ops._rocm_C.moe_int8_gemm_rdna2(
+        output,
+        a,
+        a_scale,
+        w,
+        w_scale,
+        sorted_ids,
+        expert_ids,
+        num_tokens_post_padded,
+        topk_weights,
+        top_k,
+        mul_routed_weight,
+        block_m,
     )
 
 

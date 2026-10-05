@@ -48,6 +48,11 @@ torch::Tensor gemv_w8a16_rdna2(const at::Tensor& a, const at::Tensor& w,
                                const at::Tensor& scale,
                                const std::optional<at::Tensor>& bias);
 
+torch::Tensor gemm_w4a16_exl_rdna2(const at::Tensor& a, const at::Tensor& w,
+                                   const at::Tensor& zeros,
+                                   const at::Tensor& scales, bool symmetric,
+                                   bool use_v2_format, int64_t cfg);
+
 void moe_int8_decode_rdna2(torch::Tensor& output, const torch::Tensor& x,
                            const torch::Tensor& topk_ids,
                            const torch::Tensor& topk_weights,
@@ -61,6 +66,23 @@ void moe_wna16_decode_rdna2(torch::Tensor& output, const torch::Tensor& x,
                             const torch::Tensor& w13, const torch::Tensor& s13,
                             const torch::Tensor& w2, const torch::Tensor& s2,
                             torch::Tensor& act);
+
+void moe_wna16_gemm_rdna2(torch::Tensor& output, const torch::Tensor& a,
+                          const torch::Tensor& w, const torch::Tensor& scales,
+                          const torch::Tensor& sorted_ids,
+                          const torch::Tensor& expert_ids,
+                          const torch::Tensor& num_tokens_post_padded,
+                          const torch::Tensor& topk_weights, int64_t top_k,
+                          bool mul_routed_weight, int64_t block_m);
+
+void moe_int8_gemm_rdna2(torch::Tensor& output, const torch::Tensor& a,
+                         const torch::Tensor& a_scale, const torch::Tensor& w,
+                         const torch::Tensor& w_scale,
+                         const torch::Tensor& sorted_ids,
+                         const torch::Tensor& expert_ids,
+                         const torch::Tensor& num_tokens_post_padded,
+                         const torch::Tensor& topk_weights, int64_t top_k,
+                         bool mul_routed_weight, int64_t block_m);
 
 torch::Tensor gptq_gemm_rdna3(torch::Tensor a, torch::Tensor b_q_weight,
                               torch::Tensor b_qzeros, torch::Tensor b_scales,

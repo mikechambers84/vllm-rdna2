@@ -13,6 +13,27 @@ from vllm.triton_utils import tl, triton
 from vllm.v1.attention.backends.utils import NULL_BLOCK_ID, PAD_SLOT_ID
 
 
+def _on_gfx10() -> bool:
+    if not torch.version.hip:
+        return False
+    from vllm.platforms.rocm import on_gfx10
+
+    return on_gfx10()
+
+
+def conv1d_prefill_block_m(block_size_to_align: int = 0) -> int:
+    """Tokens per program of causal_conv1d_fn; must divide block_size_to_align."""
+    if not _on_gfx10():
+        return 8
+    # RDNA2: 64-token x 512-channel blocks with 2 warps run ~5x faster than
+    # 8 x 256 at 8K tokens on a V620 (the short blocks re-read a 3-token halo
+    # per 8 tokens and leave the GPU latency-bound).
+    for block_m in (64, 32, 16):
+        if not block_size_to_align or block_size_to_align % block_m == 0:
+            return block_m
+    return 8
+
+
 @triton.jit(do_not_specialize_on_alignment=["num_cache_lines"])
 def _causal_conv1d_fwd_kernel(  # continuous batching
     # Pointers to matrices
@@ -556,6 +577,9 @@ def causal_conv1d_fn(
     original_x_dtype = x.dtype
     x = x.to(conv_states.dtype)
     out = torch.empty_like(x)
+    BLOCK_M = conv1d_prefill_block_m(block_size_to_align or 0)
+    if metadata is not None and BLOCK_M not in metadata.nums_dict:
+        metadata = None  # precomputed for another BLOCK_M
     if metadata is not None:
         nums_dict = metadata.nums_dict
         args = nums_dict
@@ -588,7 +612,6 @@ def causal_conv1d_fn(
     stride_istate_dim = 0
     stride_istate_token = 0
     num_cache_lines = 0
-    BLOCK_M = 8
     if conv_states is not None:
         # extensions to support vLLM:
         # 1. conv_states is used to replaced initial_states
@@ -752,8 +775,9 @@ def causal_conv1d_fn(
         NP2_STATELEN=np2_statelen,
         # launch_cooperative_grid=True
         BLOCK_M=BLOCK_M,
-        BLOCK_N=256,
-        num_stages=2,
+        BLOCK_N=512 if BLOCK_M > 8 else 256,
+        num_warps=2 if BLOCK_M > 8 else 4,
+        num_stages=1 if BLOCK_M > 8 else 2,
         launch_pdl=current_platform.is_arch_support_pdl(),
     )
     return out.to(original_x_dtype)

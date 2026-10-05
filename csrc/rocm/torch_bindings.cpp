@@ -77,6 +77,11 @@ TORCH_LIBRARY_EXPAND(TORCH_EXTENSION_NAME, rocm_ops) {
       "gemv_w8a16_rdna2(Tensor a, Tensor w, Tensor scale, Tensor? bias) -> "
       "Tensor");
   rocm_ops.impl("gemv_w8a16_rdna2", torch::kCUDA, &gemv_w8a16_rdna2);
+  // 4-bit GPTQ GEMM for decode and small batches on Exllama's weight layout.
+  rocm_ops.def(
+      "gemm_w4a16_exl_rdna2(Tensor a, Tensor w, Tensor zeros, Tensor scales, "
+      "bool symmetric, bool use_v2_format, int cfg) -> Tensor");
+  rocm_ops.impl("gemm_w4a16_exl_rdna2", torch::kCUDA, &gemm_w4a16_exl_rdna2);
   // int8-weight fused-MoE decode (few tokens) on the Triton int8 layout.
   rocm_ops.def(
       "moe_int8_decode_rdna2(Tensor! output, Tensor x, Tensor topk_ids, "
@@ -90,6 +95,20 @@ TORCH_LIBRARY_EXPAND(TORCH_EXTENSION_NAME, rocm_ops) {
       "Tensor! act) -> ()");
   rocm_ops.impl("moe_wna16_decode_rdna2", torch::kCUDA,
                 &moe_wna16_decode_rdna2);
+  // Grouped W4A16 GEMM for fused-MoE prefill on the Triton WNA16 layout.
+  rocm_ops.def(
+      "moe_wna16_gemm_rdna2(Tensor! output, Tensor a, Tensor w, Tensor scales, "
+      "Tensor sorted_ids, Tensor expert_ids, Tensor num_tokens_post_padded, "
+      "Tensor topk_weights, int top_k, bool mul_routed_weight, int block_m) -> "
+      "()");
+  rocm_ops.impl("moe_wna16_gemm_rdna2", torch::kCUDA, &moe_wna16_gemm_rdna2);
+  // Grouped W8A8 GEMM for fused-MoE prefill on the Triton int8 layout.
+  rocm_ops.def(
+      "moe_int8_gemm_rdna2(Tensor! output, Tensor a, Tensor a_scale, Tensor w, "
+      "Tensor w_scale, Tensor sorted_ids, Tensor expert_ids, "
+      "Tensor num_tokens_post_padded, Tensor topk_weights, int top_k, "
+      "bool mul_routed_weight, int block_m) -> ()");
+  rocm_ops.impl("moe_int8_gemm_rdna2", torch::kCUDA, &moe_int8_gemm_rdna2);
 #endif  // VLLM_ROCM_GFX1030
 
 #ifdef VLLM_ROCM_GFX1100
