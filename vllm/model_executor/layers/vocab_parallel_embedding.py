@@ -79,7 +79,7 @@ class UnquantizedEmbeddingMethod(QuantizeMethodBase):
             )
 
             if use_rdna2_w8a16_lm_head(layer.weight):
-                quantize_weight(layer, chunked=True)
+                quantize_weight(layer)
 
     def apply(
         self,

@@ -422,26 +422,70 @@ def test_rocm_gemv_rdna2_kernel(n, k, m, dtype, with_bias):
     torch.testing.assert_close(out, ref, atol=atol, rtol=1e-2)
 
 
-@pytest.mark.parametrize("n", [1, 3, 8])
-@pytest.mark.parametrize("k,m", [(2048, 64), (4096, 1000), (14336, 512)])
+def _w8_rdna2_weights(fmt: str, m: int, k: int):
+    """K-major 8-bit weights for m output channels and their scales, as
+    gemm_w8_rdna2 takes them, plus the dequantized fp32 weights [m, k]."""
+    from vllm.model_executor.kernels.linear.rdna2_w8a16 import kmajor_w8
+    from vllm.model_executor.kernels.linear.scaled_mm.rdna2 import (
+        _split_block_scales,
+    )
+
+    scale = torch.rand(m, device="cuda") * 1e-2 + 1e-3
+    if fmt == "int8":
+        w = torch.randint(-127, 128, (m, k), dtype=torch.int8, device="cuda")
+        return kmajor_w8(w), scale, None, 0, w.float() * scale[:, None]
+    w = (torch.randn(m, k, device="cuda") * 64).clamp(-448, 448)
+    w = w.to(torch.float8_e4m3fn)
+    if fmt == "fp8":
+        return kmajor_w8(w), scale, None, 0, w.float() * scale[:, None]
+    blocks = torch.rand(-(-m // 128), -(-k // 128), device="cuda") * 1e-2 + 1e-3
+    scale, ratio = _split_block_scales(blocks, 128, m)
+    full = blocks.repeat_interleave(128, 0)[:m].repeat_interleave(128, 1)[:, :k]
+    return kmajor_w8(w), scale, ratio, 128, w.float() * full
+
+
+@pytest.mark.parametrize("fmt", ["int8", "fp8", "fp8_block"])
+@pytest.mark.parametrize("n", [1, 13, 130])
+@pytest.mark.parametrize(
+    "k,m",
+    [
+        (2048, 1024),
+        (1040, 516),  # K % 32 == 16; N not a multiple of 128 (column tile)
+        (5120, 4100),
+    ],
+)
 @pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
 @pytest.mark.parametrize("with_bias", [False, True])
 @pytest.mark.skipif(not on_gfx1030(), reason="RDNA2 (gfx1030) kernel")
-def test_rocm_gemv_w8a16_rdna2_kernel(n, k, m, dtype, with_bias):
-    """int8 weights are converted exactly in registers, so the result matches
-    an fp32 GEMM on the dequantized weights to output rounding."""
+def test_rocm_gemm_w8_rdna2_kernel(fmt, n, k, m, dtype, with_bias):
+    """8-bit weights are widened exactly in registers (fp8 block scales as
+    per-channel scales times fp16 ratios), so the result matches an fp32 GEMM
+    on the dequantized weights to output rounding."""
     torch.manual_seed(0)
     A = torch.randn(n, k, dtype=dtype, device="cuda") * math.sqrt(2 / k)
-    W = torch.randint(-127, 128, (m, k), dtype=torch.int8, device="cuda")
-    scale = torch.rand(m, device="cuda") * 1e-2 + 1e-3
+    W, scale, ratio, block_k, ref_w = _w8_rdna2_weights(fmt, m, k)
     bias = torch.rand(m, dtype=dtype, device="cuda") if with_bias else None
 
-    out = ops.gemv_w8a16_rdna2(A, W, scale, bias)
+    out = ops.gemm_w8_rdna2(A, W, scale, ratio, block_k, bias)
     ref_bias = bias.float() if bias is not None else None
-    ref = torch.nn.functional.linear(
-        A.float(), W.float() * scale[:, None], ref_bias
-    ).to(dtype)
+    ref = torch.nn.functional.linear(A.float(), ref_w, ref_bias).to(dtype)
     atol = torch.finfo(dtype).eps * math.sqrt(k)
+    torch.testing.assert_close(out, ref, atol=atol, rtol=1e-2)
+
+
+@pytest.mark.parametrize("cfg", range(12))
+@pytest.mark.skipif(not on_gfx1030(), reason="RDNA2 (gfx1030) kernel")
+def test_rocm_gemm_w8_rdna2_configs(cfg):
+    """Every tile config gives the same result (row counts not a multiple of
+    the token tile, K % 32 == 16)."""
+    torch.manual_seed(0)
+    k, m = 1040, 516
+    A = torch.randn(37, k, dtype=torch.float16, device="cuda") * math.sqrt(2 / k)
+    W, scale, ratio, block_k, ref_w = _w8_rdna2_weights("fp8_block", m, k)
+
+    out = ops.gemm_w8_rdna2(A, W, scale, ratio, block_k, None, cfg)
+    ref = torch.nn.functional.linear(A.float(), ref_w).half()
+    atol = torch.finfo(torch.float16).eps * math.sqrt(k)
     torch.testing.assert_close(out, ref, atol=atol, rtol=1e-2)
 
 

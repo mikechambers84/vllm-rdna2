@@ -72,21 +72,12 @@ TORCH_LIBRARY_EXPAND(TORCH_EXTENSION_NAME, rocm_ops) {
   // fp16/bf16 GEMV (M <= 8).
   rocm_ops.def("gemv_rdna2(Tensor a, Tensor w, Tensor? bias) -> Tensor");
   rocm_ops.impl("gemv_rdna2", torch::kCUDA, &gemv_rdna2);
-  // int8-weight (per-channel scale) GEMV with fp16/bf16 activations (M <= 8).
+  // GEMM on K-major int8 or fp8 e4m3fn weights (per-channel scales, fp8 also
+  // with 2D block scales) with fp16/bf16 activations, any number of rows.
   rocm_ops.def(
-      "gemv_w8a16_rdna2(Tensor a, Tensor w, Tensor scale, Tensor? bias) -> "
-      "Tensor");
-  rocm_ops.impl("gemv_w8a16_rdna2", torch::kCUDA, &gemv_w8a16_rdna2);
-  // fp8 e4m3fn-weight GEMV (per-row or 2D block scales) with fp16/bf16
-  // activations (M <= 8), and the matching dequantization for larger batches.
-  rocm_ops.def(
-      "gemv_fp8_rdna2(Tensor a, Tensor w, Tensor scale, int block_n, "
-      "int block_k, Tensor? bias) -> Tensor");
-  rocm_ops.impl("gemv_fp8_rdna2", torch::kCUDA, &gemv_fp8_rdna2);
-  rocm_ops.def(
-      "dequant_fp8_rdna2(Tensor! out, Tensor w, Tensor scale, int block_n, "
-      "int block_k) -> ()");
-  rocm_ops.impl("dequant_fp8_rdna2", torch::kCUDA, &dequant_fp8_rdna2);
+      "gemm_w8_rdna2(Tensor a, Tensor w, Tensor scale, Tensor? block_scale, "
+      "int block_k, Tensor? bias, int cfg) -> Tensor");
+  rocm_ops.impl("gemm_w8_rdna2", torch::kCUDA, &gemm_w8_rdna2);
   // fp16/bf16 GEMM with an explicit rocBLAS solution, and the solutions and
   // rocBLAS version for tuning them.
   rocm_ops.def(
