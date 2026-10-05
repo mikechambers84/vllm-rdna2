@@ -1244,9 +1244,9 @@ def test_unified_attn_rdna2_decode(
     calls = []
     hip_decode = ops.decode_attention_rdna2
 
-    def spy(*args) -> None:
+    def spy(*args, **kwargs) -> None:
         calls.append(args)
-        hip_decode(*args)
+        hip_decode(*args, **kwargs)
 
     monkeypatch.setattr(ops, "decode_attention_rdna2", spy)
     unified_attention(
@@ -1285,5 +1285,104 @@ def test_unified_attn_rdna2_decode(
         kv_lens=kv_lens,
         block_tables=block_tables,
         scale=scale,
+    )
+    torch.testing.assert_close(output, ref_output, atol=1.5e-2, rtol=1e-2)
+
+
+@pytest.mark.skipif(not _rdna2_attention(), reason="gfx1030 HIP attention only")
+@pytest.mark.parametrize(
+    "head_size,query_lens,soft_cap",
+    [
+        (256, [1, 3, 1], None),
+        (256, [300, 1, 70], None),
+        (128, [300, 70], 30.0),
+        (64, [300, 1], None),
+    ],
+)
+@torch.inference_mode()
+def test_unified_attn_rdna2_fp8_kv(
+    head_size: int, query_lens: list[int], soft_cap: float | None, monkeypatch
+) -> None:
+    """fp8 e4m3fn caches with per-tensor scales (--kv-cache-dtype fp8) run the
+    HIP prefill / decode kernels and match attention on the dequantized
+    caches."""
+    from vllm import _custom_ops as ops
+
+    torch.set_default_device(DEVICE_TYPE)
+    set_random_seed(0)
+    block_size, num_query_heads, num_kv_heads = 16, 16, 2
+    kv_lens = [q + c for q, c in zip(query_lens, [900, 2000, 37])]
+    num_blocks = sum(kv_lens) // block_size + 64
+    query = torch.randn(
+        sum(query_lens), num_query_heads, head_size, dtype=torch.float16
+    )
+    # Values within e4m3fn's +-448 (beyond it they become NaN).
+    k_scale, v_scale = torch.tensor(0.01), torch.tensor(0.0125)
+    shape = (num_blocks, block_size, num_kv_heads, head_size)
+    key_cache = (torch.randn(shape).clamp(-4, 4) / k_scale).to(torch.float8_e4m3fn)
+    value_cache = (torch.randn(shape).clamp(-4, 4) / v_scale).to(torch.float8_e4m3fn)
+    cu_query_lens = torch.tensor([0] + query_lens, dtype=torch.int32).cumsum(
+        dim=0, dtype=torch.int32
+    )
+    max_blocks = (max(kv_lens) + block_size - 1) // block_size
+    block_tables = torch.randint(
+        0, num_blocks, (len(kv_lens), max_blocks), dtype=torch.int32
+    )
+    output = torch.empty_like(query)
+    scale = head_size**-0.5
+    rows, segments = query.shape[0], 16
+    descale_shape = (len(kv_lens), num_kv_heads)
+    decode = max(query_lens) <= 16
+    split_kv = dict(
+        seq_threshold_3D=len(kv_lens),
+        num_par_softmax_segments=segments,
+        softmax_segm_output=torch.empty(
+            rows, num_query_heads, segments, head_size, dtype=torch.float32
+        ),
+        softmax_segm_max=torch.empty(rows, num_query_heads, segments),
+        softmax_segm_expsum=torch.empty(rows, num_query_heads, segments),
+        max_seqlen_q_3d=max(query_lens),
+    )
+
+    calls = []
+    for name in ("unified_attention_rdna2", "decode_attention_rdna2"):
+        hip_op = getattr(ops, name)
+
+        def spy(*args, hip_op=hip_op, name=name, **kwargs) -> None:
+            calls.append(name)
+            hip_op(*args, **kwargs)
+
+        monkeypatch.setattr(ops, name, spy)
+    unified_attention(
+        q=query,
+        k=key_cache,
+        v=value_cache,
+        out=output,
+        cu_seqlens_q=cu_query_lens,
+        seqused_k=torch.tensor(kv_lens, dtype=torch.int32),
+        max_seqlen_q=max(query_lens),
+        max_seqlen_k=max(kv_lens),
+        softmax_scale=scale,
+        causal=True,
+        window_size=(-1, -1),
+        block_table=block_tables,
+        softcap=soft_cap or 0,
+        q_descale=None,
+        k_descale=k_scale.expand(descale_shape),
+        v_descale=v_scale.expand(descale_shape),
+        kv_quant_mode=KVQuantMode.FP8_PER_TENSOR,
+        **(split_kv if decode else {}),
+    )
+    assert calls == ["decode_attention_rdna2" if decode else "unified_attention_rdna2"]
+
+    ref_output = ref_paged_attn(
+        query=query,
+        key_cache=(key_cache.float() * k_scale).half(),
+        value_cache=(value_cache.float() * v_scale).half(),
+        query_lens=query_lens,
+        kv_lens=kv_lens,
+        block_tables=block_tables,
+        scale=scale,
+        soft_cap=soft_cap,
     )
     torch.testing.assert_close(output, ref_output, atol=1.5e-2, rtol=1e-2)

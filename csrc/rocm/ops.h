@@ -128,17 +128,18 @@ void unified_attention_rdna2(torch::Tensor& out, const torch::Tensor& q,
                              const torch::Tensor& seqused_k,
                              const torch::Tensor& block_table, double scale,
                              int64_t window, double softcap,
-                             const std::optional<torch::Tensor>& sinks);
+                             const std::optional<torch::Tensor>& sinks,
+                             const std::optional<torch::Tensor>& k_scale,
+                             const std::optional<torch::Tensor>& v_scale);
 
-void decode_attention_rdna2(const torch::Tensor& q,
-                            const torch::Tensor& k_cache,
-                            const torch::Tensor& v_cache,
-                            torch::Tensor& segm_out, torch::Tensor& segm_max,
-                            torch::Tensor& segm_sum,
-                            const torch::Tensor& cu_seqlens_q,
-                            const torch::Tensor& seqused_k,
-                            const torch::Tensor& block_table, int64_t tile,
-                            int64_t max_seqlen_q, double scale);
+void decode_attention_rdna2(
+    const torch::Tensor& q, const torch::Tensor& k_cache,
+    const torch::Tensor& v_cache, torch::Tensor& segm_out,
+    torch::Tensor& segm_max, torch::Tensor& segm_sum,
+    const torch::Tensor& cu_seqlens_q, const torch::Tensor& seqused_k,
+    const torch::Tensor& block_table, int64_t tile, int64_t max_seqlen_q,
+    double scale, const std::optional<torch::Tensor>& k_scale,
+    const std::optional<torch::Tensor>& v_scale);
 
 void gdn_post_conv_rdna2(const torch::Tensor& conv_output,
                          const torch::Tensor& a, const torch::Tensor& b,

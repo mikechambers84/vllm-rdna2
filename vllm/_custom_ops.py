@@ -2389,10 +2389,13 @@ def unified_attention_rdna2(
     window: int = 0,
     softcap: float = 0.0,
     sinks: torch.Tensor | None = None,
+    k_scale: torch.Tensor | None = None,
+    v_scale: torch.Tensor | None = None,
 ) -> None:
     """RDNA2 paged causal GQA attention: fp16 ``q`` [tokens, heads, D] against
     ``k_cache`` / ``v_cache`` [blocks, block_size, kv_heads, D] (D in 64, 128,
-    256) with unified_attention's varlen metadata, into ``out``. ``window`` > 0
+    256; fp16, or float8_e4m3fn with fp32 per-tensor ``k_scale`` / ``v_scale``)
+    with unified_attention's varlen metadata, into ``out``. ``window`` > 0
     keeps each query's last ``window`` keys; ``softcap`` > 0 caps the scores;
     ``sinks`` (fp32, one per query head) join each softmax normalizer."""
     torch.ops._rocm_C.unified_attention_rdna2(
@@ -2407,6 +2410,8 @@ def unified_attention_rdna2(
         window,
         softcap,
         sinks,
+        k_scale,
+        v_scale,
     )
 
 
@@ -2423,9 +2428,12 @@ def decode_attention_rdna2(
     tile: int,
     max_seqlen_q: int,
     scale: float,
+    k_scale: torch.Tensor | None = None,
+    v_scale: torch.Tensor | None = None,
 ) -> None:
-    """RDNA2 split-KV decode / spec-verify attention (head 256): writes the
-    per-segment partials of unified_attention's 3D path for reduce_segments."""
+    """RDNA2 split-KV decode / spec-verify attention (head 256; caches and
+    scales as for ``unified_attention_rdna2``): writes the per-segment partials
+    of unified_attention's 3D path for reduce_segments."""
     torch.ops._rocm_C.decode_attention_rdna2(
         q,
         k_cache,
@@ -2439,6 +2447,8 @@ def decode_attention_rdna2(
         tile,
         max_seqlen_q,
         scale,
+        k_scale,
+        v_scale,
     )
 
 

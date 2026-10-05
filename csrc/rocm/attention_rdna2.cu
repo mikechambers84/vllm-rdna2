@@ -36,6 +36,10 @@
 #include <hip/hip_runtime.h>
 #include <hip/hip_fp16.h>
 
+#include <type_traits>
+
+#include "rdna2_fp8.cuh"
+
 #if defined(__HIPCC__) && defined(__gfx1030__)
   #define __HIP__RDNA2__
 #endif
@@ -66,20 +70,54 @@ __device__ __forceinline__ float row16_sum(float v) {
   return v;
 }
 
+// K/V caches hold fp16, or fp8 e4m3fn (KV8) widened exactly to fp16 x 2^-8
+// on the way into LDS; the per-tensor scales (x 256) go into the softmax scale
+// and the output.
+template <bool KV8>
+using KvRaw = std::conditional_t<KV8, uint2, uint4>;
+
+template <bool KV8>
+__device__ __forceinline__ KvRaw<KV8> kv_load(const void* base, long elem) {
+  if constexpr (KV8)
+    return *reinterpret_cast<const uint2*>(static_cast<const uint8_t*>(base) +
+                                           elem);
+  else
+    return *reinterpret_cast<const uint4*>(static_cast<const __half*>(base) +
+                                           elem);
+}
+
+__device__ __forceinline__ uint4 kv_widen(const uint4 r) { return r; }
+
+__device__ __forceinline__ uint4 kv_widen(const uint2 r) {
+  const half2 h[4] = {rdna2::fp8x2_to_half2(r.x, rdna2::FP8_LO),
+                      rdna2::fp8x2_to_half2(r.x, rdna2::FP8_HI),
+                      rdna2::fp8x2_to_half2(r.y, rdna2::FP8_LO),
+                      rdna2::fp8x2_to_half2(r.y, rdna2::FP8_HI)};
+  return *reinterpret_cast<const uint4*>(h);
+}
+
+template <bool KV8>
+__device__ __forceinline__ float kv_scale(const float* scale) {
+  return KV8 ? 256.f * scale[0] : 1.f;
+}
+
 // EXT: sliding window / softcap / sinks compiled in (plain causal otherwise).
-template <int D, int DC, bool EXT>
+// KV8: fp8 e4m3fn caches (see kv_load).
+template <int D, int DC, bool EXT, bool KV8>
 __global__ void __launch_bounds__(THREADS) unified_attention_rdna2_kernel(
-    const __half* __restrict__ Q, const __half* __restrict__ Kc,
-    const __half* __restrict__ Vc, __half* __restrict__ O,
+    const __half* __restrict__ Q, const void* __restrict__ Kc,
+    const void* __restrict__ Vc, __half* __restrict__ O,
     const int* __restrict__ cu_q, const int* __restrict__ seqused_k,
     const int* __restrict__ block_table, const int num_seqs, const int G,
     const int BQ, const int block_size, const long bt_stride, const long q_st,
     const long q_sh, const long k_sb, const long k_st, const long k_sh,
     const long v_sb, const long v_st, const long v_sh, const long o_st,
     const long o_sh, const float scale, const int window, const float softcap,
-    const float* __restrict__ sinks) {
+    const float* __restrict__ sinks, const float* __restrict__ k_scale,
+    const float* __restrict__ v_scale) {
   constexpr float LOG2E = 1.4426950408889634f;
-  const float scale_log2e = scale * LOG2E;
+  const float qk_scale = scale * kv_scale<KV8>(k_scale);
+  const float scale_log2e = qk_scale * LOG2E;
   constexpr int D2 = D / 2;
   constexpr int TN = D / 16;  // output columns per thread
   constexpr int Q_ITEMS = BM * (D / 8) / THREADS;
@@ -173,7 +211,7 @@ __global__ void __launch_bounds__(THREADS) unified_attention_rdna2_kernel(
   };
 
   long krow[K_ITEMS];
-  uint4 kr[K_ITEMS];
+  KvRaw<KV8> kr[K_ITEMS];
   auto kaddr = [&](int kt) {
   #pragma unroll
     for (int it = 0; it < K_ITEMS; it++) {
@@ -185,9 +223,8 @@ __global__ void __launch_bounds__(THREADS) unified_attention_rdna2_kernel(
   #pragma unroll
     for (int it = 0; it < K_ITEMS; it++) {
       const int part = (tid + it * THREADS) % KL;
-      kr[it] = krow[it] >= 0 ? *reinterpret_cast<const uint4*>(
-                                   Kc + krow[it] + dc * DC + part * 8)
-                             : make_uint4(0, 0, 0, 0);
+      kr[it] = krow[it] >= 0 ? kv_load<KV8>(Kc, krow[it] + dc * DC + part * 8)
+                             : KvRaw<KV8>{};
     }
   };
   auto kstore = [&](int buf) {
@@ -196,25 +233,25 @@ __global__ void __launch_bounds__(THREADS) unified_attention_rdna2_kernel(
       const int idx = tid + it * THREADS;
       const int key = idx / KL, part = idx % KL;
       uint32_t* d = &sU[buf][part * 4 * BN + (key ^ (part * (32 / KL)))];
-      d[0] = kr[it].x;
-      d[BN] = kr[it].y;
-      d[2 * BN] = kr[it].z;
-      d[3 * BN] = kr[it].w;
+      const uint4 kv = kv_widen(kr[it]);
+      d[0] = kv.x;
+      d[BN] = kv.y;
+      d[2 * BN] = kv.z;
+      d[3 * BN] = kv.w;
     }
   };
-  uint4 va[V_ITEMS], vb[V_ITEMS];
+  KvRaw<KV8> va[V_ITEMS], vb[V_ITEMS];
   auto vload = [&](int kt, int vc) {
   #pragma unroll
     for (int it = 0; it < V_ITEMS; it++) {
       const int idx = tid + it * THREADS;
       const int kp = idx / (D / 8), c = idx % (D / 8);
       const int k0 = kt + vc * VC + kp * 2;
-      va[it] = idx < V_TOTAL && k0 < klen
-                   ? *reinterpret_cast<const uint4*>(Vc + v_off(k0) + c * 8)
-                   : make_uint4(0, 0, 0, 0);
+      va[it] = idx < V_TOTAL && k0 < klen ? kv_load<KV8>(Vc, v_off(k0) + c * 8)
+                                          : KvRaw<KV8>{};
       vb[it] = idx < V_TOTAL && k0 + 1 < klen
-                   ? *reinterpret_cast<const uint4*>(Vc + v_off(k0 + 1) + c * 8)
-                   : make_uint4(0, 0, 0, 0);
+                   ? kv_load<KV8>(Vc, v_off(k0 + 1) + c * 8)
+                   : KvRaw<KV8>{};
     }
   };
   auto vstore = [&](int buf) {
@@ -223,8 +260,9 @@ __global__ void __launch_bounds__(THREADS) unified_attention_rdna2_kernel(
       const int idx = tid + it * THREADS;
       if (idx >= V_TOTAL) continue;
       const int kp = idx / (D / 8), c = idx % (D / 8);
-      const uint32_t* a = reinterpret_cast<const uint32_t*>(&va[it]);
-      const uint32_t* b = reinterpret_cast<const uint32_t*>(&vb[it]);
+      const uint4 av = kv_widen(va[it]), bv = kv_widen(vb[it]);
+      const uint32_t* a = reinterpret_cast<const uint32_t*>(&av);
+      const uint32_t* b = reinterpret_cast<const uint32_t*>(&bv);
       uint32_t w[8];
   #pragma unroll
       for (int e = 0; e < 4; e++) {
@@ -287,7 +325,7 @@ __global__ void __launch_bounds__(THREADS) unified_attention_rdna2_kernel(
       for (int j = 0; j < 4; j++) {
         if (EXT &&
             softcap > 0.f) {  // softcap * tanh(s / softcap), overflow-safe
-          const float y = sacc[i][j] * scale / softcap;
+          const float y = sacc[i][j] * qk_scale / softcap;
           sv[j] = softcap * (1.f - 2.f / (__expf(2.f * y) + 1.f)) * LOG2E;
         } else {
           sv[j] = sacc[i][j] * scale_log2e;
@@ -368,7 +406,7 @@ __global__ void __launch_bounds__(THREADS) unified_attention_rdna2_kernel(
     const int tq = r / G, g = r % G;
     const float l = row16_sum(l_i[i]);
     if (tq >= ntok) continue;
-    const float inv = 1.f / l;
+    const float inv = kv_scale<KV8>(v_scale) / l;
     __half* o = O + (q0 + t0 + tq) * o_st + (kvh * G + g) * o_sh;
   #pragma unroll
     for (int j = 0; j < TN; j += 4) {
@@ -385,18 +423,18 @@ __global__ void __launch_bounds__(THREADS) unified_attention_rdna2_kernel(
 // Split-KV decode / spec-verify attention: 16 rows (query token, q-head) per
 // workgroup, the prefill kernel's 64-key tiles (S: 1 row x 4 keys per thread,
 // PV: 1 row x D/16 columns), segment partials for reduce_segments.
-template <int D, int DC>
+template <int D, int DC, bool KV8>
 __global__ void __launch_bounds__(THREADS) decode_attention_rdna2_kernel(
-    const __half* __restrict__ Q, const __half* __restrict__ Kc,
-    const __half* __restrict__ Vc, float* __restrict__ segm_out,
+    const __half* __restrict__ Q, const void* __restrict__ Kc,
+    const void* __restrict__ Vc, float* __restrict__ segm_out,
     float* __restrict__ segm_max, float* __restrict__ segm_sum,
     const int* __restrict__ cu_q, const int* __restrict__ seqused_k,
     const int* __restrict__ block_table, const int G, const int HQ,
     const int block_size, const long bt_stride, const long q_st,
     const long q_sh, const long k_sb, const long k_st, const long k_sh,
     const long v_sb, const long v_st, const long v_sh, const int tile,
-    const int nseg, const int dpad, const int rgroups,
-    const float scale_log2e) {
+    const int nseg, const int dpad, const int rgroups, const float scale,
+    const float* __restrict__ k_scale, const float* __restrict__ v_scale) {
   constexpr float LOG2E = 1.4426950408889634f;
   constexpr int RB = 16;  // rows per workgroup
   constexpr int D2 = D / 2;
@@ -413,6 +451,7 @@ __global__ void __launch_bounds__(THREADS) decode_attention_rdna2_kernel(
   constexpr int U_STAGE = K_STAGE > V_STAGE ? K_STAGE : V_STAGE;
   constexpr int PLD =
       RB + 1;  // sP row stride: conflict-free transposing stores
+  const float scale_log2e = scale * LOG2E * kv_scale<KV8>(k_scale);
   __shared__ __align__(16) uint32_t sQ[D2][RB];
   __shared__ __align__(16) uint32_t sU[2][U_STAGE];
   __shared__ uint32_t sP[(BN / 2) * PLD];
@@ -459,7 +498,7 @@ __global__ void __launch_bounds__(THREADS) decode_attention_rdna2_kernel(
     return bt[key / block_size] * v_sb + key % block_size * v_st + kvh * v_sh;
   };
   long krow[K_ITEMS];
-  uint4 kr[K_ITEMS];
+  KvRaw<KV8> kr[K_ITEMS];
   auto kaddr = [&](int kt) {
   #pragma unroll
     for (int it = 0; it < K_ITEMS; it++) {
@@ -471,9 +510,8 @@ __global__ void __launch_bounds__(THREADS) decode_attention_rdna2_kernel(
   #pragma unroll
     for (int it = 0; it < K_ITEMS; it++) {
       const int part = (tid + it * THREADS) % KL;
-      kr[it] = krow[it] >= 0 ? *reinterpret_cast<const uint4*>(
-                                   Kc + krow[it] + dc * DC + part * 8)
-                             : make_uint4(0, 0, 0, 0);
+      kr[it] = krow[it] >= 0 ? kv_load<KV8>(Kc, krow[it] + dc * DC + part * 8)
+                             : KvRaw<KV8>{};
     }
   };
   auto kstore = [&](int buf) {
@@ -482,13 +520,14 @@ __global__ void __launch_bounds__(THREADS) decode_attention_rdna2_kernel(
       const int idx = tid + it * THREADS;
       const int key = idx / KL, part = idx % KL;
       uint32_t* d = &sU[buf][part * 4 * BN + (key ^ (part * (32 / KL)))];
-      d[0] = kr[it].x;
-      d[BN] = kr[it].y;
-      d[2 * BN] = kr[it].z;
-      d[3 * BN] = kr[it].w;
+      const uint4 kv = kv_widen(kr[it]);
+      d[0] = kv.x;
+      d[BN] = kv.y;
+      d[2 * BN] = kv.z;
+      d[3 * BN] = kv.w;
     }
   };
-  uint4 va[V_ITEMS], vb[V_ITEMS];
+  KvRaw<KV8> va[V_ITEMS], vb[V_ITEMS];
   auto vload = [&](int kt, int vc) {
   #pragma unroll
     for (int it = 0; it < V_ITEMS; it++) {
@@ -496,12 +535,11 @@ __global__ void __launch_bounds__(THREADS) decode_attention_rdna2_kernel(
       const int kp = idx / (D / 8), c = idx % (D / 8);
       const int key0 = kt + vc * VC + kp * 2;
       va[it] = idx < V_TOTAL && key0 < k1
-                   ? *reinterpret_cast<const uint4*>(Vc + v_off(key0) + c * 8)
-                   : make_uint4(0, 0, 0, 0);
-      vb[it] =
-          idx < V_TOTAL && key0 + 1 < k1
-              ? *reinterpret_cast<const uint4*>(Vc + v_off(key0 + 1) + c * 8)
-              : make_uint4(0, 0, 0, 0);
+                   ? kv_load<KV8>(Vc, v_off(key0) + c * 8)
+                   : KvRaw<KV8>{};
+      vb[it] = idx < V_TOTAL && key0 + 1 < k1
+                   ? kv_load<KV8>(Vc, v_off(key0 + 1) + c * 8)
+                   : KvRaw<KV8>{};
     }
   };
   auto vstore = [&](int buf) {
@@ -510,8 +548,9 @@ __global__ void __launch_bounds__(THREADS) decode_attention_rdna2_kernel(
       const int idx = tid + it * THREADS;
       if (idx >= V_TOTAL) continue;
       const int kp = idx / (D / 8), c = idx % (D / 8);
-      const uint32_t* a = reinterpret_cast<const uint32_t*>(&va[it]);
-      const uint32_t* b = reinterpret_cast<const uint32_t*>(&vb[it]);
+      const uint4 av = kv_widen(va[it]), bv = kv_widen(vb[it]);
+      const uint32_t* a = reinterpret_cast<const uint32_t*>(&av);
+      const uint32_t* b = reinterpret_cast<const uint32_t*>(&bv);
       uint32_t w[8];
   #pragma unroll
       for (int e = 0; e < 4; e++) {
@@ -614,10 +653,11 @@ __global__ void __launch_bounds__(THREADS) decode_attention_rdna2_kernel(
   if (my_tq >= qlen) return;
   const long base = ((long)(q0 + my_tq) * HQ + kvh * G + my_g) * nseg + seg;
   float* o = segm_out + base * dpad;
+  const float vs = kv_scale<KV8>(v_scale);
   #pragma unroll
   for (int j = 0; j < TN; j += 4)
-    *reinterpret_cast<float4*>(o + j * 16 + tx * 4) =
-        make_float4(acc[j], acc[j + 1], acc[j + 2], acc[j + 3]);
+    *reinterpret_cast<float4*>(o + j * 16 + tx * 4) = make_float4(
+        acc[j] * vs, acc[j + 1] * vs, acc[j + 2] * vs, acc[j + 3] * vs);
   if (tx == 0) {
     segm_max[base] = m_i / LOG2E;
     segm_sum[base] = l;
@@ -626,29 +666,55 @@ __global__ void __launch_bounds__(THREADS) decode_attention_rdna2_kernel(
 
 #else  // non-RDNA2 device pass: empty stub for symbol parity.
 
-template <int D, int DC, bool EXT>
+template <int D, int DC, bool EXT, bool KV8>
 __global__ void unified_attention_rdna2_kernel(
-    const __half*, const __half*, const __half*, __half*, const int*,
-    const int*, const int*, const int, const int, const int, const int,
+    const __half*, const void*, const void*, __half*, const int*, const int*,
+    const int*, const int, const int, const int, const int, const long,
     const long, const long, const long, const long, const long, const long,
-    const long, const long, const long, const long, const long, const float,
-    const int, const float, const float*) {}
+    const long, const long, const long, const long, const float, const int,
+    const float, const float*, const float*, const float*) {}
 
-template <int D, int DC>
+template <int D, int DC, bool KV8>
 __global__ void decode_attention_rdna2_kernel(
-    const __half*, const __half*, const __half*, float*, float*, float*,
-    const int*, const int*, const int*, const int, const int, const int,
+    const __half*, const void*, const void*, float*, float*, float*, const int*,
+    const int*, const int*, const int, const int, const int, const long,
     const long, const long, const long, const long, const long, const long,
-    const long, const long, const long, const int, const int, const int,
-    const int, const float) {}
+    const long, const long, const int, const int, const int, const int,
+    const float, const float*, const float*) {}
 
 #endif  // __HIP__RDNA2__ || !__HIP_DEVICE_COMPILE__
 
 }  // namespace attention_rdna2
 }  // namespace vllm
 
+namespace {
+
+// Whether the caches are fp8 e4m3fn (else fp16); fp8 needs fp32 per-tensor
+// k_scale / v_scale (only element 0 is read, so expanded views work).
+bool check_kv_dtype(const char* name, const torch::Tensor& k_cache,
+                    const torch::Tensor& v_cache,
+                    const std::optional<torch::Tensor>& k_scale,
+                    const std::optional<torch::Tensor>& v_scale) {
+  TORCH_CHECK(k_cache.dtype() == v_cache.dtype(), name,
+              " needs k_cache and v_cache of one dtype");
+  if (k_cache.dtype() == torch::kFloat16) return false;
+  TORCH_CHECK(k_cache.dtype() == at::ScalarType::Float8_e4m3fn, name,
+              " needs fp16 or float8_e4m3fn caches");
+  TORCH_CHECK(k_scale && v_scale && k_scale->dtype() == torch::kFloat32 &&
+                  v_scale->dtype() == torch::kFloat32,
+              name, " needs fp32 k_scale and v_scale for fp8 caches");
+  return true;
+}
+
+const float* scale_ptr(const std::optional<torch::Tensor>& t) {
+  return t ? t->data_ptr<float>() : nullptr;
+}
+
+}  // namespace
+
 // Causal attention of q [num_tokens, num_q_heads, D] against the paged fp16
-// caches k_cache / v_cache [num_blocks, block_size, num_kv_heads, D] into
+// (or fp8 e4m3fn, dequantized with the per-tensor k_scale / v_scale) caches
+// k_cache / v_cache [num_blocks, block_size, num_kv_heads, D] into
 // out [num_tokens, num_q_heads, D]; D in {64, 128, 256}. Sequence s owns query
 // tokens cu_seqlens_q[s] .. cu_seqlens_q[s + 1] - 1, which are the last ones
 // of its seqused_k[s] keys, whose cache blocks are block_table[s]. window > 0
@@ -662,12 +728,14 @@ void unified_attention_rdna2(torch::Tensor& out, const torch::Tensor& q,
                              const torch::Tensor& seqused_k,
                              const torch::Tensor& block_table, double scale,
                              int64_t window, double softcap,
-                             const std::optional<torch::Tensor>& sinks) {
+                             const std::optional<torch::Tensor>& sinks,
+                             const std::optional<torch::Tensor>& k_scale,
+                             const std::optional<torch::Tensor>& v_scale) {
   using namespace vllm::attention_rdna2;
-  TORCH_CHECK(
-      q.dtype() == torch::kFloat16 && k_cache.dtype() == torch::kFloat16 &&
-          v_cache.dtype() == torch::kFloat16 && out.dtype() == torch::kFloat16,
-      "unified_attention_rdna2 needs fp16 queries, caches and output");
+  TORCH_CHECK(q.dtype() == torch::kFloat16 && out.dtype() == torch::kFloat16,
+              "unified_attention_rdna2 needs fp16 queries and output");
+  const bool kv8 = check_kv_dtype("unified_attention_rdna2", k_cache, v_cache,
+                                  k_scale, v_scale);
   TORCH_CHECK(q.dim() == 3 && k_cache.dim() == 4 && v_cache.dim() == 4 &&
                   out.sizes() == q.sizes(),
               "unified_attention_rdna2 needs q/out [tokens, heads, D] and "
@@ -714,21 +782,27 @@ void unified_attention_rdna2(torch::Tensor& out, const torch::Tensor& q,
     sinks_ptr = sinks->data_ptr<float>();
   }
 
-#define VLLM_ATTN_RDNA2_LAUNCH(HD, DC, X)                                  \
-  unified_attention_rdna2_kernel<HD, DC, X><<<grid, THREADS, 0, stream>>>( \
-      (const __half*)q.data_ptr(), (const __half*)k_cache.data_ptr(),      \
-      (const __half*)v_cache.data_ptr(), (__half*)out.data_ptr(),          \
-      cu_seqlens_q.data_ptr<int>(), seqused_k.data_ptr<int>(),             \
-      block_table.data_ptr<int>(), num_seqs, G, BQ, k_cache.size(1),       \
-      block_table.stride(0), q.stride(0), q.stride(1), k_cache.stride(0),  \
-      k_cache.stride(1), k_cache.stride(2), v_cache.stride(0),             \
-      v_cache.stride(1), v_cache.stride(2), out.stride(0), out.stride(1),  \
-      (float)scale, (int)window, (float)softcap, sinks_ptr)
-#define VLLM_ATTN_RDNA2_BY_EXT(HD, DC)     \
-  if (ext) {                               \
-    VLLM_ATTN_RDNA2_LAUNCH(HD, DC, true);  \
-  } else {                                 \
-    VLLM_ATTN_RDNA2_LAUNCH(HD, DC, false); \
+#define VLLM_ATTN_RDNA2_LAUNCH(HD, DC, X, K8)                                  \
+  unified_attention_rdna2_kernel<HD, DC, X, K8><<<grid, THREADS, 0, stream>>>( \
+      (const __half*)q.data_ptr(), k_cache.data_ptr(), v_cache.data_ptr(),     \
+      (__half*)out.data_ptr(), cu_seqlens_q.data_ptr<int>(),                   \
+      seqused_k.data_ptr<int>(), block_table.data_ptr<int>(), num_seqs, G, BQ, \
+      k_cache.size(1), block_table.stride(0), q.stride(0), q.stride(1),        \
+      k_cache.stride(0), k_cache.stride(1), k_cache.stride(2),                 \
+      v_cache.stride(0), v_cache.stride(1), v_cache.stride(2), out.stride(0),  \
+      out.stride(1), (float)scale, (int)window, (float)softcap, sinks_ptr,     \
+      scale_ptr(k_scale), scale_ptr(v_scale))
+#define VLLM_ATTN_RDNA2_BY_KV(HD, DC, X)      \
+  if (kv8) {                                  \
+    VLLM_ATTN_RDNA2_LAUNCH(HD, DC, X, true);  \
+  } else {                                    \
+    VLLM_ATTN_RDNA2_LAUNCH(HD, DC, X, false); \
+  }
+#define VLLM_ATTN_RDNA2_BY_EXT(HD, DC)    \
+  if (ext) {                              \
+    VLLM_ATTN_RDNA2_BY_KV(HD, DC, true);  \
+  } else {                                \
+    VLLM_ATTN_RDNA2_BY_KV(HD, DC, false); \
   }
   const bool ext = window > 0 || softcap > 0 || sinks_ptr != nullptr;
   if (D == 256) {
@@ -739,32 +813,33 @@ void unified_attention_rdna2(torch::Tensor& out, const torch::Tensor& q,
     VLLM_ATTN_RDNA2_BY_EXT(64, 32);
   }
 #undef VLLM_ATTN_RDNA2_BY_EXT
+#undef VLLM_ATTN_RDNA2_BY_KV
 #undef VLLM_ATTN_RDNA2_LAUNCH
 }
 
-// Split-KV decode / spec-verify attention for head 256 (fp16): q [num_tokens,
-// num_q_heads, 256], paged caches as for unified_attention_rdna2; writes the
+// Split-KV decode / spec-verify attention for head 256: q [num_tokens,
+// num_q_heads, 256], paged caches (and scales) as for unified_attention_rdna2;
+// writes the
 // unnormalized per-segment outputs segm_out [>= num_tokens, num_q_heads, S,
 // 256] fp32 and their maxima (natural log) / exp sums segm_max, segm_sum
 // [>= num_tokens, num_q_heads, S], segments of ceil(len / (S * tile)) * tile
 // keys as in reduce_segments.
-void decode_attention_rdna2(const torch::Tensor& q,
-                            const torch::Tensor& k_cache,
-                            const torch::Tensor& v_cache,
-                            torch::Tensor& segm_out, torch::Tensor& segm_max,
-                            torch::Tensor& segm_sum,
-                            const torch::Tensor& cu_seqlens_q,
-                            const torch::Tensor& seqused_k,
-                            const torch::Tensor& block_table, int64_t tile,
-                            int64_t max_seqlen_q, double scale) {
+void decode_attention_rdna2(
+    const torch::Tensor& q, const torch::Tensor& k_cache,
+    const torch::Tensor& v_cache, torch::Tensor& segm_out,
+    torch::Tensor& segm_max, torch::Tensor& segm_sum,
+    const torch::Tensor& cu_seqlens_q, const torch::Tensor& seqused_k,
+    const torch::Tensor& block_table, int64_t tile, int64_t max_seqlen_q,
+    double scale, const std::optional<torch::Tensor>& k_scale,
+    const std::optional<torch::Tensor>& v_scale) {
   using namespace vllm::attention_rdna2;
   TORCH_CHECK(q.dtype() == torch::kFloat16 &&
-                  k_cache.dtype() == torch::kFloat16 &&
-                  v_cache.dtype() == torch::kFloat16 &&
                   segm_out.dtype() == torch::kFloat32 &&
                   segm_max.dtype() == torch::kFloat32 &&
                   segm_sum.dtype() == torch::kFloat32,
-              "decode_attention_rdna2: fp16 q / caches, fp32 segment scratch");
+              "decode_attention_rdna2: fp16 q, fp32 segment scratch");
+  const bool kv8 = check_kv_dtype("decode_attention_rdna2", k_cache, v_cache,
+                                  k_scale, v_scale);
   const int HQ = q.size(1), D = q.size(2), HKV = k_cache.size(2);
   TORCH_CHECK(D == 256 && k_cache.size(3) == D &&
                   v_cache.sizes() == k_cache.sizes() && HQ % HKV == 0,
@@ -795,14 +870,21 @@ void decode_attention_rdna2(const torch::Tensor& q,
   const at::cuda::OptionalCUDAGuard device_guard(device_of(q));
   const cudaStream_t stream = at::cuda::getCurrentCUDAStream();
   const dim3 grid(num_seqs * rgroups, HKV, nseg);
-  decode_attention_rdna2_kernel<256, 64><<<grid, THREADS, 0, stream>>>(
-      (const __half*)q.data_ptr(), (const __half*)k_cache.data_ptr(),
-      (const __half*)v_cache.data_ptr(), segm_out.data_ptr<float>(),
-      segm_max.data_ptr<float>(), segm_sum.data_ptr<float>(),
-      cu_seqlens_q.data_ptr<int>(), seqused_k.data_ptr<int>(),
-      block_table.data_ptr<int>(), G, HQ, k_cache.size(1),
-      block_table.stride(0), q.stride(0), q.stride(1), k_cache.stride(0),
-      k_cache.stride(1), k_cache.stride(2), v_cache.stride(0),
-      v_cache.stride(1), v_cache.stride(2), (int)tile, nseg, segm_out.size(3),
-      rgroups, (float)(scale * 1.4426950408889634));
+  auto launch = [&](auto kernel) {
+    kernel<<<grid, THREADS, 0, stream>>>(
+        (const __half*)q.data_ptr(), k_cache.data_ptr(), v_cache.data_ptr(),
+        segm_out.data_ptr<float>(), segm_max.data_ptr<float>(),
+        segm_sum.data_ptr<float>(), cu_seqlens_q.data_ptr<int>(),
+        seqused_k.data_ptr<int>(), block_table.data_ptr<int>(), G, HQ,
+        k_cache.size(1), block_table.stride(0), q.stride(0), q.stride(1),
+        k_cache.stride(0), k_cache.stride(1), k_cache.stride(2),
+        v_cache.stride(0), v_cache.stride(1), v_cache.stride(2), (int)tile,
+        nseg, segm_out.size(3), rgroups, (float)scale, scale_ptr(k_scale),
+        scale_ptr(v_scale));
+  };
+  if (kv8) {
+    launch(decode_attention_rdna2_kernel<256, 64, true>);
+  } else {
+    launch(decode_attention_rdna2_kernel<256, 64, false>);
+  }
 }
