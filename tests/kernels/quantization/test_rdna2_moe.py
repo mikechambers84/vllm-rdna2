@@ -123,3 +123,79 @@ def test_moe_wna16_gemm_rdna2_prefill_matches_reference(block_m, group):
     ref = _reference(x, topk_weights, topk_ids.long(), w13_ref, w2_ref)
     out = down.float().sum(1)
     assert ((out - ref).norm() / ref.norm()).item() < 2e-3
+
+
+@pytest.mark.parametrize("block_m", [64, 128])
+def test_moe_int8_gemm_rdna2_prefill_matches_triton(block_m):
+    """The W8A8 prefill GEMM runs the same integer math as the Triton int8
+    kernel (int8 rows gathered by moe_align_block_size, per-row activation and
+    per-channel weight scales, top-k weights on the second GEMM), so both
+    routed GEMMs match it to fp16 output rounding."""
+    import triton.language as tl
+
+    from vllm import _custom_ops as ops
+    from vllm.model_executor.layers.fused_moe.fused_moe import (
+        dispatch_fused_moe_kernel,
+    )
+    from vllm.model_executor.layers.fused_moe.moe_align_block_size import (
+        moe_align_block_size,
+    )
+
+    torch.manual_seed(0)
+    num_tokens = 128
+    w13 = torch.randint(-127, 128, (E, 2 * INTER, H), dtype=torch.int8, device="cuda")
+    w2 = torch.randint(-127, 128, (E, H, INTER), dtype=torch.int8, device="cuda")
+    s13 = torch.rand(E, 2 * INTER, 1, device="cuda") * 2e-4 + 1e-5
+    s2 = torch.rand(E, H, 1, device="cuda") * 2e-4 + 1e-5
+    x = torch.randn(num_tokens, H, dtype=torch.float16, device="cuda") * 0.5
+    act = torch.randn(num_tokens * TOPK, INTER, dtype=x.dtype, device="cuda") * 0.5
+    x_q, x_s, _ = ops.scaled_int8_quant(x, None, None, True)
+    act_q, act_s, _ = ops.scaled_int8_quant(act, None, None, True)
+    topk_weights, topk_ids = torch.topk(
+        torch.randn(num_tokens, E, device="cuda").softmax(-1), TOPK, dim=-1
+    )
+    topk_ids = topk_ids.int()
+    sorted_ids, expert_ids, num_post_padded = moe_align_block_size(topk_ids, block_m, E)
+    flags = dict(
+        use_fp8_w8a8=False,
+        use_int8_w8a8=True,
+        use_int8_w8a16=False,
+        use_int4_w4a16=False,
+        per_channel_quant=True,
+        block_shape=None,
+    )
+    config = {
+        "BLOCK_SIZE_M": block_m,
+        "BLOCK_SIZE_N": 128,
+        "BLOCK_SIZE_K": 128,
+        "GROUP_SIZE_M": 1,
+        "SPLIT_K": 1,
+        "num_warps": 4,
+        "num_stages": 2,
+    }
+    align = (sorted_ids, expert_ids, num_post_padded)
+    for a, a_s, w, w_s, top_k, mul in (
+        (x_q, x_s, w13, s13, TOPK, False),
+        (act_q, act_s, w2, s2, 1, True),
+    ):
+        ref = torch.empty(num_tokens, TOPK, w.size(1), dtype=x.dtype, device="cuda")
+        dispatch_fused_moe_kernel(
+            a,
+            w,
+            ref,
+            a_s,
+            w_s,
+            None,
+            topk_weights,
+            *align,
+            mul,
+            top_k,
+            config,
+            compute_type=tl.float16,
+            **flags,
+        )
+        out = torch.empty_like(ref)
+        ops.moe_int8_gemm_rdna2(
+            out, a, a_s.view(-1), w, w_s, *align, topk_weights, top_k, mul, block_m
+        )
+        torch.testing.assert_close(out, ref, rtol=2e-3, atol=1e-3)

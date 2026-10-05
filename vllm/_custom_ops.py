@@ -2236,6 +2236,40 @@ def moe_wna16_gemm_rdna2(
     )
 
 
+def moe_int8_gemm_rdna2(
+    output: torch.Tensor,
+    a: torch.Tensor,
+    a_scale: torch.Tensor,
+    w: torch.Tensor,
+    w_scale: torch.Tensor,
+    sorted_ids: torch.Tensor,
+    expert_ids: torch.Tensor,
+    num_tokens_post_padded: torch.Tensor,
+    topk_weights: torch.Tensor,
+    top_k: int,
+    mul_routed_weight: bool,
+    block_m: int,
+) -> None:
+    """RDNA2 grouped W8A8 GEMM for fused-MoE prefill: one routed GEMM of the
+    Triton int8 path (int8 [E, N, K] weights with channel scales, int8
+    activations with row scales) over moe_align_block_size(block_m) rows,
+    into ``output`` [M * top_k, N]."""
+    torch.ops._rocm_C.moe_int8_gemm_rdna2(
+        output,
+        a,
+        a_scale,
+        w,
+        w_scale,
+        sorted_ids,
+        expert_ids,
+        num_tokens_post_padded,
+        topk_weights,
+        top_k,
+        mul_routed_weight,
+        block_m,
+    )
+
+
 def wvSplitK_int4_g(
     weight: torch.Tensor,
     activation: torch.Tensor,

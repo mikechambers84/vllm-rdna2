@@ -102,6 +102,13 @@ TORCH_LIBRARY_EXPAND(TORCH_EXTENSION_NAME, rocm_ops) {
       "Tensor topk_weights, int top_k, bool mul_routed_weight, int block_m) -> "
       "()");
   rocm_ops.impl("moe_wna16_gemm_rdna2", torch::kCUDA, &moe_wna16_gemm_rdna2);
+  // Grouped W8A8 GEMM for fused-MoE prefill on the Triton int8 layout.
+  rocm_ops.def(
+      "moe_int8_gemm_rdna2(Tensor! output, Tensor a, Tensor a_scale, Tensor w, "
+      "Tensor w_scale, Tensor sorted_ids, Tensor expert_ids, "
+      "Tensor num_tokens_post_padded, Tensor topk_weights, int top_k, "
+      "bool mul_routed_weight, int block_m) -> ()");
+  rocm_ops.impl("moe_int8_gemm_rdna2", torch::kCUDA, &moe_int8_gemm_rdna2);
 #endif  // VLLM_ROCM_GFX1030
 
 #ifdef VLLM_ROCM_GFX1100

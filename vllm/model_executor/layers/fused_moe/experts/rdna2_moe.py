@@ -242,8 +242,11 @@ class Rdna2Int8Experts(TritonExperts):
     ``moe_int8_decode_rdna2``, which dots the exactly converted int8 weights
     with the fp16 activations (no activation quantization, so more accurate
     than the Triton W8A8 path): 7x tuned Triton at 1 token, 2.2x at 8, 1.5x at
-    32 on a V620 (E=256, top-8), even near 64. Larger batches take the Triton
-    path."""
+    32 on a V620 (E=256, top-8), even near 64. With dynamic per-token
+    activation scales, batches with at least 32 routed rows per expert run
+    the two routed GEMMs on ``moe_int8_gemm_rdna2`` (same integer math as the
+    Triton W8A8 kernel; 1.24x at 1024 tokens, 1.3x at 2048, 1.47x at 8192). Other
+    batches take the Triton path."""
 
     MAX_DECODE_TOKENS = 32
 
@@ -284,6 +287,99 @@ class Rdna2Int8Experts(TritonExperts):
             and w2.size(2) % 256 == 0
         )
 
+    def _use_prefill_kernel(
+        self,
+        hidden_states: torch.Tensor,
+        w1: torch.Tensor,
+        w2: torch.Tensor,
+        topk_ids: torch.Tensor,
+        expert_map: torch.Tensor | None,
+    ) -> bool:
+        w1_scale, w2_scale = self.w1_scale, self.w2_scale
+        num_tokens, top_k = topk_ids.shape
+        return (
+            num_tokens * top_k >= 32 * w1.size(0)
+            and rdna2_moe_kernel_available("moe_int8_gemm_rdna2")
+            and hidden_states.dtype == torch.float16
+            and self.quant_config.use_int8_w8a8
+            and self.block_shape is None
+            and self.per_act_token_quant
+            and self.a1_scale is None
+            and self.a2_scale is None
+            and w1_scale is not None
+            and w2_scale is not None
+            and w1_scale.numel() == w1.size(0) * w1.size(1)
+            and w2_scale.numel() == w2.size(0) * w2.size(1)
+            and self.w1_bias is None
+            and self.w2_bias is None
+            and expert_map is None
+            and self._lora_context is None
+            and w1.dtype == torch.int8
+            and hidden_states.size(1) % 64 == 0
+            and w2.size(2) % 64 == 0
+            and w1.size(1) % 8 == 0
+            and w2.size(1) % 8 == 0
+        )
+
+    def _apply_prefill(
+        self,
+        output: torch.Tensor,
+        hidden_states: torch.Tensor,
+        w1: torch.Tensor,
+        w2: torch.Tensor,
+        topk_weights: torch.Tensor,
+        topk_ids: torch.Tensor,
+        activation: MoEActivation,
+        workspace13: torch.Tensor,
+        workspace2: torch.Tensor,
+        apply_router_weight_on_input: bool,
+    ) -> None:
+        num_tokens, top_k = topk_ids.shape
+        num_experts, n = w1.size(0), w1.size(1)
+        block_m = 64 if num_tokens * top_k <= 96 * num_experts else 128
+        sorted_ids, expert_ids, num_post_padded = moe_align_block_size(
+            topk_ids, block_m, num_experts
+        )
+        weights = topk_weights.to(torch.float32).contiguous()
+        x_q, x_s, _ = ops.scaled_int8_quant(hidden_states, None, None, True)
+        cache1 = _resize_cache(workspace2, (num_tokens, top_k, n))
+        ops.moe_int8_gemm_rdna2(
+            cache1,
+            x_q,
+            x_s.view(-1),
+            w1,
+            self.w1_scale,
+            sorted_ids,
+            expert_ids,
+            num_post_padded,
+            weights,
+            top_k,
+            False,
+            block_m,
+        )
+        cache2 = _resize_cache(
+            workspace13,
+            (num_tokens * top_k, self.adjust_N_for_activation(n, activation)),
+        )
+        self.activation(activation, cache2, cache1.view(-1, n))
+        a2_q, a2_s, _ = ops.scaled_int8_quant(cache2, None, None, True)
+        cache3 = _resize_cache(workspace2, (num_tokens, top_k, hidden_states.size(1)))
+        ops.moe_int8_gemm_rdna2(
+            cache3,
+            a2_q,
+            a2_s.view(-1),
+            w2,
+            self.w2_scale,
+            sorted_ids,
+            expert_ids,
+            num_post_padded,
+            weights,
+            1,
+            not apply_router_weight_on_input,
+            block_m,
+        )
+        self.moe_sum(cache3, output)
+
     def apply(
         self,
         output: torch.Tensor,
@@ -311,6 +407,19 @@ class Rdna2Int8Experts(TritonExperts):
             expert_map,
             apply_router_weight_on_input,
         ):
+            if self._use_prefill_kernel(hidden_states, w1, w2, topk_ids, expert_map):
+                return self._apply_prefill(
+                    output,
+                    hidden_states,
+                    w1,
+                    w2,
+                    topk_weights,
+                    topk_ids,
+                    activation,
+                    workspace13,
+                    workspace2,
+                    apply_router_weight_on_input,
+                )
             return super().apply(
                 output,
                 hidden_states,
