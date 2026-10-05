@@ -2323,6 +2323,63 @@ def gdn_post_conv_rdna2(
     )
 
 
+def gdn_wy_rdna2(
+    k: torch.Tensor,
+    v: torch.Tensor,
+    beta: torch.Tensor,
+    g: torch.Tensor,
+    g_cum: torch.Tensor,
+    w: torch.Tensor,
+    u: torch.Tensor,
+    cu_seqlens: torch.Tensor,
+    chunk_indices: torch.Tensor,
+) -> None:
+    """RDNA2 WY step of the varlen chunked gated delta rule (FLA's chunk-local
+    cumsum, kkt, solve_tril and recompute_w_u in one kernel): writes the
+    chunk-local cumsum of ``g`` into ``g_cum`` and ``w``, ``u``."""
+    torch.ops._rocm_C.gdn_wy_rdna2(
+        k, v, beta, g, g_cum, w, u, cu_seqlens, chunk_indices
+    )
+
+
+def gdn_fwd_h_rdna2(
+    k: torch.Tensor,
+    w: torch.Tensor,
+    u: torch.Tensor,
+    g_cum: torch.Tensor,
+    h0: torch.Tensor | None,
+    h: torch.Tensor,
+    v_new: torch.Tensor,
+    ht: torch.Tensor | None,
+    cu_seqlens: torch.Tensor,
+    chunk_offsets: torch.Tensor,
+) -> None:
+    """RDNA2 chunk state recurrence of the varlen gated delta rule (FLA's
+    chunk_gated_delta_rule_fwd_h): writes the per-chunk states ``h``,
+    ``v_new`` and, if given, the final states ``ht``."""
+    torch.ops._rocm_C.gdn_fwd_h_rdna2(
+        k, w, u, g_cum, h0, h, v_new, ht, cu_seqlens, chunk_offsets
+    )
+
+
+def gdn_fwd_o_rdna2(
+    q: torch.Tensor,
+    k: torch.Tensor,
+    v_new: torch.Tensor,
+    h: torch.Tensor,
+    g_cum: torch.Tensor,
+    o: torch.Tensor,
+    cu_seqlens: torch.Tensor,
+    chunk_indices: torch.Tensor,
+    scale: float,
+) -> None:
+    """RDNA2 chunk output of the varlen gated delta rule (FLA's
+    chunk_fwd_o) into ``o``."""
+    torch.ops._rocm_C.gdn_fwd_o_rdna2(
+        q, k, v_new, h, g_cum, o, cu_seqlens, chunk_indices, scale
+    )
+
+
 def wvSplitK_int4_g(
     weight: torch.Tensor,
     activation: torch.Tensor,

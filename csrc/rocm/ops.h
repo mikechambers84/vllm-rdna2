@@ -99,6 +99,26 @@ void gdn_post_conv_rdna2(const torch::Tensor& conv_output,
                          torch::Tensor& beta, bool apply_l2norm,
                          bool output_g_exp, double eps);
 
+void gdn_wy_rdna2(const torch::Tensor& k, const torch::Tensor& v,
+                  const torch::Tensor& beta, const torch::Tensor& g,
+                  torch::Tensor& g_cum, torch::Tensor& w, torch::Tensor& u,
+                  const torch::Tensor& cu_seqlens,
+                  const torch::Tensor& chunk_indices);
+
+void gdn_fwd_h_rdna2(const torch::Tensor& k, const torch::Tensor& w,
+                     const torch::Tensor& u, const torch::Tensor& g_cum,
+                     const std::optional<torch::Tensor>& h0, torch::Tensor& h,
+                     torch::Tensor& v_new,
+                     const std::optional<torch::Tensor>& ht,
+                     const torch::Tensor& cu_seqlens,
+                     const torch::Tensor& chunk_offsets);
+
+void gdn_fwd_o_rdna2(const torch::Tensor& q, const torch::Tensor& k,
+                     const torch::Tensor& v_new, const torch::Tensor& h,
+                     const torch::Tensor& g_cum, torch::Tensor& o,
+                     const torch::Tensor& cu_seqlens,
+                     const torch::Tensor& chunk_indices, double scale);
+
 torch::Tensor gptq_gemm_rdna3(torch::Tensor a, torch::Tensor b_q_weight,
                               torch::Tensor b_qzeros, torch::Tensor b_scales,
                               bool use_v2_format);

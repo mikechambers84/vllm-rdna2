@@ -123,6 +123,22 @@ TORCH_LIBRARY_EXPAND(TORCH_EXTENSION_NAME, rocm_ops) {
       "Tensor! g, Tensor! beta, bool apply_l2norm, bool output_g_exp, "
       "float eps) -> ()");
   rocm_ops.impl("gdn_post_conv_rdna2", torch::kCUDA, &gdn_post_conv_rdna2);
+  // Gated DeltaNet prefill: fused chunk-local cumsum + WY representation.
+  rocm_ops.def(
+      "gdn_wy_rdna2(Tensor k, Tensor v, Tensor beta, Tensor g, Tensor! g_cum, "
+      "Tensor! w, Tensor! u, Tensor cu_seqlens, Tensor chunk_indices) -> ()");
+  rocm_ops.impl("gdn_wy_rdna2", torch::kCUDA, &gdn_wy_rdna2);
+  // Gated DeltaNet prefill: chunk state recurrence and chunk output.
+  rocm_ops.def(
+      "gdn_fwd_h_rdna2(Tensor k, Tensor w, Tensor u, Tensor g_cum, Tensor? h0, "
+      "Tensor! h, Tensor! v_new, Tensor(a!)? ht, Tensor cu_seqlens, "
+      "Tensor chunk_offsets) -> ()");
+  rocm_ops.impl("gdn_fwd_h_rdna2", torch::kCUDA, &gdn_fwd_h_rdna2);
+  rocm_ops.def(
+      "gdn_fwd_o_rdna2(Tensor q, Tensor k, Tensor v_new, Tensor h, "
+      "Tensor g_cum, Tensor! o, Tensor cu_seqlens, Tensor chunk_indices, "
+      "float scale) -> ()");
+  rocm_ops.impl("gdn_fwd_o_rdna2", torch::kCUDA, &gdn_fwd_o_rdna2);
 #endif  // VLLM_ROCM_GFX1030
 
 #ifdef VLLM_ROCM_GFX1100
