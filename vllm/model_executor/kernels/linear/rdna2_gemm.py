@@ -9,9 +9,9 @@ weight shape and row bucket routes those GEMMs through
 ``gemm_rocblas_rdna2``. Indices belong to one rocBLAS build, so a table records
 its version. The shipped table covers the shapes of the models this fork was
 tuned on; VLLM_ROCM_RDNA2_GEMM_TUNE=1 tunes the other weight shapes of a model
-while it loads into VLLM_ROCM_RDNA2_GEMM_TABLE (also read at startup), and
-``python -m vllm.model_executor.kernels.linear.rdna2_gemm N,K ...`` tunes
-shapes offline.
+while it loads into VLLM_ROCM_RDNA2_GEMM_TABLE (also read at startup; "0" turns
+tuned solutions off), and ``python -m
+vllm.model_executor.kernels.linear.rdna2_gemm N,K ...`` tunes shapes offline.
 """
 
 import functools
@@ -77,7 +77,7 @@ def _read(path: Path, version: str) -> dict[str, list[int]]:
 @functools.cache
 def _table() -> dict[str, list[int]]:
     """{shape key: solution per bucket (0: rocBLAS's choice)}."""
-    if not available():
+    if not available() or envs.VLLM_ROCM_RDNA2_GEMM_TABLE == "0":
         return {}
     version = torch.ops._rocm_C.rocblas_version_rdna2()
     return _read(_SHIPPED, version) | _read(_user_table_path(), version)

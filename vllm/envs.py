@@ -1440,7 +1440,7 @@ environment_variables: dict[str, Callable[[], Any]] = {
     ),
     # gfx1030: JSON table of tuned rocBLAS solutions for fp16/bf16 GEMMs, read
     # with the shipped one (default: rdna2_rocblas_gemm.json in the cache root)
-    # and written by VLLM_ROCM_RDNA2_GEMM_TUNE.
+    # and written by VLLM_ROCM_RDNA2_GEMM_TUNE; "0" uses rocBLAS's own choices.
     "VLLM_ROCM_RDNA2_GEMM_TABLE": lambda: os.getenv("VLLM_ROCM_RDNA2_GEMM_TABLE"),
     # gfx1030: benchmark rocBLAS solutions for weight shapes missing from the
     # tables while loading the model (~30 s per shape, once) and save them.
