@@ -1,8 +1,8 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
-"""8-bit weight-only linear layers on gfx1030: opt-in int8 storage of
-unquantized layers (VLLM_ROCM_W8A16_UNQUANTIZED, VLLM_ROCM_W8A16_LM_HEAD) and
-FP8 checkpoints (no FP8 instructions on gfx1030)."""
+"""8-bit linear layers on gfx1030: opt-in int8 weight-only storage of
+unquantized layers (VLLM_ROCM_W8A16_UNQUANTIZED, VLLM_ROCM_W8A16_LM_HEAD), FP8
+checkpoints (no FP8 instructions on gfx1030) and W8A8 int8 checkpoints."""
 
 from types import SimpleNamespace
 
@@ -193,3 +193,54 @@ def test_fp8_linear_partial_scale_blocks():
 
     ref = x.float() @ _fp8_dequant(w, blocks, 128, 128).t() + bias.float()
     assert ((out.float() - ref).norm() / ref.norm()).item() < 1e-3
+
+
+def _w8a8_layer(n: int, k: int, static: bool):
+    torch.manual_seed(0)
+    layer = torch.nn.Module()
+    weight = torch.randint(-127, 128, (n, k), dtype=torch.int8, device="cuda")
+    layer.weight = torch.nn.Parameter(weight, requires_grad=False)
+    scale = torch.rand(n, 1, device="cuda") * 0.01 + 1e-3
+    layer.weight_scale = torch.nn.Parameter(scale, requires_grad=False)
+    input_scale = torch.tensor([0.02], device="cuda")
+    layer.input_scale = (
+        torch.nn.Parameter(input_scale, requires_grad=False) if static else None
+    )
+    layer.input_zero_point = None
+    layer.azp_adj = None
+    layer.logical_widths = [n]
+    return layer
+
+
+@pytest.mark.skipif(not on_gfx1030(), reason="gfx1030 only")
+@pytest.mark.parametrize("n", [1024, 1030])
+@pytest.mark.parametrize("static", [False, True])
+@pytest.mark.parametrize("num_tokens", [1, 40])
+def test_w8a8_linear_matches_triton(n, static, num_tokens):
+    """A symmetric W8A8 layer gives the Triton kernel's results exactly; one
+    whose output size is not a multiple of 4 keeps the Triton layout."""
+    from vllm.model_executor.kernels.linear import (
+        RDNA2Int8ScaledMMLinearKernel,
+        TritonInt8ScaledMMLinearKernel,
+    )
+    from vllm.model_executor.kernels.linear.scaled_mm.ScaledMMLinearKernel import (
+        Int8ScaledMMLinearLayerConfig,
+    )
+
+    config = Int8ScaledMMLinearLayerConfig(
+        is_channelwise=True, is_static_input_scheme=static, input_symmetric=True
+    )
+    names = ["weight", "weight_scale", "input_scale", "input_zero_point", "azp_adj"]
+    rdna2 = RDNA2Int8ScaledMMLinearKernel(config, layer_param_names=names)
+    triton = TritonInt8ScaledMMLinearKernel(config, layer_param_names=names)
+    layer, ref_layer = _w8a8_layer(n, 512, static), _w8a8_layer(n, 512, static)
+    bias = torch.randn(n, dtype=torch.float16, device="cuda")
+
+    rdna2.process_weights_after_loading(layer)
+    triton.process_weights_after_loading(ref_layer)
+
+    assert layer.weight.dim() == (3 if n % 4 == 0 else 2)
+    x = torch.randn(num_tokens, 512, dtype=torch.float16, device="cuda")
+    out = rdna2.apply_weights(layer, x, bias)
+    ref = triton.apply_weights(ref_layer, x, bias)
+    torch.testing.assert_close(out, ref, atol=0, rtol=0)

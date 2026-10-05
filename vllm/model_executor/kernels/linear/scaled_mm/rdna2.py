@@ -1,19 +1,26 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
-"""Weight-only FP8 for gfx1030 (RDNA2), which has no FP8 instructions.
+"""FP8 and W8A8 int8 checkpoints on gfx1030 (RDNA2) through
+``gemm_w8_rdna2``, at every batch size, on weights stored K-major
+(``kmajor_w8``).
 
-e4m3fn weights stay one byte each, stored K-major (``kmajor_w8``), and are
-widened exactly to fp16 in registers by ``gemm_w8_rdna2`` at every batch
-size. The activations keep full precision, so a checkpoint's activation
-scheme (static or dynamic FP8) is ignored, as with Marlin on CUDA GPUs
-without FP8.
+gfx1030 has no FP8 instructions: e4m3fn weights stay one byte each and are
+widened exactly to fp16 in registers. The activations keep full precision, so
+a checkpoint's activation scheme (static or dynamic FP8) is ignored, as with
+Marlin on CUDA GPUs without FP8. Symmetric W8A8 int8 runs v_dot4 on the int8
+activations, with the same results as triton_scaled_mm.
 """
 
 import torch
 
+import vllm.envs as envs
+from vllm import _custom_ops as ops
 from vllm.model_executor.kernels.linear.rdna2_w8a16 import (
     kmajor_w8,
     rdna2_w8_linear,
+)
+from vllm.model_executor.layers.quantization.utils.w8a8_utils import (
+    convert_to_channelwise,
 )
 from vllm.model_executor.utils import replace_parameter
 from vllm.platforms import current_platform
@@ -21,7 +28,9 @@ from vllm.platforms import current_platform
 from .ScaledMMLinearKernel import (
     FP8ScaledMMLinearKernel,
     FP8ScaledMMLinearLayerConfig,
+    Int8ScaledMMLinearLayerConfig,
 )
+from .triton import TritonInt8ScaledMMLinearKernel
 
 
 def _channel_scales(
@@ -146,3 +155,63 @@ class RDNA2FP8ScaledMMLinearKernel(FP8ScaledMMLinearKernel):
         output_shape: list,
     ) -> torch.Tensor:
         raise NotImplementedError
+
+
+class RDNA2Int8ScaledMMLinearKernel(TritonInt8ScaledMMLinearKernel):
+    """Symmetric W8A8 int8 on gfx1030. A layer whose shape the kernel cannot
+    take (N % 4 or K % 16) keeps the Triton kernel's layout and path."""
+
+    @classmethod
+    def is_supported(
+        cls, compute_capability: int | None = None
+    ) -> tuple[bool, str | None]:
+        if not current_platform.is_rocm():
+            return False, "requires ROCm."
+        from vllm.platforms.rocm import on_gfx1030
+
+        if not on_gfx1030():
+            return False, "requires gfx1030."
+        if not envs.VLLM_ROCM_USE_SKINNY_GEMM:
+            return False, "disabled by VLLM_ROCM_USE_SKINNY_GEMM=0."
+        if not hasattr(torch.ops._rocm_C, "gemm_w8_rdna2"):
+            return False, "requires the gfx1030 ROCm kernels."
+        return True, None
+
+    @classmethod
+    def can_implement(cls, c: Int8ScaledMMLinearLayerConfig) -> tuple[bool, str | None]:
+        if not c.input_symmetric:
+            return False, "requires symmetric activation quantization."
+        return True, None
+
+    def process_weights_after_loading(self, layer: torch.nn.Module) -> None:
+        w_q_name, w_s_name, i_s_name, i_zp_name, azp_adj_name = self.layer_param_names
+        weight = getattr(layer, w_q_name)
+        n, k = weight.shape
+        layer.rdna2_w8a8 = n % 4 == 0 and k % 16 == 0
+        if not layer.rdna2_w8a8:
+            super().process_weights_after_loading(layer)
+            return
+        scale = getattr(layer, w_s_name)
+        if len(layer.logical_widths) > 1 and not self.config.is_channelwise:
+            scale = convert_to_channelwise(scale, layer.logical_widths)
+        scale = scale.float().reshape(-1).expand(n).contiguous()
+        replace_parameter(layer, w_q_name, kmajor_w8(weight.data))
+        replace_parameter(layer, w_s_name, scale)
+        if self.config.is_static_input_scheme:
+            replace_parameter(layer, i_s_name, getattr(layer, i_s_name).max())
+        else:
+            setattr(layer, i_s_name, None)
+        setattr(layer, i_zp_name, None)
+        setattr(layer, azp_adj_name, None)
+
+    def apply_weights(
+        self,
+        layer: torch.nn.Module,
+        x: torch.Tensor,
+        bias: torch.Tensor | None = None,
+    ) -> torch.Tensor:
+        if not layer.rdna2_w8a8:
+            return super().apply_weights(layer, x, bias)
+        w_q, w_s, i_s, _, _ = self._get_layer_params(layer)
+        x_q, x_s, _ = ops.scaled_int8_quant(x.contiguous(), i_s, None, symmetric=True)
+        return rdna2_w8_linear(x_q, w_q, w_s, bias=bias, scale_a=x_s, out_dtype=x.dtype)

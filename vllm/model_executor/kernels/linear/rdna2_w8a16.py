@@ -1,9 +1,9 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
-"""8-bit weight-only linear layers on gfx1030 (RDNA2): the K-major weight
-layout and the op shared by FP8 checkpoints (scaled_mm/rdna2.py) and the
-opt-in int8 storage of unquantized linear layers (VLLM_ROCM_W8A16_UNQUANTIZED)
-and the lm_head (VLLM_ROCM_W8A16_LM_HEAD).
+"""8-bit linear layers on gfx1030 (RDNA2): the K-major weight layout and the
+op shared by FP8 and W8A8 int8 checkpoints (scaled_mm/rdna2.py) and the
+opt-in int8 weight-only storage of unquantized linear layers
+(VLLM_ROCM_W8A16_UNQUANTIZED) and the lm_head (VLLM_ROCM_W8A16_LM_HEAD).
 
 Checkpoints that quantize only part of a model (e.g. Qwen3.6-35B-A3B W4A16
 keeps its attention, GDN and shared-expert projections in fp16) spend most of
@@ -12,9 +12,9 @@ weight is stored as int8 with one fp32 scale per output channel (weight-only,
 so the activations keep full precision), which halves the bytes streamed and
 the memory used.
 
-All of these run ``gemm_w8_rdna2`` at every batch size: it widens the 8-bit
-weights in registers and outruns rocBLAS on fp16 weights from decode to
-prefill.
+All of these run ``gemm_w8_rdna2`` at every batch size: it widens 8-bit
+weights in registers for fp16/bf16 activations (outrunning rocBLAS on fp16
+weights from decode to prefill) and runs v_dot4 on int8 activations.
 """
 
 import torch
@@ -89,11 +89,19 @@ def _rdna2_w8_linear(
     block_scale: torch.Tensor | None,
     block_k: int,
     bias: torch.Tensor | None,
+    scale_a: torch.Tensor | None,
+    out_dtype: torch.dtype | None,
 ) -> torch.Tensor:
     x_2d = x.reshape(-1, x.shape[-1])
-    if x_2d.stride(-1) != 1 or x_2d.stride(0) % 8 or x_2d.data_ptr() % 16:
+    if (
+        x_2d.stride(-1) != 1
+        or x_2d.stride(0) * x_2d.element_size() % 16
+        or x_2d.data_ptr() % 16
+    ):
         x_2d = x_2d.clone(memory_format=torch.contiguous_format)
-    out = ops.gemm_w8_rdna2(x_2d, weight, scale, block_scale, block_k, bias)
+    out = ops.gemm_w8_rdna2(
+        x_2d, weight, scale, block_scale, block_k, bias, -1, scale_a, out_dtype
+    )
     return out.reshape(*x.shape[:-1], weight.shape[1])
 
 
@@ -104,8 +112,10 @@ def _rdna2_w8_linear_fake(
     block_scale: torch.Tensor | None,
     block_k: int,
     bias: torch.Tensor | None,
+    scale_a: torch.Tensor | None,
+    out_dtype: torch.dtype | None,
 ) -> torch.Tensor:
-    return x.new_empty((*x.shape[:-1], weight.shape[1]))
+    return x.new_empty((*x.shape[:-1], weight.shape[1]), dtype=out_dtype or x.dtype)
 
 
 direct_register_custom_op(
@@ -120,9 +130,14 @@ def rdna2_w8_linear(
     block_scale: torch.Tensor | None = None,
     block_k: int = 0,
     bias: torch.Tensor | None = None,
+    scale_a: torch.Tensor | None = None,
+    out_dtype: torch.dtype | None = None,
 ) -> torch.Tensor:
-    """X @ W^T (+ bias) for K-major 8-bit weights, as ``gemm_w8_rdna2``."""
-    return torch.ops.vllm.rdna2_w8_linear(x, weight, scale, block_scale, block_k, bias)
+    """X @ W^T (+ bias) for K-major 8-bit weights, as ``gemm_w8_rdna2`` (int8
+    X with its scale_a and out_dtype: W8A8)."""
+    return torch.ops.vllm.rdna2_w8_linear(
+        x, weight, scale, block_scale, block_k, bias, scale_a, out_dtype
+    )
 
 
 def apply_rdna2_w8a16(

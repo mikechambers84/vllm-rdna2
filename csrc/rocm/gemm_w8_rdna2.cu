@@ -1,18 +1,22 @@
 // SPDX-License-Identifier: Apache-2.0
 // SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 //
-// RDNA2 (gfx1030) GEMM on 8-bit weights, fp8 e4m3fn or int8, with fp16/bf16
-// activations (weight-only), for decode and prefill alike:
-// C[M, N] = A[M, K] . (W * scale)^T (+ bias). gfx1030 has no fp8
-// instructions; both formats are widened exactly in registers.
+// RDNA2 (gfx1030) GEMM on 8-bit weights for decode and prefill alike:
+// C[M, N] = A[M, K] . (W * scale)^T (+ bias), with
+//  - fp8 e4m3fn or int8 weights and fp16/bf16 activations (weight-only):
+//    gfx1030 has no fp8 instructions; both formats are widened exactly in
+//    registers;
+//  - int8 weights and int8 activations (W8A8) with a per-token activation
+//    scale: v_dot4_i32_i8 on the bytes as stored, int32 accumulation, and the
+//    epilogue of triton_scaled_mm (identical results).
 //
 // The weights are stored K-major, w [K / 4, N, 4] (four consecutive k of one
 // column per dword; kmajor_w8 in rdna2_w8a16.py makes it at load time). As in
 // gemm_w4a16_exl_rdna2, lanes run along N with four columns each (one 16-byte
 // load = 4 columns x 4 k), so all lanes of a wave use the same activations,
 // which come through scalar loads; the NW waves of a workgroup split K in
-// 16- or 32-k blocks and reduce through LDS in a fixed order (deterministic, no
-// atomics); T tokens share each widened weight. fp8 widens through
+// 16- to 64-k blocks and reduce through LDS in a fixed order (deterministic,
+// no atomics); T tokens share each loaded weight. fp8 widens through
 // rdna2::fp8x2_to_half2 (its 2^-8 is folded into the output scale), int8 by
 // placing the byte in the mantissa of 1024.0; fp16 activations accumulate
 // through v_dot2_f32_f16, bf16 (no dot instruction on gfx1030) through fp32
@@ -24,7 +28,9 @@
 // rows, 300-340 at 16, ~200 at 32, 16-18 TFLOPS at 128 rows and ~20 from 1024
 // on, above rocBLAS on fp16 weights (15-18 TFLOPS); the per-row GEMV it
 // replaces fell to ~210 GB/s at 8 rows and ~90 at 16, and larger batches
-// dequantized for rocBLAS.
+// dequantized for rocBLAS. W8A8: 430-480 GB/s up to 16 rows, 340-380 at 32,
+// 32-36 TOPS at 128 rows and 38-40 from 1024 on (w8a8_gemv_rdna2: 270-350 at
+// 16 rows; w8a8_gemm_rdna2: ~110 at 32, 24-30 TOPS at 128).
 
 #include <torch/all.h>
 #include <c10/cuda/CUDAGuard.h>
@@ -33,6 +39,8 @@
 #include <hip/hip_runtime.h>
 #include <hip/hip_fp16.h>
 #include <hip/hip_bf16.h>
+
+#include <type_traits>
 
 #include "rdna2_fp8.cuh"
 
@@ -53,12 +61,22 @@ struct Config {
 };
 
 // Indexed by the cfg argument; the default for a shape is default_config().
+// fp16/bf16 activations:
 static constexpr Config kConfigs[] = {
     {1, 8, 2, 32},  {2, 8, 2, 32},  {4, 4, 1, 32},  {6, 4, 1, 32},
     {8, 4, 1, 32},  {12, 4, 1, 32}, {16, 4, 1, 32}, {24, 4, 1, 32},
     {16, 8, 1, 32}, {16, 2, 1, 32}, {16, 1, 1, 32}, {16, 1, 2, 16},
 };
+// int8 activations, which need no widening and so take longer weight blocks
+// and token tiles:
+static constexpr Config kConfigsI8[] = {
+    {1, 8, 2, 64},  {2, 8, 2, 64},  {4, 4, 1, 64},  {8, 4, 1, 32},
+    {16, 2, 1, 64}, {16, 4, 1, 32}, {24, 4, 1, 32}, {32, 4, 1, 32},
+    {16, 4, 1, 64}, {32, 2, 1, 32}, {32, 1, 1, 32}, {16, 1, 2, 32},
+    {16, 2, 2, 32},
+};
 static constexpr int kNumConfigs = sizeof(kConfigs) / sizeof(kConfigs[0]);
+static constexpr int kNumConfigsI8 = sizeof(kConfigsI8) / sizeof(kConfigsI8[0]);
 
 template <typename T>
 __device__ __forceinline__ T from_float(float v);
@@ -136,19 +154,28 @@ __device__ __forceinline__ uint32_t dword(const uint4& v, int c) {
   return c == 0 ? v.x : c == 1 ? v.y : c == 2 ? v.z : v.w;
 }
 
-// grid (ceil(M / T), ceil(N / (128 * CT))). W holds ldw 16-byte column quads
-// per dword row; R (BLOCK) the ratios of k-block k >> bk_shift at
-// R[kb * ldr + n].
-template <typename T, int TT, int NW, int CT, int KBLOCK, bool INT8, bool BLOCK>
+// grid (ceil(M / T), ceil(N / (128 * CT))). T is the activation type (int8_t:
+// W8A8), O the output type. W holds ldw 16-byte column quads per dword row; R
+// (BLOCK) the ratios of k-block k >> bk_shift at R[kb * ldr + n]; SA (W8A8)
+// the activation scale of row t at SA[t * sa_stride].
+template <typename T, typename O, int TT, int NW, int CT, int KBLOCK, bool INT8,
+          bool BLOCK>
 __global__ void __launch_bounds__(NW* WARP32)
     gemm_w8_rdna2_kernel(const uint4* __restrict__ W,
                          const float* __restrict__ S,
+                         const float* __restrict__ SA, const int sa_stride,
                          const __half* __restrict__ R, const T* __restrict__ A,
-                         const T* __restrict__ bias, T* __restrict__ C,
+                         const O* __restrict__ bias, O* __restrict__ C,
                          const int M, const int N, const int K, const int ldw,
                          const int ldr, const int bk_shift, const int lda,
                          const int ldc) {
-  extern __shared__ __align__(16) float red[];
+  constexpr bool DOT4 = std::is_same_v<T, int8_t>;
+  using Acc = std::conditional_t<DOT4, int, float>;
+  // k per activation load (16 bytes) and the dword rows it covers.
+  constexpr int STEP = DOT4 ? 16 : 8;
+  constexpr int ROWS = STEP / 4;
+  extern __shared__ __align__(16) char smem[];
+  Acc* red = reinterpret_cast<Acc*>(smem);
   const int lane = threadIdx.x % WARP32;
   const int wave = __builtin_amdgcn_readfirstlane(threadIdx.x / WARP32);
   const int t0 = blockIdx.x * TT;
@@ -160,59 +187,79 @@ __global__ void __launch_bounds__(NW* WARP32)
   for (int ct = 0; ct < CT; ct++)
     col[ct] = min(blockIdx.y * WARP32 * CT + ct * WARP32 + lane, n4 - 1);
 
-  float acc[CT][4][TT];
+  Acc acc[CT][4][TT];
   #pragma unroll
   for (int ct = 0; ct < CT; ct++)
   #pragma unroll
     for (int c = 0; c < 4; c++)
   #pragma unroll
-      for (int i = 0; i < TT; i++) acc[ct][c][i] = 0.f;
+      for (int i = 0; i < TT; i++) acc[ct][c][i] = 0;
 
   half2 ratio[CT][4];
   int kb_cur = -1;
 
-  // Two dword rows (8 k from k0) of each column.
-  auto mac = [&](const uint4(&w)[2][CT], const int k0) {
-    if constexpr (BLOCK) {
-      const int kb = k0 >> bk_shift;
-      if (kb != kb_cur) {
-        kb_cur = kb;
+  // ROWS dword rows (STEP k from k0) of each column.
+  auto mac = [&](const uint4(&w)[ROWS][CT], const int k0) {
+    if constexpr (DOT4) {
   #pragma unroll
-        for (int ct = 0; ct < CT; ct++) {
-          const uint2 r =
-              *reinterpret_cast<const uint2*>(R + (long)kb * ldr + col[ct] * 4);
-          const half2 r01 = *reinterpret_cast<const half2*>(&r.x);
-          const half2 r23 = *reinterpret_cast<const half2*>(&r.y);
-          ratio[ct][0] = __low2half2(r01);
-          ratio[ct][1] = __high2half2(r01);
-          ratio[ct][2] = __low2half2(r23);
-          ratio[ct][3] = __high2half2(r23);
+      for (int i = 0; i < TT; i++) {
+        // Wave-uniform address: a scalar load.
+        const uint4 av = *reinterpret_cast<const uint4*>(
+            A + (long)min(t0 + i, M - 1) * lda + k0);
+  #pragma unroll
+        for (int ct = 0; ct < CT; ct++)
+  #pragma unroll
+          for (int c = 0; c < 4; c++) {
+            int s = acc[ct][c][i];
+            s = __builtin_amdgcn_sdot4(av.x, dword(w[0][ct], c), s, false);
+            s = __builtin_amdgcn_sdot4(av.y, dword(w[1][ct], c), s, false);
+            s = __builtin_amdgcn_sdot4(av.z, dword(w[2][ct], c), s, false);
+            s = __builtin_amdgcn_sdot4(av.w, dword(w[3][ct], c), s, false);
+            acc[ct][c][i] = s;
+          }
+      }
+    } else {
+      if constexpr (BLOCK) {
+        const int kb = k0 >> bk_shift;
+        if (kb != kb_cur) {
+          kb_cur = kb;
+  #pragma unroll
+          for (int ct = 0; ct < CT; ct++) {
+            const uint2 r = *reinterpret_cast<const uint2*>(R + (long)kb * ldr +
+                                                            col[ct] * 4);
+            const half2 r01 = *reinterpret_cast<const half2*>(&r.x);
+            const half2 r23 = *reinterpret_cast<const half2*>(&r.y);
+            ratio[ct][0] = __low2half2(r01);
+            ratio[ct][1] = __high2half2(r01);
+            ratio[ct][2] = __low2half2(r23);
+            ratio[ct][3] = __high2half2(r23);
+          }
         }
       }
-    }
-    half2 h[CT][4][4];
-  #pragma unroll
-    for (int ct = 0; ct < CT; ct++)
-  #pragma unroll
-      for (int c = 0; c < 4; c++) {
-        widen4<INT8>(dword(w[0][ct], c), h[ct][c][0], h[ct][c][1]);
-        widen4<INT8>(dword(w[1][ct], c), h[ct][c][2], h[ct][c][3]);
-        if constexpr (BLOCK) {
-  #pragma unroll
-          for (int j = 0; j < 4; j++)
-            h[ct][c][j] = __hmul2(h[ct][c][j], ratio[ct][c]);
-        }
-      }
-  #pragma unroll
-    for (int i = 0; i < TT; i++) {
-      // Wave-uniform address: a scalar load.
-      const uint4 av = *reinterpret_cast<const uint4*>(
-          A + (long)min(t0 + i, M - 1) * lda + k0);
+      half2 h[CT][4][4];
   #pragma unroll
       for (int ct = 0; ct < CT; ct++)
   #pragma unroll
-        for (int c = 0; c < 4; c++)
-          acc[ct][c][i] = dot8<T>(av, h[ct][c], acc[ct][c][i]);
+        for (int c = 0; c < 4; c++) {
+          widen4<INT8>(dword(w[0][ct], c), h[ct][c][0], h[ct][c][1]);
+          widen4<INT8>(dword(w[1][ct], c), h[ct][c][2], h[ct][c][3]);
+          if constexpr (BLOCK) {
+  #pragma unroll
+            for (int j = 0; j < 4; j++)
+              h[ct][c][j] = __hmul2(h[ct][c][j], ratio[ct][c]);
+          }
+        }
+  #pragma unroll
+      for (int i = 0; i < TT; i++) {
+        // Wave-uniform address: a scalar load.
+        const uint4 av = *reinterpret_cast<const uint4*>(
+            A + (long)min(t0 + i, M - 1) * lda + k0);
+  #pragma unroll
+        for (int ct = 0; ct < CT; ct++)
+  #pragma unroll
+          for (int c = 0; c < 4; c++)
+            acc[ct][c][i] = dot8<T>(av, h[ct][c], acc[ct][c][i]);
+      }
     }
   };
 
@@ -224,16 +271,16 @@ __global__ void __launch_bounds__(NW* WARP32)
       for (int ct = 0; ct < CT; ct++)
         w[u][ct] = W[(long)(b * (KBLOCK / 4) + u) * ldw + col[ct]];
   #pragma unroll
-    for (int p = 0; p < KBLOCK / 8; p++)
-      mac(reinterpret_cast<const uint4(&)[2][CT]>(w[2 * p]),
-          b * KBLOCK + p * 8);
+    for (int p = 0; p < KBLOCK / STEP; p++)
+      mac(reinterpret_cast<const uint4(&)[ROWS][CT]>(w[ROWS * p]),
+          b * KBLOCK + p * STEP);
   }
   // The k past the last whole block (K % KBLOCK).
   if (wave == NW - 1)
-    for (int kw = blocks * (KBLOCK / 4); kw < K / 4; kw += 2) {
-      uint4 w[2][CT];
+    for (int kw = blocks * (KBLOCK / 4); kw < K / 4; kw += ROWS) {
+      uint4 w[ROWS][CT];
   #pragma unroll
-      for (int u = 0; u < 2; u++)
+      for (int u = 0; u < ROWS; u++)
   #pragma unroll
         for (int ct = 0; ct < CT; ct++)
           w[u][ct] = W[(long)(kw + u) * ldw + col[ct]];
@@ -280,14 +327,25 @@ __global__ void __launch_bounds__(NW* WARP32)
       float bv[4] = {0.f, 0.f, 0.f, 0.f};
       if (bias != nullptr)
   #pragma unroll
-        for (int c = 0; c < 4; c++) bv[c] = to_float<T>(bias[c4 * 4 + c]);
+        for (int c = 0; c < 4; c++) bv[c] = to_float<O>(bias[c4 * 4 + c]);
   #pragma unroll
       for (int i = 0; i < TT; i++) {
         if (t0 + i < M) {
-          __align__(8) T o[4];
+          __align__(8) O o[4];
+          if constexpr (DOT4) {
+            // As triton_scaled_mm: round the scaled sum, then add the bias.
+            const float sa = SA[(t0 + i) * sa_stride];
   #pragma unroll
-          for (int c = 0; c < 4; c++)
-            o[c] = from_float<T>(fmaf(acc[ct][c][i], s[c], bv[c]));
+            for (int c = 0; c < 4; c++) {
+              o[c] = from_float<O>((float)acc[ct][c][i] * sa * s[c]);
+              if (bias != nullptr)
+                o[c] = from_float<O>(to_float<O>(o[c]) + bv[c]);
+            }
+          } else {
+  #pragma unroll
+            for (int c = 0; c < 4; c++)
+              o[c] = from_float<O>(fmaf(acc[ct][c][i], s[c], bv[c]));
+          }
           *reinterpret_cast<uint2*>(C + (long)(t0 + i) * ldc + c4 * 4) =
               *reinterpret_cast<const uint2*>(o);
         }
@@ -298,11 +356,13 @@ __global__ void __launch_bounds__(NW* WARP32)
 
 #else  // non-RDNA2 device pass: empty stub for symbol parity.
 
-template <typename T, int TT, int NW, int CT, int KBLOCK, bool INT8, bool BLOCK>
-__global__ void gemm_w8_rdna2_kernel(const uint4*, const float*, const __half*,
-                                     const T*, const T*, T*, const int,
+template <typename T, typename O, int TT, int NW, int CT, int KBLOCK, bool INT8,
+          bool BLOCK>
+__global__ void gemm_w8_rdna2_kernel(const uint4*, const float*, const float*,
+                                     const int, const __half*, const T*,
+                                     const O*, O*, const int, const int,
                                      const int, const int, const int, const int,
-                                     const int, const int, const int) {}
+                                     const int, const int) {}
 
 #endif  // __HIP__RDNA2__ || !__HIP_DEVICE_COMPILE__
 
@@ -312,26 +372,33 @@ struct Args {
   const at::Tensor& scale;
   const std::optional<at::Tensor>& block_scale;
   const std::optional<at::Tensor>& bias;
+  const std::optional<at::Tensor>& scale_a;
   at::Tensor& c;
   int bk_shift;
 };
 
-template <typename T, int TT, int NW, int CT, int KB, bool INT8, bool BLOCK>
+template <typename T, typename O, int TT, int NW, int CT, int KB, bool INT8,
+          bool BLOCK>
 void launch(const Args& p, cudaStream_t stream) {
+  using Acc = std::conditional_t<std::is_same_v<T, int8_t>, int, float>;
   const int M = p.a.size(0), K = p.a.size(1), N = p.w.size(1);
   const dim3 grid((M + TT - 1) / TT, (N / 4 + WARP32 * CT - 1) / (WARP32 * CT));
-  const size_t lds = (size_t)(NW / 2) * CT * 4 * TT * WARP32 * sizeof(float);
-  gemm_w8_rdna2_kernel<T, TT, NW, CT, KB, INT8, BLOCK>
+  const size_t lds = (size_t)(NW / 2) * CT * 4 * TT * WARP32 * sizeof(Acc);
+  const bool sa = p.scale_a.has_value();
+  gemm_w8_rdna2_kernel<T, O, TT, NW, CT, KB, INT8, BLOCK>
       <<<grid, dim3(NW * WARP32), lds, stream>>>(
           (const uint4*)p.w.data_ptr(), p.scale.data_ptr<float>(),
+          sa ? p.scale_a->data_ptr<float>() : nullptr,
+          sa && p.scale_a->numel() > 1 ? 1 : 0,
           BLOCK ? (const __half*)p.block_scale->data_ptr() : nullptr,
           (const T*)p.a.data_ptr(),
-          p.bias.has_value() ? (const T*)p.bias->data_ptr() : nullptr,
-          (T*)p.c.data_ptr(), M, N, K, p.w.stride(0) / 16,
+          p.bias.has_value() ? (const O*)p.bias->data_ptr() : nullptr,
+          (O*)p.c.data_ptr(), M, N, K, p.w.stride(0) / 16,
           BLOCK ? p.block_scale->stride(0) : 0, p.bk_shift, p.a.stride(0),
           p.c.stride(0));
 }
 
+// fp16/bf16 activations: weight format by w's dtype and block scales.
 template <int TT, int NW, int CT, int KB>
 void launch_config(const Args& p, cudaStream_t stream) {
   const bool int8 = p.w.dtype() == torch::kInt8;
@@ -339,16 +406,25 @@ void launch_config(const Args& p, cudaStream_t stream) {
   auto by_format = [&](auto t) {
     using T = decltype(t);
     if (int8)
-      launch<T, TT, NW, CT, KB, true, false>(p, stream);
+      launch<T, T, TT, NW, CT, KB, true, false>(p, stream);
     else if (block)
-      launch<T, TT, NW, CT, KB, false, true>(p, stream);
+      launch<T, T, TT, NW, CT, KB, false, true>(p, stream);
     else
-      launch<T, TT, NW, CT, KB, false, false>(p, stream);
+      launch<T, T, TT, NW, CT, KB, false, false>(p, stream);
   };
   if (p.a.dtype() == torch::kFloat16)
     by_format(__half{});
   else
     by_format(__hip_bfloat16{});
+}
+
+// int8 activations (W8A8): output type by c's dtype.
+template <int TT, int NW, int CT, int KB>
+void launch_config_i8(const Args& p, cudaStream_t stream) {
+  if (p.c.dtype() == torch::kFloat16)
+    launch<int8_t, __half, TT, NW, CT, KB, true, false>(p, stream);
+  else
+    launch<int8_t, __hip_bfloat16, TT, NW, CT, KB, true, false>(p, stream);
 }
 
 // Default config, fitted on the linear layers of Qwen3.8-27B and
@@ -378,26 +454,46 @@ static int default_config(int M, int N) {
   return 11;
 }
 
+// The same for int8 activations, fitted on the Qwen3.8-27B layers.
+static int default_config_i8(int M, int N) {
+  const bool narrow = N <= 6144;
+  if (M == 1) return 0;
+  if (M == 2) return 1;
+  if (M <= 4) return 2;
+  if (M <= 8) return 3;
+  if (M <= 16) return narrow ? 5 : 4;
+  if (M <= 24) return 6;
+  if (M <= 32) return narrow ? 8 : 7;
+  if (M <= 48) return narrow ? 4 : 6;
+  if (M <= 256) return narrow ? 4 : M <= 64 ? 9 : 10;
+  return M <= 512 ? 12 : 11;
+}
+
 }  // namespace gemm_w8_rdna2
 }  // namespace vllm
 
-// Requirements: a [M, K] fp16 or bf16 with K-contiguous, 16-byte aligned rows
-// and K % 16 == 0; w [K / 4, N, 4] int8 or float8_e4m3fn (kmajor_w8), its
-// dword rows 16-byte aligned (stride(0) % 16 == 0, so N % 4 == 0); scale [N]
-// fp32 contiguous; optional block_scale [ceil(K / block_k), N] fp16 with
-// N-contiguous rows (stride(0) % 4 == 0) multiplying the weights of each
-// block_k slice (fp8 only; block_k a power of two >= 8); optional contiguous
-// bias [N] of a's dtype. cfg < 0 picks the default config for M. Returns
-// [M, N] in a's dtype.
+// Requirements: a [M, K] with K-contiguous, 16-byte aligned rows and
+// K % 16 == 0; w [K / 4, N, 4] (kmajor_w8), its dword rows 16-byte aligned
+// (stride(0) % 16 == 0, so N % 4 == 0); scale [N] fp32 contiguous; optional
+// contiguous bias [N] of the output dtype. a fp16 or bf16 (output: a's dtype)
+// with w int8 or float8_e4m3fn and optionally fp8 block_scale
+// [ceil(K / block_k), N] fp16 with N-contiguous rows (stride(0) % 4 == 0)
+// multiplying the weights of each block_k slice (block_k a power of two
+// >= 8); or a int8 with int8 w, fp32 scale_a of 1 or M elements and an fp16
+// or bf16 out_dtype (W8A8). cfg < 0 picks the default config for M. Returns
+// [M, N].
 torch::Tensor gemm_w8_rdna2(const at::Tensor& a, const at::Tensor& w,
                             const at::Tensor& scale,
                             const std::optional<at::Tensor>& block_scale,
                             int64_t block_k,
-                            const std::optional<at::Tensor>& bias,
-                            int64_t cfg) {
+                            const std::optional<at::Tensor>& bias, int64_t cfg,
+                            const std::optional<at::Tensor>& scale_a,
+                            std::optional<at::ScalarType> out_dtype) {
   using namespace vllm::gemm_w8_rdna2;
-  TORCH_CHECK(a.dtype() == torch::kFloat16 || a.dtype() == torch::kBFloat16,
-              "gemm_w8_rdna2 needs fp16 or bf16 activations");
+  const bool w8a8 = a.dtype() == torch::kInt8;
+  TORCH_CHECK(
+      w8a8 || a.dtype() == torch::kFloat16 || a.dtype() == torch::kBFloat16,
+      "gemm_w8_rdna2 needs fp16, bf16 or int8 activations");
   TORCH_CHECK(
       w.dtype() == torch::kInt8 || w.dtype() == at::ScalarType::Float8_e4m3fn,
       "gemm_w8_rdna2 needs int8 or float8_e4m3fn weights");
@@ -407,7 +503,8 @@ torch::Tensor gemm_w8_rdna2(const at::Tensor& a, const at::Tensor& w,
   const int M = a.size(0);
   const int K = a.size(1);
   const int N = w.size(1);
-  TORCH_CHECK(K % 16 == 0 && a.stride(1) == 1 && a.stride(0) % 8 == 0 &&
+  TORCH_CHECK(K % 16 == 0 && a.stride(1) == 1 &&
+                  a.stride(0) * a.element_size() % 16 == 0 &&
                   reinterpret_cast<uintptr_t>(a.data_ptr()) % 16 == 0,
               "gemm_w8_rdna2 needs K % 16 == 0 and 16-byte aligned, "
               "K-contiguous rows of a");
@@ -421,6 +518,22 @@ torch::Tensor gemm_w8_rdna2(const at::Tensor& a, const at::Tensor& w,
                   reinterpret_cast<uintptr_t>(scale.data_ptr()) % 16 == 0,
               "gemm_w8_rdna2 needs a 16-byte aligned, contiguous fp32 scale "
               "per output channel");
+  at::ScalarType c_dtype = a.scalar_type();
+  if (w8a8) {
+    TORCH_CHECK(w.dtype() == torch::kInt8 && !block_scale.has_value(),
+                "gemm_w8_rdna2 with int8 activations needs int8 weights "
+                "without block scales");
+    TORCH_CHECK(scale_a.has_value() && scale_a->dtype() == torch::kFloat32 &&
+                    scale_a->is_contiguous() &&
+                    (scale_a->numel() == 1 || scale_a->numel() == M),
+                "gemm_w8_rdna2 with int8 activations needs a contiguous fp32 "
+                "scale_a of 1 or M elements");
+    TORCH_CHECK(out_dtype.has_value() && (*out_dtype == torch::kFloat16 ||
+                                          *out_dtype == torch::kBFloat16),
+                "gemm_w8_rdna2 with int8 activations needs an fp16 or bf16 "
+                "out_dtype");
+    c_dtype = *out_dtype;
+  }
   int bk_shift = 0;
   if (block_scale.has_value()) {
     TORCH_CHECK(w.dtype() != torch::kInt8 && block_k >= 8 &&
@@ -438,19 +551,48 @@ torch::Tensor gemm_w8_rdna2(const at::Tensor& a, const at::Tensor& w,
     bk_shift = __builtin_ctzll(block_k);
   }
   if (bias.has_value()) {
-    TORCH_CHECK(bias->dtype() == a.dtype() && bias->numel() == N &&
-                    bias->is_contiguous(),
-                "gemm_w8_rdna2 bias must be a contiguous [N] of a's dtype");
+    TORCH_CHECK(
+        bias->dtype() == c_dtype && bias->numel() == N && bias->is_contiguous(),
+        "gemm_w8_rdna2 bias must be a contiguous [N] of the output "
+        "dtype");
   }
-  TORCH_CHECK(cfg < kNumConfigs, "gemm_w8_rdna2: cfg out of range");
+  TORCH_CHECK(cfg < (w8a8 ? kNumConfigsI8 : kNumConfigs),
+              "gemm_w8_rdna2: cfg out of range");
 
-  auto c = torch::empty({M, N}, a.options());
+  auto c = torch::empty({M, N}, a.options().dtype(c_dtype));
   if (M == 0 || N == 0) return c;
   const at::cuda::OptionalCUDAGuard device_guard(device_of(a));
   const cudaStream_t stream = at::cuda::getCurrentCUDAStream();
-  const Args p{a, w, scale, block_scale, bias, c, bk_shift};
-  const int id = cfg < 0 ? default_config(M, N) : (int)cfg;
+  const Args p{a, w, scale, block_scale, bias, scale_a, c, bk_shift};
 
+  if (w8a8) {
+    const int id = cfg < 0 ? default_config_i8(M, N) : (int)cfg;
+#define VLLM_W8A8_RDNA2_CASE(ID, T, NW, CT, KB)                        \
+  case ID:                                                             \
+    static_assert(kConfigsI8[ID].t == T && kConfigsI8[ID].nw == NW &&  \
+                  kConfigsI8[ID].ct == CT && kConfigsI8[ID].kb == KB); \
+    launch_config_i8<T, NW, CT, KB>(p, stream);                        \
+    break;
+    switch (id) {
+      VLLM_W8A8_RDNA2_CASE(0, 1, 8, 2, 64)
+      VLLM_W8A8_RDNA2_CASE(1, 2, 8, 2, 64)
+      VLLM_W8A8_RDNA2_CASE(2, 4, 4, 1, 64)
+      VLLM_W8A8_RDNA2_CASE(3, 8, 4, 1, 32)
+      VLLM_W8A8_RDNA2_CASE(4, 16, 2, 1, 64)
+      VLLM_W8A8_RDNA2_CASE(5, 16, 4, 1, 32)
+      VLLM_W8A8_RDNA2_CASE(6, 24, 4, 1, 32)
+      VLLM_W8A8_RDNA2_CASE(7, 32, 4, 1, 32)
+      VLLM_W8A8_RDNA2_CASE(8, 16, 4, 1, 64)
+      VLLM_W8A8_RDNA2_CASE(9, 32, 2, 1, 32)
+      VLLM_W8A8_RDNA2_CASE(10, 32, 1, 1, 32)
+      VLLM_W8A8_RDNA2_CASE(11, 16, 1, 2, 32)
+      VLLM_W8A8_RDNA2_CASE(12, 16, 2, 2, 32)
+    }
+#undef VLLM_W8A8_RDNA2_CASE
+    return c;
+  }
+
+  const int id = cfg < 0 ? default_config(M, N) : (int)cfg;
 #define VLLM_W8_RDNA2_CASE(ID, T, NW, CT, KB)                      \
   case ID:                                                         \
     static_assert(kConfigs[ID].t == T && kConfigs[ID].nw == NW &&  \

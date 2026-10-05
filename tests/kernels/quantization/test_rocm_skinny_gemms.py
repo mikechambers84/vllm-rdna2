@@ -473,6 +473,57 @@ def test_rocm_gemm_w8_rdna2_kernel(fmt, n, k, m, dtype, with_bias):
     torch.testing.assert_close(out, ref, atol=atol, rtol=1e-2)
 
 
+@pytest.mark.parametrize("n", [1, 13, 130])
+@pytest.mark.parametrize("k,m", [(2048, 1024), (1040, 516)])
+@pytest.mark.parametrize("out_dtype", [torch.float16, torch.bfloat16])
+@pytest.mark.parametrize("per_token", [False, True])
+@pytest.mark.parametrize("with_bias", [False, True])
+@pytest.mark.skipif(not on_gfx1030(), reason="RDNA2 (gfx1030) kernel")
+def test_rocm_gemm_w8_rdna2_w8a8_kernel(n, k, m, out_dtype, per_token, with_bias):
+    """int8 activations (W8A8) accumulate exactly in int32 and share
+    triton_scaled_mm's epilogue, so the results are identical."""
+    from vllm.model_executor.kernels.linear.rdna2_w8a16 import kmajor_w8
+    from vllm.model_executor.layers.quantization.compressed_tensors.triton_scaled_mm import (  # noqa: E501
+        triton_scaled_mm,
+    )
+
+    torch.manual_seed(0)
+    A = torch.randint(-127, 128, (n, k), dtype=torch.int8, device="cuda")
+    W = torch.randint(-127, 128, (m, k), dtype=torch.int8, device="cuda")
+    scale_a = torch.rand(n if per_token else 1, 1, device="cuda") * 1e-2 + 1e-3
+    scale_b = torch.rand(m, device="cuda") * 1e-2 + 1e-3
+    bias = torch.rand(m, dtype=out_dtype, device="cuda") if with_bias else None
+
+    out = ops.gemm_w8_rdna2(
+        A, kmajor_w8(W), scale_b, bias=bias, scale_a=scale_a, out_dtype=out_dtype
+    )
+
+    ref = triton_scaled_mm(A, W.t(), scale_a, scale_b.view(m, 1), out_dtype, bias)
+    torch.testing.assert_close(out, ref, atol=0, rtol=0)
+
+
+@pytest.mark.parametrize("cfg", range(13))
+@pytest.mark.skipif(not on_gfx1030(), reason="RDNA2 (gfx1030) kernel")
+def test_rocm_gemm_w8_rdna2_w8a8_configs(cfg):
+    """Every W8A8 tile config gives the same result."""
+    from vllm.model_executor.kernels.linear.rdna2_w8a16 import kmajor_w8
+
+    torch.manual_seed(0)
+    k, m = 1040, 516
+    A = torch.randint(-127, 128, (37, k), dtype=torch.int8, device="cuda")
+    W = torch.randint(-127, 128, (m, k), dtype=torch.int8, device="cuda")
+    scale_a = torch.rand(37, 1, device="cuda") * 1e-2 + 1e-3
+    scale_b = torch.rand(m, device="cuda") * 1e-2 + 1e-3
+
+    out = ops.gemm_w8_rdna2(
+        A, kmajor_w8(W), scale_b, cfg=cfg, scale_a=scale_a, out_dtype=torch.half
+    )
+    ref = ops.gemm_w8_rdna2(
+        A, kmajor_w8(W), scale_b, scale_a=scale_a, out_dtype=torch.half
+    )
+    torch.testing.assert_close(out, ref, atol=0, rtol=0)
+
+
 @pytest.mark.parametrize("cfg", range(12))
 @pytest.mark.skipif(not on_gfx1030(), reason="RDNA2 (gfx1030) kernel")
 def test_rocm_gemm_w8_rdna2_configs(cfg):
