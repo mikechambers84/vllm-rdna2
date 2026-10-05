@@ -161,6 +161,7 @@ if TYPE_CHECKING:
     VLLM_ROCM_W4A8_PREFILL: bool = False
     VLLM_UVA_INPUT_EMBEDDINGS: bool = False
     VLLM_ROCM_W8A16_UNQUANTIZED: bool = False
+    VLLM_ROCM_RDNA2_ATTENTION: bool = True
     VLLM_ROCM_FP8_PADDING: bool = True
     VLLM_ROCM_MOE_PADDING: bool = True
     VLLM_ROCM_SHUFFLE_KV_CACHE_LAYOUT: bool = False
@@ -1422,6 +1423,11 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # scales, weight-only: halves their decode bandwidth and memory.
     "VLLM_ROCM_W8A16_UNQUANTIZED": lambda: (
         os.getenv("VLLM_ROCM_W8A16_UNQUANTIZED", "0").lower() in ("1", "true")
+    ),
+    # gfx1030: run fp16 prefill attention (head 64/128/256, causal, no sliding
+    # window / softcap / ALiBi / sinks) in the HIP kernel instead of Triton.
+    "VLLM_ROCM_RDNA2_ATTENTION": lambda: (
+        os.getenv("VLLM_ROCM_RDNA2_ATTENTION", "1").lower() in ("1", "true")
     ),
     # Pad the fp8 weights to 256 bytes for ROCm
     "VLLM_ROCM_FP8_PADDING": lambda: bool(int(os.getenv("VLLM_ROCM_FP8_PADDING", "1"))),

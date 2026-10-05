@@ -7,6 +7,7 @@
 #  - Chih-Chieh Yang <chih.chieh.yang@ibm.com>
 #  - Thomas Parnell <tpa@zurich.ibm.com>
 
+from functools import cache
 from typing import Any
 
 import torch
@@ -41,6 +42,26 @@ def _on_gfx10() -> bool:
     from vllm.platforms.rocm import on_gfx10
 
     return on_gfx10()
+
+
+@cache
+def _rdna2_attention_available() -> bool:
+    if not (current_platform.is_rocm() and envs.VLLM_ROCM_RDNA2_ATTENTION):
+        return False
+    import vllm._custom_ops  # noqa: F401  (loads _rocm_C)
+    from vllm.platforms.rocm import on_gfx1030
+
+    return on_gfx1030() and hasattr(torch.ops._rocm_C, "unified_attention_rdna2")
+
+
+def _rdna2_attention_operands_ok(*tensors: torch.Tensor) -> bool:
+    return all(
+        t.dtype == torch.float16
+        and t.stride(-1) == 1
+        and t.data_ptr() % 16 == 0
+        and all(st % 8 == 0 for st in t.stride()[:-1])
+        for t in tensors
+    )
 
 
 @triton.jit
@@ -965,6 +986,34 @@ def unified_attention(
         or q.shape[0] > softmax_segm_max.shape[0]
         or is_batch_invariant
     )
+
+    if (
+        not use_3d
+        and max_seqlen_q > 16
+        and head_size in (64, 128, 256)
+        and num_queries_per_kv <= 64
+        and use_causal
+        and not use_per_seq_causal
+        and window_size[0] < 0
+        and not softcap
+        and not (use_alibi_slopes or use_qq_bias or use_mm_prefix or use_rswa)
+        and sinks is None
+        and chunk_lookback < 0
+        and kv_quant_mode == KVQuantMode.NONE
+        and output_scale is None
+        and not use_td
+        and not is_batch_invariant
+        and _rdna2_attention_available()
+        and _rdna2_attention_operands_ok(q, k, v, out)
+        and block_table.dtype == torch.int32
+        and block_table.stride(1) == 1
+    ):
+        from vllm import _custom_ops as ops
+
+        ops.unified_attention_rdna2(
+            out, q, k, v, cu_seqlens_q, seqused_k, block_table, softmax_scale
+        )
+        return
 
     BLOCK_M = (
         16 if num_queries_per_kv <= 16 else triton.next_power_of_2(num_queries_per_kv)

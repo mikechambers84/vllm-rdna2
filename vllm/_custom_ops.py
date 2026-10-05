@@ -2270,6 +2270,24 @@ def moe_int8_gemm_rdna2(
     )
 
 
+def unified_attention_rdna2(
+    out: torch.Tensor,
+    q: torch.Tensor,
+    k_cache: torch.Tensor,
+    v_cache: torch.Tensor,
+    cu_seqlens_q: torch.Tensor,
+    seqused_k: torch.Tensor,
+    block_table: torch.Tensor,
+    scale: float,
+) -> None:
+    """RDNA2 paged causal GQA attention: fp16 ``q`` [tokens, heads, D] against
+    ``k_cache`` / ``v_cache`` [blocks, block_size, kv_heads, D] (D in 64, 128,
+    256) with unified_attention's varlen metadata, into ``out``."""
+    torch.ops._rocm_C.unified_attention_rdna2(
+        out, q, k_cache, v_cache, cu_seqlens_q, seqused_k, block_table, scale
+    )
+
+
 def wvSplitK_int4_g(
     weight: torch.Tensor,
     activation: torch.Tensor,

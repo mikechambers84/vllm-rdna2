@@ -84,6 +84,13 @@ void moe_int8_gemm_rdna2(torch::Tensor& output, const torch::Tensor& a,
                          const torch::Tensor& topk_weights, int64_t top_k,
                          bool mul_routed_weight, int64_t block_m);
 
+void unified_attention_rdna2(torch::Tensor& out, const torch::Tensor& q,
+                             const torch::Tensor& k_cache,
+                             const torch::Tensor& v_cache,
+                             const torch::Tensor& cu_seqlens_q,
+                             const torch::Tensor& seqused_k,
+                             const torch::Tensor& block_table, double scale);
+
 torch::Tensor gptq_gemm_rdna3(torch::Tensor a, torch::Tensor b_q_weight,
                               torch::Tensor b_qzeros, torch::Tensor b_scales,
                               bool use_v2_format);
