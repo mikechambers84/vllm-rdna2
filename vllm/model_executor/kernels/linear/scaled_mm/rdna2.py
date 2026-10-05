@@ -55,11 +55,13 @@ def _split_block_scales(
     scale: torch.Tensor, block_n: int, n: int
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """2D block scales [ceil(n / block_n), ceil(k / block_k)] as a scale per
-    output channel (the largest of its blocks) and fp16 ratios <= 1 per
-    (k-block, channel), the form ``gemm_w8_rdna2`` takes."""
-    s = scale.float().repeat_interleave(block_n, 0)[:n]
-    channel = s.amax(dim=1).clamp(min=torch.finfo(torch.float32).tiny)
-    return channel.contiguous(), (s / channel[:, None]).t().contiguous().half()
+    output channel (the largest block of its row) and fp16 ratios <= 1 per
+    block, transposed to [ceil(k / block_k), ceil(n / block_n)]: the form
+    ``gemm_w8_rdna2`` takes."""
+    s = scale.float()
+    row = s.amax(dim=1).clamp(min=torch.finfo(torch.float32).tiny)
+    channel = row.repeat_interleave(block_n)[:n].contiguous()
+    return channel, (s / row[:, None]).t().contiguous().half()
 
 
 class RDNA2FP8ScaledMMLinearKernel(FP8ScaledMMLinearKernel):
@@ -126,7 +128,7 @@ class RDNA2FP8ScaledMMLinearKernel(FP8ScaledMMLinearKernel):
         replace_parameter(layer, name, scale)
         layer.rdna2_fp8_scale_name = name
         layer.rdna2_fp8_block_scale = block_scale
-        layer.rdna2_fp8_block_k = block_k
+        layer.rdna2_fp8_block = (block_n, block_k)
 
     def apply_weights(
         self,
@@ -134,12 +136,14 @@ class RDNA2FP8ScaledMMLinearKernel(FP8ScaledMMLinearKernel):
         x: torch.Tensor,
         bias: torch.Tensor | None = None,
     ) -> torch.Tensor:
+        block_n, block_k = layer.rdna2_fp8_block
         return rdna2_w8_linear(
             x,
             layer.weight,
             getattr(layer, layer.rdna2_fp8_scale_name),
             layer.rdna2_fp8_block_scale,
-            layer.rdna2_fp8_block_k,
+            block_n,
+            block_k,
             bias,
         )
 

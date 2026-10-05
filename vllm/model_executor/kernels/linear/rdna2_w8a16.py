@@ -87,6 +87,7 @@ def _rdna2_w8_linear(
     weight: torch.Tensor,
     scale: torch.Tensor,
     block_scale: torch.Tensor | None,
+    block_n: int,
     block_k: int,
     bias: torch.Tensor | None,
     scale_a: torch.Tensor | None,
@@ -100,7 +101,16 @@ def _rdna2_w8_linear(
     ):
         x_2d = x_2d.clone(memory_format=torch.contiguous_format)
     out = ops.gemm_w8_rdna2(
-        x_2d, weight, scale, block_scale, block_k, bias, -1, scale_a, out_dtype
+        x_2d,
+        weight,
+        scale,
+        block_scale,
+        block_n,
+        block_k,
+        bias,
+        -1,
+        scale_a,
+        out_dtype,
     )
     return out.reshape(*x.shape[:-1], weight.shape[1])
 
@@ -110,6 +120,7 @@ def _rdna2_w8_linear_fake(
     weight: torch.Tensor,
     scale: torch.Tensor,
     block_scale: torch.Tensor | None,
+    block_n: int,
     block_k: int,
     bias: torch.Tensor | None,
     scale_a: torch.Tensor | None,
@@ -128,6 +139,7 @@ def rdna2_w8_linear(
     weight: torch.Tensor,
     scale: torch.Tensor,
     block_scale: torch.Tensor | None = None,
+    block_n: int = 1,
     block_k: int = 0,
     bias: torch.Tensor | None = None,
     scale_a: torch.Tensor | None = None,
@@ -136,7 +148,7 @@ def rdna2_w8_linear(
     """X @ W^T (+ bias) for K-major 8-bit weights, as ``gemm_w8_rdna2`` (int8
     X with its scale_a and out_dtype: W8A8)."""
     return torch.ops.vllm.rdna2_w8_linear(
-        x, weight, scale, block_scale, block_k, bias, scale_a, out_dtype
+        x, weight, scale, block_scale, block_n, block_k, bias, scale_a, out_dtype
     )
 
 

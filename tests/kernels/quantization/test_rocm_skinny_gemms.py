@@ -433,18 +433,20 @@ def _w8_rdna2_weights(fmt: str, m: int, k: int):
     scale = torch.rand(m, device="cuda") * 1e-2 + 1e-3
     if fmt == "int8":
         w = torch.randint(-127, 128, (m, k), dtype=torch.int8, device="cuda")
-        return kmajor_w8(w), scale, None, 0, w.float() * scale[:, None]
+        return kmajor_w8(w), scale, None, 1, 0, w.float() * scale[:, None]
     w = (torch.randn(m, k, device="cuda") * 64).clamp(-448, 448)
     w = w.to(torch.float8_e4m3fn)
     if fmt == "fp8":
-        return kmajor_w8(w), scale, None, 0, w.float() * scale[:, None]
-    blocks = torch.rand(-(-m // 128), -(-k // 128), device="cuda") * 1e-2 + 1e-3
-    scale, ratio = _split_block_scales(blocks, 128, m)
-    full = blocks.repeat_interleave(128, 0)[:m].repeat_interleave(128, 1)[:, :k]
-    return kmajor_w8(w), scale, ratio, 128, w.float() * full
+        return kmajor_w8(w), scale, None, 1, 0, w.float() * scale[:, None]
+    # 2D blocks; block_n 2 puts two blocks in one dword of 4 channels.
+    bn = 2 if fmt == "fp8_block_n2" else 128
+    blocks = torch.rand(-(-m // bn), -(-k // 128), device="cuda") * 1e-2 + 1e-3
+    scale, ratio = _split_block_scales(blocks, bn, m)
+    full = blocks.repeat_interleave(bn, 0)[:m].repeat_interleave(128, 1)[:, :k]
+    return kmajor_w8(w), scale, ratio, bn, 128, w.float() * full
 
 
-@pytest.mark.parametrize("fmt", ["int8", "fp8", "fp8_block"])
+@pytest.mark.parametrize("fmt", ["int8", "fp8", "fp8_block", "fp8_block_n2"])
 @pytest.mark.parametrize("n", [1, 13, 130])
 @pytest.mark.parametrize(
     "k,m",
@@ -463,10 +465,10 @@ def test_rocm_gemm_w8_rdna2_kernel(fmt, n, k, m, dtype, with_bias):
     on the dequantized weights to output rounding."""
     torch.manual_seed(0)
     A = torch.randn(n, k, dtype=dtype, device="cuda") * math.sqrt(2 / k)
-    W, scale, ratio, block_k, ref_w = _w8_rdna2_weights(fmt, m, k)
+    W, scale, ratio, block_n, block_k, ref_w = _w8_rdna2_weights(fmt, m, k)
     bias = torch.rand(m, dtype=dtype, device="cuda") if with_bias else None
 
-    out = ops.gemm_w8_rdna2(A, W, scale, ratio, block_k, bias)
+    out = ops.gemm_w8_rdna2(A, W, scale, ratio, block_n, block_k, bias)
     ref_bias = bias.float() if bias is not None else None
     ref = torch.nn.functional.linear(A.float(), ref_w, ref_bias).to(dtype)
     atol = torch.finfo(dtype).eps * math.sqrt(k)
@@ -532,9 +534,9 @@ def test_rocm_gemm_w8_rdna2_configs(cfg):
     torch.manual_seed(0)
     k, m = 1040, 516
     A = torch.randn(37, k, dtype=torch.float16, device="cuda") * math.sqrt(2 / k)
-    W, scale, ratio, block_k, ref_w = _w8_rdna2_weights("fp8_block", m, k)
+    W, scale, ratio, block_n, block_k, ref_w = _w8_rdna2_weights("fp8_block", m, k)
 
-    out = ops.gemm_w8_rdna2(A, W, scale, ratio, block_k, None, cfg)
+    out = ops.gemm_w8_rdna2(A, W, scale, ratio, block_n, block_k, None, cfg)
     ref = torch.nn.functional.linear(A.float(), ref_w).half()
     atol = torch.finfo(torch.float16).eps * math.sqrt(k)
     torch.testing.assert_close(out, ref, atol=atol, rtol=1e-2)

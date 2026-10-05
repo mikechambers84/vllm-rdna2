@@ -189,7 +189,7 @@ def test_fp8_linear_partial_scale_blocks():
     x = torch.randn(40, k, dtype=torch.float16, device="cuda")
     scale, ratio = _split_block_scales(blocks, 128, n)
 
-    out = rdna2_w8_linear(x, kmajor_w8(w), scale, ratio, 128, bias)
+    out = rdna2_w8_linear(x, kmajor_w8(w), scale, ratio, 128, 128, bias)
 
     ref = x.float() @ _fp8_dequant(w, blocks, 128, 128).t() + bias.float()
     assert ((out.float() - ref).norm() / ref.norm()).item() < 1e-3

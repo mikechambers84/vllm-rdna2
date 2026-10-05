@@ -21,7 +21,7 @@
 // placing the byte in the mantissa of 1024.0; fp16 activations accumulate
 // through v_dot2_f32_f16, bf16 (no dot instruction on gfx1030) through fp32
 // FMAs. 2D block scales are split at load time into a scale per column (the
-// largest of its blocks) and fp16 ratios <= 1 per (k-block, column) that
+// largest of its blocks) and fp16 ratios <= 1 per block that
 // multiply the widened weights.
 //
 // On the linear layers of Qwen3.8-27B at steady clocks: 440-490 GB/s at 1-8
@@ -156,8 +156,8 @@ __device__ __forceinline__ uint32_t dword(const uint4& v, int c) {
 
 // grid (ceil(M / T), ceil(N / (128 * CT))). T is the activation type (int8_t:
 // W8A8), O the output type. W holds ldw 16-byte column quads per dword row; R
-// (BLOCK) the ratios of k-block k >> bk_shift at R[kb * ldr + n]; SA (W8A8)
-// the activation scale of row t at SA[t * sa_stride].
+// (BLOCK) the ratios of k-block k >> bk_shift at R[kb * ldr + n / bn]; SA
+// (W8A8) the activation scale of row t at SA[t * sa_stride].
 template <typename T, typename O, int TT, int NW, int CT, int KBLOCK, bool INT8,
           bool BLOCK>
 __global__ void __launch_bounds__(NW* WARP32)
@@ -167,8 +167,8 @@ __global__ void __launch_bounds__(NW* WARP32)
                          const __half* __restrict__ R, const T* __restrict__ A,
                          const O* __restrict__ bias, O* __restrict__ C,
                          const int M, const int N, const int K, const int ldw,
-                         const int ldr, const int bk_shift, const int lda,
-                         const int ldc) {
+                         const int ldr, const int bn, const int bk_shift,
+                         const int lda, const int ldc) {
   constexpr bool DOT4 = std::is_same_v<T, int8_t>;
   using Acc = std::conditional_t<DOT4, int, float>;
   // k per activation load (16 bytes) and the dword rows it covers.
@@ -224,16 +224,11 @@ __global__ void __launch_bounds__(NW* WARP32)
         if (kb != kb_cur) {
           kb_cur = kb;
   #pragma unroll
-          for (int ct = 0; ct < CT; ct++) {
-            const uint2 r = *reinterpret_cast<const uint2*>(R + (long)kb * ldr +
-                                                            col[ct] * 4);
-            const half2 r01 = *reinterpret_cast<const half2*>(&r.x);
-            const half2 r23 = *reinterpret_cast<const half2*>(&r.y);
-            ratio[ct][0] = __low2half2(r01);
-            ratio[ct][1] = __high2half2(r01);
-            ratio[ct][2] = __low2half2(r23);
-            ratio[ct][3] = __high2half2(r23);
-          }
+          for (int ct = 0; ct < CT; ct++)
+  #pragma unroll
+            for (int c = 0; c < 4; c++)
+              ratio[ct][c] =
+                  __half2half2(R[(long)kb * ldr + (col[ct] * 4 + c) / bn]);
         }
       }
       half2 h[CT][4][4];
@@ -362,7 +357,7 @@ __global__ void gemm_w8_rdna2_kernel(const uint4*, const float*, const float*,
                                      const int, const __half*, const T*,
                                      const O*, O*, const int, const int,
                                      const int, const int, const int, const int,
-                                     const int, const int) {}
+                                     const int, const int, const int) {}
 
 #endif  // __HIP__RDNA2__ || !__HIP_DEVICE_COMPILE__
 
@@ -374,6 +369,7 @@ struct Args {
   const std::optional<at::Tensor>& bias;
   const std::optional<at::Tensor>& scale_a;
   at::Tensor& c;
+  int bn;
   int bk_shift;
 };
 
@@ -394,7 +390,7 @@ void launch(const Args& p, cudaStream_t stream) {
           (const T*)p.a.data_ptr(),
           p.bias.has_value() ? (const O*)p.bias->data_ptr() : nullptr,
           (O*)p.c.data_ptr(), M, N, K, p.w.stride(0) / 16,
-          BLOCK ? p.block_scale->stride(0) : 0, p.bk_shift, p.a.stride(0),
+          BLOCK ? p.block_scale->stride(0) : 0, p.bn, p.bk_shift, p.a.stride(0),
           p.c.stride(0));
 }
 
@@ -454,18 +450,27 @@ static int default_config(int M, int N) {
   return 11;
 }
 
-// The same for int8 activations, fitted on the Qwen3.8-27B layers.
-static int default_config_i8(int M, int N) {
-  const bool narrow = N <= 6144;
+// The same for int8 activations, fitted on the Qwen3.8-27B and
+// Qwen3.6-35B-A3B layers (within 0-3% of the best config summed per row
+// count): layers with few column tiles and long rows (N <= 2048, K >= 2048)
+// take tiny token tiles split 8 ways along K up to 16 rows; short rows
+// (K <= 2048) keep two waves per workgroup where long ones take one.
+static int default_config_i8(int M, int N, int K) {
+  if (N <= 2048 && K >= 2048) {
+    if (M <= 16) return 1;
+    if (M <= 512) return 5;
+    return M <= 1024 ? 8 : 11;
+  }
+  const bool narrow = N <= 6144, short_k = K <= 2048;
   if (M == 1) return 0;
   if (M == 2) return 1;
   if (M <= 4) return 2;
   if (M <= 8) return 3;
-  if (M <= 16) return narrow ? 5 : 4;
+  if (M <= 16) return narrow || short_k ? 5 : 4;
   if (M <= 24) return 6;
-  if (M <= 32) return narrow ? 8 : 7;
+  if (M <= 32) return narrow ? 8 : short_k ? 4 : 7;
   if (M <= 48) return narrow ? 4 : 6;
-  if (M <= 256) return narrow ? 4 : M <= 64 ? 9 : 10;
+  if (M <= 256) return narrow ? 4 : M <= 64 || short_k ? 9 : 10;
   return M <= 512 ? 12 : 11;
 }
 
@@ -477,15 +482,14 @@ static int default_config_i8(int M, int N) {
 // (stride(0) % 16 == 0, so N % 4 == 0); scale [N] fp32 contiguous; optional
 // contiguous bias [N] of the output dtype. a fp16 or bf16 (output: a's dtype)
 // with w int8 or float8_e4m3fn and optionally fp8 block_scale
-// [ceil(K / block_k), N] fp16 with N-contiguous rows (stride(0) % 4 == 0)
-// multiplying the weights of each block_k slice (block_k a power of two
-// >= 8); or a int8 with int8 w, fp32 scale_a of 1 or M elements and an fp16
-// or bf16 out_dtype (W8A8). cfg < 0 picks the default config for M. Returns
-// [M, N].
+// [ceil(K / block_k), ceil(N / block_n)] fp16 with contiguous rows
+// multiplying the weights of each block (block_k a power of two >= 8); or a
+// int8 with int8 w, fp32 scale_a of 1 or M elements and an fp16 or bf16
+// out_dtype (W8A8). cfg < 0 picks the default config for M. Returns [M, N].
 torch::Tensor gemm_w8_rdna2(const at::Tensor& a, const at::Tensor& w,
                             const at::Tensor& scale,
                             const std::optional<at::Tensor>& block_scale,
-                            int64_t block_k,
+                            int64_t block_n, int64_t block_k,
                             const std::optional<at::Tensor>& bias, int64_t cfg,
                             const std::optional<at::Tensor>& scale_a,
                             std::optional<at::ScalarType> out_dtype) {
@@ -536,18 +540,17 @@ torch::Tensor gemm_w8_rdna2(const at::Tensor& a, const at::Tensor& w,
   }
   int bk_shift = 0;
   if (block_scale.has_value()) {
-    TORCH_CHECK(w.dtype() != torch::kInt8 && block_k >= 8 &&
+    TORCH_CHECK(w.dtype() != torch::kInt8 && block_n >= 1 && block_k >= 8 &&
                     (block_k & (block_k - 1)) == 0,
-                "gemm_w8_rdna2 block scales need fp8 weights and block_k a "
-                "power of two >= 8");
-    TORCH_CHECK(
-        block_scale->dtype() == torch::kFloat16 && block_scale->dim() == 2 &&
-            block_scale->size(0) == (K + block_k - 1) / block_k &&
-            block_scale->size(1) == N && block_scale->stride(1) == 1 &&
-            block_scale->stride(0) % 4 == 0 &&
-            reinterpret_cast<uintptr_t>(block_scale->data_ptr()) % 8 == 0,
-        "gemm_w8_rdna2 needs fp16 block scales [ceil(K / block_k), N] "
-        "with 8-byte aligned, N-contiguous rows");
+                "gemm_w8_rdna2 block scales need fp8 weights, block_n >= 1 and "
+                "block_k a power of two >= 8");
+    TORCH_CHECK(block_scale->dtype() == torch::kFloat16 &&
+                    block_scale->dim() == 2 &&
+                    block_scale->size(0) == (K + block_k - 1) / block_k &&
+                    block_scale->size(1) == (N + block_n - 1) / block_n &&
+                    block_scale->stride(1) == 1,
+                "gemm_w8_rdna2 needs fp16 block scales [ceil(K / block_k), "
+                "ceil(N / block_n)] with contiguous rows");
     bk_shift = __builtin_ctzll(block_k);
   }
   if (bias.has_value()) {
@@ -563,10 +566,11 @@ torch::Tensor gemm_w8_rdna2(const at::Tensor& a, const at::Tensor& w,
   if (M == 0 || N == 0) return c;
   const at::cuda::OptionalCUDAGuard device_guard(device_of(a));
   const cudaStream_t stream = at::cuda::getCurrentCUDAStream();
-  const Args p{a, w, scale, block_scale, bias, scale_a, c, bk_shift};
+  const Args p{a,       w, scale,        block_scale, bias,
+               scale_a, c, (int)block_n, bk_shift};
 
   if (w8a8) {
-    const int id = cfg < 0 ? default_config_i8(M, N) : (int)cfg;
+    const int id = cfg < 0 ? default_config_i8(M, N, K) : (int)cfg;
 #define VLLM_W8A8_RDNA2_CASE(ID, T, NW, CT, KB)                        \
   case ID:                                                             \
     static_assert(kConfigsI8[ID].t == T && kConfigsI8[ID].nw == NW &&  \

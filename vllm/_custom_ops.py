@@ -2143,6 +2143,7 @@ def gemm_w8_rdna2(
     w: torch.Tensor,
     scale: torch.Tensor,
     block_scale: torch.Tensor | None = None,
+    block_n: int = 1,
     block_k: int = 0,
     bias: torch.Tensor | None = None,
     cfg: int = -1,
@@ -2152,12 +2153,12 @@ def gemm_w8_rdna2(
     """RDNA2 GEMM on int8 or fp8 e4m3fn weights in the K-major layout
     ``w`` [K / 4, N, 4] (``kmajor_w8``): ``a @ (W * scale).T (+ bias)`` for
     fp16/bf16 ``a`` and fp32 ``scale`` [N]; fp16 ``block_scale``
-    [ceil(K / block_k), N] further scales each block_k slice of a column.
+    [ceil(K / block_k), ceil(N / block_n)] further scales each block.
     For int8 ``a`` (W8A8, int8 ``w``): ``(a @ w.T) * scale_a * scale`` in
     ``out_dtype`` with fp32 ``scale_a`` of 1 or M elements, the same result as
     ``triton_scaled_mm``. ``cfg`` selects a tile config (-1: by row count)."""
     return torch.ops._rocm_C.gemm_w8_rdna2(
-        a, w, scale, block_scale, block_k, bias, cfg, scale_a, out_dtype
+        a, w, scale, block_scale, block_n, block_k, bias, cfg, scale_a, out_dtype
     )
 
 
