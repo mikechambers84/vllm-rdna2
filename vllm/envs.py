@@ -162,6 +162,7 @@ if TYPE_CHECKING:
     VLLM_UVA_INPUT_EMBEDDINGS: bool = False
     VLLM_ROCM_W8A16_UNQUANTIZED: bool = False
     VLLM_ROCM_RDNA2_ATTENTION: bool = True
+    VLLM_ROCM_W8A16_LM_HEAD: bool = False
     VLLM_ROCM_FP8_PADDING: bool = True
     VLLM_ROCM_MOE_PADDING: bool = True
     VLLM_ROCM_SHUFFLE_KV_CACHE_LAYOUT: bool = False
@@ -1423,6 +1424,12 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # scales, weight-only: halves their decode bandwidth and memory.
     "VLLM_ROCM_W8A16_UNQUANTIZED": lambda: (
         os.getenv("VLLM_ROCM_W8A16_UNQUANTIZED", "0").lower() in ("1", "true")
+    ),
+    # gfx1030: store an untied fp16/bf16 lm_head as int8 with per-row scales
+    # (weight-only): halves the bytes the decode logits read (~6-7% of TPOT on
+    # 27B-35B models). The logits change slightly.
+    "VLLM_ROCM_W8A16_LM_HEAD": lambda: (
+        os.getenv("VLLM_ROCM_W8A16_LM_HEAD", "0").lower() in ("1", "true")
     ),
     # gfx1030: run fp16 prefill attention (head 64/128/256, causal, no sliding
     # window / softcap / ALiBi / sinks) in the HIP kernel instead of Triton.

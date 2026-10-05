@@ -323,9 +323,16 @@ class Qwen3_5MTP(LocalArgmaxMixin, nn.Module, SupportsMultiModal, SupportsPP):
     ) -> torch.Tensor:
         # Only the first draft_vocab rows of lm_head are read; the other tokens
         # get -inf, i.e. zero draft probability.
-        prefix = dispatch_unquantized_gemm()(
-            self.lm_head, hidden_states, self.lm_head.weight[:draft_vocab]
-        )
+        if hasattr(self.lm_head, "w8a16_weight"):  # VLLM_ROCM_W8A16_LM_HEAD
+            from vllm.model_executor.kernels.linear.rdna2_w8a16 import (
+                apply_rdna2_w8a16,
+            )
+
+            prefix = apply_rdna2_w8a16(self.lm_head, hidden_states, None, draft_vocab)
+        else:
+            prefix = dispatch_unquantized_gemm()(
+                self.lm_head, hidden_states, self.lm_head.weight[:draft_vocab]
+            )
         logits = prefix.new_full(
             (hidden_states.shape[0], self.logits_processor.org_vocab_size),
             float("-inf"),
