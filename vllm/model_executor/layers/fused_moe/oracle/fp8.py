@@ -61,6 +61,8 @@ class Fp8MoeBackend(Enum):
     CPU = "CPU"
     CPU_W8A8 = "CPU_W8A8"
     HPC = "HPC"
+    # gfx1030 (no FP8 instructions): weight-only FP8, fp16 activations.
+    RDNA2 = "RDNA2"
     # Dequantize-to-BF16 emulation for MXFP8 on devices without a native
     # MXFP8 MoE kernel (e.g. ROCm). Weights pass through unchanged here.
     EMULATION = "EMULATION"
@@ -87,6 +89,7 @@ def _get_priority_backends(
         Fp8MoeBackend.FLASHINFER_CUTLASS,
         Fp8MoeBackend.DEEPGEMM,
         Fp8MoeBackend.VLLM_CUTLASS,
+        Fp8MoeBackend.RDNA2,
         Fp8MoeBackend.TRITON,
         Fp8MoeBackend.MARLIN,
         Fp8MoeBackend.HUMMING,
@@ -256,6 +259,13 @@ def backend_to_kernel_cls(
         )
 
         return [HPCExperts]
+
+    elif backend == Fp8MoeBackend.RDNA2:
+        from vllm.model_executor.layers.fused_moe.experts.rdna2_moe import (
+            Rdna2Fp8Experts,
+        )
+
+        return [Rdna2Fp8Experts]
 
     else:
         raise ValueError(f"Unknown FP8 MoE backend: {backend.value}")
@@ -680,6 +690,7 @@ def convert_to_fp8_moe_kernel_format(
             Fp8MoeBackend.BATCHED_VLLM_CUTLASS,
             Fp8MoeBackend.XPU,
             Fp8MoeBackend.HPC,
+            Fp8MoeBackend.RDNA2,
             # EMULATION dequantizes weights at runtime; NATIVE_MXFP8 consumes
             # the MXFP8 weights as-is — neither needs a load-time layout change.
             Fp8MoeBackend.EMULATION,
@@ -725,8 +736,8 @@ def make_fp8_moe_quant_config(
             block_shape=block_shape,
         )
 
-    # MARLIN and CPU (W8A16) are mixed precision W8A16 configs.
-    if fp8_backend == Fp8MoeBackend.MARLIN or fp8_backend == Fp8MoeBackend.CPU:
+    # MARLIN, CPU and RDNA2 (W8A16) are mixed precision W8A16 configs.
+    if fp8_backend in (Fp8MoeBackend.MARLIN, Fp8MoeBackend.CPU, Fp8MoeBackend.RDNA2):
         return fp8_w8a16_moe_quant_config(
             w1_scale=w1_scale,
             w2_scale=w2_scale,

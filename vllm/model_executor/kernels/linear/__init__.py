@@ -213,6 +213,9 @@ from vllm.model_executor.kernels.linear.scaled_mm.pytorch import (
     PerTensorTorchFP8ScaledMMLinearKernel,
     RowWiseTorchFP8ScaledMMLinearKernel,
 )
+from vllm.model_executor.kernels.linear.scaled_mm.rdna2 import (
+    RDNA2FP8ScaledMMLinearKernel,
+)
 from vllm.model_executor.kernels.linear.scaled_mm.rocm import (
     ROCmFP8ScaledMMLinearKernel,
 )
@@ -435,6 +438,7 @@ _POSSIBLE_FP8_KERNELS: dict[PlatformEnum, list[type[FP8ScaledMMLinearKernel]]] =
         PerTensorTorchFP8ScaledMMLinearKernel,
         RowWiseTorchFP8ScaledMMLinearKernel,
         ChannelWiseTorchFP8ScaledMMLinearKernel,
+        RDNA2FP8ScaledMMLinearKernel,
     ],
     PlatformEnum.CPU: [
         CPUFP8W8A8ScaledMMLinearKernel,
@@ -467,6 +471,7 @@ _POSSIBLE_FP8_BLOCK_KERNELS: dict[
     ],
     PlatformEnum.ROCM: [
         AiterFp8BlockScaledMMKernel,
+        RDNA2FP8ScaledMMLinearKernel,
         TritonFp8BlockScaledMMKernel,
     ],
     PlatformEnum.CPU: [
@@ -486,7 +491,7 @@ _POSSIBLE_WFP8A16_KERNELS: dict[PlatformEnum, list[type[FP8ScaledMMLinearKernel]
         MarlinFP8ScaledMMLinearKernel,
     ],
     PlatformEnum.ROCM: [
-        # To be added
+        RDNA2FP8ScaledMMLinearKernel,
     ],
     PlatformEnum.CPU: [
         # To be added
@@ -731,7 +736,8 @@ def init_fp8_linear_kernel(
             )
 
         # TODO make scaled_mm kernels inherit from MMLinearKernel
-        # only MarlinFP8ScaledMMLinearKernel is a type of FP8ScaledMMLinearKernel.
+        # only the Marlin and RDNA2 weight-only kernels are
+        # FP8ScaledMMLinearKernels.
         if issubclass(kernel_type, FP8ScaledMMLinearKernel):
             return kernel_type(
                 scaled_mm_linear_kernel_config,

@@ -402,6 +402,11 @@ def rocm_unquantized_gemm_impl(
 
         return tgemm.mm(x, weight, bias)
 
+    if on_gfx1030():
+        from vllm.model_executor.kernels.linear import rdna2_gemm
+
+        return rdna2_gemm.linear(x, weight, bias)
+
     return torch.nn.functional.linear(x, weight, bias)
 
 

@@ -16,6 +16,9 @@
 // on their way into LDS (OR into the 1024.0 mantissa, subtract 1032, scale in
 // fp16) and v_dot2_f32_f16 accumulates in fp32. Qwen3.6-35B-A3B's experts
 // (E=256, top-8) run 1.4x Triton at 512 tokens, 1.8x at 2048, 2.1x at 8192.
+// moe_fp8_gemm_rdna2 is the same GEMM on fp8 e4m3fn weights w [E, N, K]
+// (widened exactly to fp16 on their way into LDS, then scaled in fp16) with
+// per-tensor, per-channel or 2D block fp32 scales.
 
 #include <torch/all.h>
 #include <c10/cuda/CUDAGuard.h>
@@ -23,6 +26,8 @@
 
 #include <hip/hip_runtime.h>
 #include <hip/hip_fp16.h>
+
+#include "rdna2_fp8.cuh"
 
 #if defined(__HIPCC__) && defined(__gfx1030__)
   #define __HIP__RDNA2__
@@ -40,17 +45,25 @@ static constexpr int CH = BK / 8;  // 8-element chunks per row per stage
 
 #if defined(__HIP__RDNA2__) || !defined(__HIP_DEVICE_COMPILE__)
 
+// fp32 scales of fp8 weights [E, N, K]: [E, ceil(N / bn), cols], indexed
+// [e][n / bn][k >> bk_shift].
+struct Fp8Scales {
+  const float* s;
+  int bn, bk_shift, row_blocks, cols;
+};
+
 // UNR: unroll of the k2 loop; a full unroll lets the compiler hoist every
-// LDS read and spill.
-template <int RM, int UNR, bool MUL_W, bool ZP>
+// LDS read and spill. FP8: W holds fp8 weights [E, N, K] with scales F8S
+// (S, Z and group_size unused).
+template <int RM, int UNR, bool MUL_W, bool ZP, bool FP8>
 __global__ void __launch_bounds__(THREADS) moe_wna16_gemm_rdna2_kernel(
     const __half* __restrict__ A, const uint8_t* __restrict__ W,
     const __half* __restrict__ S, const uint8_t* __restrict__ Z,
-    __half* __restrict__ C, const int* __restrict__ sorted_ids,
-    const int* __restrict__ expert_ids, const int* __restrict__ num_post_padded,
-    const float* __restrict__ topk_w, const int num_valid, const int top_k,
-    const int N, const int K, const int group_size, const int E, const int lda,
-    const int ldc) {
+    const Fp8Scales F8S, __half* __restrict__ C,
+    const int* __restrict__ sorted_ids, const int* __restrict__ expert_ids,
+    const int* __restrict__ num_post_padded, const float* __restrict__ topk_w,
+    const int num_valid, const int top_k, const int N, const int K,
+    const int group_size, const int E, const int lda, const int ldc) {
   constexpr int BM = 16 * RM;
   constexpr int A_ITEMS = (BM * CH + THREADS - 1) / THREADS;
   constexpr int W_ITEMS = BN * CH / THREADS;
@@ -62,9 +75,11 @@ __global__ void __launch_bounds__(THREADS) moe_wna16_gemm_rdna2_kernel(
   const int e = expert_ids[blockIdx.x];
   if (e < 0 || e >= E) return;
   const int n0 = blockIdx.y * BN;
-  const uint8_t* We = W + (long)e * N * (K / 2);
-  const __half* Se = S + (long)e * N * (K / group_size);
+  const uint8_t* We = W + (long)e * N * (FP8 ? K : K / 2);
+  const __half* Se = FP8 ? nullptr : S + (long)e * N * (K / group_size);
   const uint8_t* Ze = ZP ? Z + (long)e * (N / 2) * (K / group_size) : nullptr;
+  const float* F8Se =
+      FP8 ? F8S.s + (long)e * F8S.row_blocks * F8S.cols : nullptr;
 
   // Element offset of each gathered activation chunk; -1 for padding rows.
   int a_off[A_ITEMS];
@@ -80,6 +95,7 @@ __global__ void __launch_bounds__(THREADS) moe_wna16_gemm_rdna2_kernel(
 
   uint4 ra[A_ITEMS];
   uint32_t rw[W_ITEMS];
+  uint32_t rw_hi[FP8 ? W_ITEMS : 1];  // fp8: k + 4 .. k + 7
   __half rs[W_ITEMS];
   uint32_t rz[W_ITEMS];  // zero point of the item's (column, group)
   auto load = [&](int k0) {
@@ -93,6 +109,15 @@ __global__ void __launch_bounds__(THREADS) moe_wna16_gemm_rdna2_kernel(
       const int idx = tid + it * THREADS;
       const int col = min(n0 + idx / CH, N - 1);
       const int k = k0 + idx % CH * 8;
+      if constexpr (FP8) {
+        const uint2 q = *reinterpret_cast<const uint2*>(We + (long)col * K + k);
+        rw[it] = q.x;
+        rw_hi[it] = q.y;
+        // 256 undoes the 2^-8 of the conversion.
+        rs[it] = __float2half(
+            F8Se[(col / F8S.bn) * F8S.cols + (k >> F8S.bk_shift)] * 256.f);
+        continue;
+      }
       rw[it] =
           *reinterpret_cast<const uint32_t*>(We + (long)col * (K / 2) + k / 2);
       rs[it] = Se[(long)col * (K / group_size) + k / group_size];
@@ -121,6 +146,17 @@ __global__ void __launch_bounds__(THREADS) moe_wna16_gemm_rdna2_kernel(
       const int idx = tid + it * THREADS;
       const int n = idx / CH, c = idx % CH;
       const half2 s2 = __halves2half2(rs[it], rs[it]);
+      if constexpr (FP8) {
+  #pragma unroll
+        for (int j = 0; j < 4; j++) {
+          const half2 h = __hmul2(
+              rdna2::fp8x2_to_half2(j < 2 ? rw[it] : rw_hi[it],
+                                    j % 2 ? rdna2::FP8_HI : rdna2::FP8_LO),
+              s2);
+          sW[buf][c * 4 + j][n] = *reinterpret_cast<const uint32_t*>(&h);
+        }
+        continue;
+      }
       if constexpr (ZP) {
         const __half zb = __ushort_as_half(0x6400 | rz[it]);  // 1024 + zp
         bias = __halves2half2(zb, zb);
@@ -208,11 +244,18 @@ __global__ void __launch_bounds__(THREADS) moe_wna16_gemm_rdna2_kernel(
 
 #else  // non-RDNA2 device pass: empty stub for symbol parity.
 
-template <int RM, int UNR, bool MUL_W, bool ZP>
-__global__ void moe_wna16_gemm_rdna2_kernel(
-    const __half*, const uint8_t*, const __half*, const uint8_t*, __half*,
-    const int*, const int*, const int*, const float*, const int, const int,
-    const int, const int, const int, const int, const int, const int) {}
+struct Fp8Scales {
+  const float* s;
+  int bn, bk_shift, row_blocks, cols;
+};
+template <int RM, int UNR, bool MUL_W, bool ZP, bool FP8>
+__global__ void moe_wna16_gemm_rdna2_kernel(const __half*, const uint8_t*,
+                                            const __half*, const uint8_t*,
+                                            const Fp8Scales, __half*,
+                                            const int*, const int*, const int*,
+                                            const float*, const int, const int,
+                                            const int, const int, const int,
+                                            const int, const int, const int) {}
 
 #endif  // __HIP__RDNA2__ || !__HIP_DEVICE_COMPILE__
 
@@ -282,13 +325,15 @@ void moe_wna16_gemm_rdna2(torch::Tensor& output, const torch::Tensor& a,
   const cudaStream_t stream = at::cuda::getCurrentCUDAStream();
   const dim3 grid(expert_ids.numel(), (N + BN - 1) / BN);
 
-#define VLLM_MOE_GEMM_LAUNCH_Z(RM, UNR, MW, ZPV)                               \
-  moe_wna16_gemm_rdna2_kernel<RM, UNR, MW, ZPV><<<grid, THREADS, 0, stream>>>( \
-      (const __half*)a.data_ptr(), w.data_ptr<uint8_t>(),                      \
-      (const __half*)scales.data_ptr(), zp, (__half*)output.data_ptr(),        \
-      sorted_ids.data_ptr<int>(), expert_ids.data_ptr<int>(),                  \
-      num_tokens_post_padded.data_ptr<int>(), topk_weights.data_ptr<float>(),  \
-      num_valid, top_k, N, K, K / groups, E, a.stride(0), N)
+#define VLLM_MOE_GEMM_LAUNCH_Z(RM, UNR, MW, ZPV)                              \
+  moe_wna16_gemm_rdna2_kernel<RM, UNR, MW, ZPV, false>                        \
+      <<<grid, THREADS, 0, stream>>>(                                         \
+          (const __half*)a.data_ptr(), w.data_ptr<uint8_t>(),                 \
+          (const __half*)scales.data_ptr(), zp, Fp8Scales{},                  \
+          (__half*)output.data_ptr(), sorted_ids.data_ptr<int>(),             \
+          expert_ids.data_ptr<int>(), num_tokens_post_padded.data_ptr<int>(), \
+          topk_weights.data_ptr<float>(), num_valid, top_k, N, K, K / groups, \
+          E, a.stride(0), N)
 #define VLLM_MOE_GEMM_LAUNCH(RM, UNR, MW)       \
   if (zp) {                                     \
     VLLM_MOE_GEMM_LAUNCH_Z(RM, UNR, MW, true);  \
@@ -318,4 +363,99 @@ void moe_wna16_gemm_rdna2(torch::Tensor& output, const torch::Tensor& a,
 #undef VLLM_MOE_GEMM_BY_W
 #undef VLLM_MOE_GEMM_LAUNCH
 #undef VLLM_MOE_GEMM_LAUNCH_Z
+}
+
+// moe_wna16_gemm_rdna2 on float8_e4m3fn weights w [E, N, K] (K % 32 == 0,
+// N % 8 == 0) with fp32 scales [E] (one per expert) or
+// [E, ceil(N / block_n), S], S == 1 (one scale per block_n rows) or
+// S == ceil(K / block_k) (2D blocks, block_k a power of two >= 32).
+void moe_fp8_gemm_rdna2(torch::Tensor& output, const torch::Tensor& a,
+                        const torch::Tensor& w, const torch::Tensor& scales,
+                        int64_t block_n, int64_t block_k,
+                        const torch::Tensor& sorted_ids,
+                        const torch::Tensor& expert_ids,
+                        const torch::Tensor& num_tokens_post_padded,
+                        const torch::Tensor& topk_weights, int64_t top_k,
+                        bool mul_routed_weight, int64_t block_m) {
+  using namespace vllm::moe_wna16_gemm_rdna2;
+  TORCH_CHECK(a.dtype() == torch::kFloat16 && output.dtype() == torch::kFloat16,
+              "moe_fp8_gemm_rdna2 needs fp16 activations and output");
+  TORCH_CHECK(w.dtype() == at::ScalarType::Float8_e4m3fn && w.dim() == 3 &&
+                  w.is_contiguous() && scales.dtype() == torch::kFloat32 &&
+                  scales.is_contiguous(),
+              "moe_fp8_gemm_rdna2 needs contiguous [E, N, K] float8_e4m3fn "
+              "weights and contiguous fp32 scales");
+  TORCH_CHECK(sorted_ids.dtype() == torch::kInt32 &&
+                  expert_ids.dtype() == torch::kInt32 &&
+                  num_tokens_post_padded.dtype() == torch::kInt32 &&
+                  topk_weights.dtype() == torch::kFloat32 &&
+                  topk_weights.is_contiguous(),
+              "moe_fp8_gemm_rdna2 needs int32 alignment tensors and fp32 topk "
+              "weights");
+  const int E = w.size(0), N = w.size(1), K = w.size(2);
+  TORCH_CHECK(a.dim() == 2 && a.size(1) == K && a.stride(1) == 1 &&
+                  a.stride(0) % 8 == 0 &&
+                  reinterpret_cast<uintptr_t>(a.data_ptr()) % 16 == 0,
+              "moe_fp8_gemm_rdna2 needs a [rows, K] with 16-byte aligned, "
+              "K-contiguous rows");
+  TORCH_CHECK(K % BK == 0 && N % 8 == 0,
+              "moe_fp8_gemm_rdna2 needs K % 32 == 0 and N % 8 == 0");
+  Fp8Scales s{scales.data_ptr<float>(), N, 31, 1, 1};
+  if (scales.dim() == 1) {
+    TORCH_CHECK(scales.numel() == E, "moe_fp8_gemm_rdna2: bad expert scales");
+  } else {
+    TORCH_CHECK(scales.dim() == 3 && scales.size(0) == E && block_n >= 1 &&
+                    scales.size(1) == (N + block_n - 1) / block_n,
+                "moe_fp8_gemm_rdna2 needs [E, ceil(N / block_n), S] scales");
+    s.bn = block_n;
+    s.row_blocks = scales.size(1);
+    if (scales.size(2) > 1) {
+      TORCH_CHECK(block_k >= BK && (block_k & (block_k - 1)) == 0 &&
+                      scales.size(2) == (K + block_k - 1) / block_k,
+                  "moe_fp8_gemm_rdna2 needs block_k a power of two >= 32 "
+                  "and ceil(K / block_k) scale columns");
+      s.bk_shift = __builtin_ctzll(block_k);
+      s.cols = scales.size(2);
+    }
+  }
+  const int num_valid = topk_weights.numel();
+  TORCH_CHECK(output.is_contiguous() && output.numel() == (long)num_valid * N,
+              "moe_fp8_gemm_rdna2 needs a contiguous [num_valid, N] output");
+  TORCH_CHECK(block_m == 16 || block_m == 32 || block_m == 64 || block_m == 128,
+              "moe_fp8_gemm_rdna2 supports block_m 16, 32, 64 and 128");
+
+  const at::cuda::OptionalCUDAGuard device_guard(device_of(a));
+  const cudaStream_t stream = at::cuda::getCurrentCUDAStream();
+  const dim3 grid(expert_ids.numel(), (N + BN - 1) / BN);
+
+#define VLLM_MOE_FP8_GEMM_LAUNCH(RM, UNR, MW)                                 \
+  moe_wna16_gemm_rdna2_kernel<RM, UNR, MW, false, true>                       \
+      <<<grid, THREADS, 0, stream>>>(                                         \
+          (const __half*)a.data_ptr(), (const uint8_t*)w.data_ptr(), nullptr, \
+          nullptr, s, (__half*)output.data_ptr(), sorted_ids.data_ptr<int>(), \
+          expert_ids.data_ptr<int>(), num_tokens_post_padded.data_ptr<int>(), \
+          topk_weights.data_ptr<float>(), num_valid, top_k, N, K, K, E,       \
+          a.stride(0), N)
+#define VLLM_MOE_FP8_GEMM_BY_W(RM, UNR)       \
+  if (mul_routed_weight) {                    \
+    VLLM_MOE_FP8_GEMM_LAUNCH(RM, UNR, true);  \
+  } else {                                    \
+    VLLM_MOE_FP8_GEMM_LAUNCH(RM, UNR, false); \
+  }
+  switch (block_m) {
+    case 16:
+      VLLM_MOE_FP8_GEMM_BY_W(1, 4);
+      break;
+    case 32:
+      VLLM_MOE_FP8_GEMM_BY_W(2, 4);
+      break;
+    case 64:
+      VLLM_MOE_FP8_GEMM_BY_W(4, 4);
+      break;
+    default:
+      VLLM_MOE_FP8_GEMM_BY_W(8, 2);
+      break;
+  }
+#undef VLLM_MOE_FP8_GEMM_BY_W
+#undef VLLM_MOE_FP8_GEMM_LAUNCH
 }

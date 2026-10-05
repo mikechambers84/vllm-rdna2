@@ -1218,6 +1218,15 @@ class RocmPlatform(Platform):
     def device_count(cls) -> int:
         return _rocm_device_count_stateless(getattr(envs, cls.device_control_env_var))
 
+    @property
+    def supported_dtypes(self) -> list[torch.dtype]:
+        if on_gfx10():
+            # No bf16 dot instruction, and the gfx10 kernels (and some Triton
+            # ones that fail to compile bf16 there) are fp16: "auto" picks fp16
+            # for bf16 checkpoints. An explicit bf16 dtype is still accepted.
+            return [torch.float16, torch.float32]
+        return super().supported_dtypes
+
     @classmethod
     def check_if_supports_dtype(cls, dtype: torch.dtype):
         if dtype == torch.bfloat16:  # noqa: SIM102

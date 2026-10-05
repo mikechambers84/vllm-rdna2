@@ -264,3 +264,28 @@ def test_rocm_unquantized_gemm_gfx950_wvsplitkrc_path(monkeypatch):
     x_view = wvsplitkrc_mock.call_args.args[0]
     assert x_view.is_contiguous()
     assert torch.allclose(out, ref, atol=1e-3, rtol=1e-3)
+
+
+@pytest.mark.skipif(not current_platform.is_rocm(), reason="ROCm-only kernel test")
+@pytest.mark.parametrize("valid", [True, False])
+def test_rocm_unquantized_gemm_gfx1030_tuned_rocblas_solution(monkeypatch, valid):
+    """On gfx1030 a weight shape in the tuned table runs rocBLAS with the
+    table's solution for the row bucket; an index rocBLAS cannot use falls
+    back to its own choice. Either way the result is F.linear's."""
+    from vllm.model_executor.kernels.linear import rdna2_gemm
+
+    if not rdna2_gemm.available():
+        pytest.skip("gfx1030 with gemm_rocblas_rdna2")
+    torch.manual_seed(0)
+    x = torch.randn(100, 2048, device="cuda", dtype=torch.float16)
+    weight = torch.randn(3072, 2048, device="cuda", dtype=torch.float16) * 0.02
+    sols = torch.ops._rocm_C.gemm_rocblas_solutions_rdna2(x, weight, False)
+    sol = sols[len(sols) // 2] if valid else 12345
+    table = {rdna2_gemm._key(3072, 2048, torch.float16, False): [0, 0, 0, sol, 0, 0]}
+    monkeypatch.setattr(rdna2_gemm, "_table", lambda: table)
+
+    out = utils.rocm_unquantized_gemm_impl(x, weight, None)
+
+    assert rdna2_gemm.solution(3072, 2048, 100, torch.float16) == sol
+    ref = torch.nn.functional.linear(x.float(), weight.float())
+    assert ((out.float() - ref).norm() / ref.norm()).item() < 1e-3

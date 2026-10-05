@@ -1555,7 +1555,8 @@ if(VLLM_GPU_LANG STREQUAL "HIP")
                                   "csrc/rocm/moe_int8_gemm_rdna2.cu"
                                   "csrc/rocm/moe_int8_rdna2.cu"
                                   "csrc/rocm/attention_rdna2.cu"
-                                  "csrc/rocm/gdn_rdna2.cu")
+                                  "csrc/rocm/gdn_rdna2.cu"
+                                  "csrc/rocm/gemm_rocblas_rdna2.cu")
   endif()
 
   define_extension_target(
@@ -1580,6 +1581,9 @@ if(VLLM_GPU_LANG STREQUAL "HIP")
 
   if(VLLM_ROCM_HAS_GFX1030)
     target_compile_definitions(_rocm_C PRIVATE VLLM_ROCM_GFX1030)
+    # gemm_rocblas_rdna2 picks rocBLAS solutions by index.
+    find_package(rocblas REQUIRED)
+    target_link_libraries(_rocm_C PRIVATE roc::rocblas)
   endif()
 endif()
 

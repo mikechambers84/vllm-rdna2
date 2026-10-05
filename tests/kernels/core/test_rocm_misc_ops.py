@@ -166,6 +166,21 @@ def test_gfx10_capability_does_not_match_blackwell(on_gfx10, monkeypatch):
     assert platform.has_device_capability(90)
 
 
+@pytest.mark.parametrize("on_gfx10", [True, False])
+def test_gfx10_auto_dtype_prefers_fp16(on_gfx10, monkeypatch):
+    """gfx10 has no bf16 dot instruction and its kernels are fp16, so a bf16
+    checkpoint with dtype "auto" runs in fp16 there (other ROCm GPUs keep bf16)."""
+    import torch
+
+    import vllm.platforms.rocm as rocm
+    from vllm.config.model import _resolve_auto_dtype
+
+    monkeypatch.setattr(rocm, "_ON_GFX10", on_gfx10)
+    monkeypatch.setattr("vllm.config.model.current_platform", rocm.RocmPlatform())
+    dtype = _resolve_auto_dtype("llama", torch.bfloat16, is_pooling_model=False)
+    assert dtype == (torch.float16 if on_gfx10 else torch.bfloat16)
+
+
 # ---------------------------------------------------------------------------
 # AITER ops availability tests
 # ---------------------------------------------------------------------------

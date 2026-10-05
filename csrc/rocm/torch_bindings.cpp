@@ -77,6 +77,28 @@ TORCH_LIBRARY_EXPAND(TORCH_EXTENSION_NAME, rocm_ops) {
       "gemv_w8a16_rdna2(Tensor a, Tensor w, Tensor scale, Tensor? bias) -> "
       "Tensor");
   rocm_ops.impl("gemv_w8a16_rdna2", torch::kCUDA, &gemv_w8a16_rdna2);
+  // fp8 e4m3fn-weight GEMV (per-row or 2D block scales) with fp16/bf16
+  // activations (M <= 8), and the matching dequantization for larger batches.
+  rocm_ops.def(
+      "gemv_fp8_rdna2(Tensor a, Tensor w, Tensor scale, int block_n, "
+      "int block_k, Tensor? bias) -> Tensor");
+  rocm_ops.impl("gemv_fp8_rdna2", torch::kCUDA, &gemv_fp8_rdna2);
+  rocm_ops.def(
+      "dequant_fp8_rdna2(Tensor! out, Tensor w, Tensor scale, int block_n, "
+      "int block_k) -> ()");
+  rocm_ops.impl("dequant_fp8_rdna2", torch::kCUDA, &dequant_fp8_rdna2);
+  // fp16/bf16 GEMM with an explicit rocBLAS solution, and the solutions and
+  // rocBLAS version for tuning them.
+  rocm_ops.def(
+      "gemm_rocblas_rdna2(Tensor a, Tensor w, int solution, bool w_kn) -> "
+      "Tensor");
+  rocm_ops.impl("gemm_rocblas_rdna2", torch::kCUDA, &gemm_rocblas_rdna2);
+  rocm_ops.def(
+      "gemm_rocblas_solutions_rdna2(Tensor a, Tensor w, bool w_kn) -> int[]");
+  rocm_ops.impl("gemm_rocblas_solutions_rdna2", torch::kCUDA,
+                &gemm_rocblas_solutions_rdna2);
+  rocm_ops.def("rocblas_version_rdna2() -> str");
+  rocm_ops.impl("rocblas_version_rdna2", &rocblas_version_rdna2);
   // 4-bit GPTQ GEMM for decode and small batches on Exllama's weight layout.
   rocm_ops.def(
       "gemm_w4a16_exl_rdna2(Tensor a, Tensor w, Tensor zeros, Tensor scales, "
@@ -88,6 +110,18 @@ TORCH_LIBRARY_EXPAND(TORCH_EXTENSION_NAME, rocm_ops) {
       "Tensor topk_weights, Tensor w13, Tensor s13, Tensor w2, Tensor s2, "
       "Tensor! act) -> ()");
   rocm_ops.impl("moe_int8_decode_rdna2", torch::kCUDA, &moe_int8_decode_rdna2);
+  // fp8-weight fused-MoE decode and prefill GEMM (fp16 activations).
+  rocm_ops.def(
+      "moe_fp8_decode_rdna2(Tensor! output, Tensor x, Tensor topk_ids, "
+      "Tensor topk_weights, Tensor w13, Tensor s13, Tensor w2, Tensor s2, "
+      "int block_n, int block_k, Tensor! act) -> ()");
+  rocm_ops.impl("moe_fp8_decode_rdna2", torch::kCUDA, &moe_fp8_decode_rdna2);
+  rocm_ops.def(
+      "moe_fp8_gemm_rdna2(Tensor! output, Tensor a, Tensor w, Tensor scales, "
+      "int block_n, int block_k, Tensor sorted_ids, Tensor expert_ids, "
+      "Tensor num_tokens_post_padded, Tensor topk_weights, int top_k, "
+      "bool mul_routed_weight, int block_m) -> ()");
+  rocm_ops.impl("moe_fp8_gemm_rdna2", torch::kCUDA, &moe_fp8_gemm_rdna2);
   // W4A16 fused-MoE decode (few tokens) on the Triton WNA16 weight layout.
   rocm_ops.def(
       "moe_wna16_decode_rdna2(Tensor! output, Tensor x, Tensor topk_ids, "
@@ -116,7 +150,7 @@ TORCH_LIBRARY_EXPAND(TORCH_EXTENSION_NAME, rocm_ops) {
       "unified_attention_rdna2(Tensor! out, Tensor q, Tensor k_cache, "
       "Tensor v_cache, Tensor cu_seqlens_q, Tensor seqused_k, "
       "Tensor block_table, float scale, int window, float softcap, "
-      "Tensor? sinks) -> ()");
+      "Tensor? sinks, Tensor? k_scale=None, Tensor? v_scale=None) -> ()");
   rocm_ops.impl("unified_attention_rdna2", torch::kCUDA,
                 &unified_attention_rdna2);
   // Split-KV decode / spec-verify attention, head 256 (segment partials).
@@ -124,7 +158,9 @@ TORCH_LIBRARY_EXPAND(TORCH_EXTENSION_NAME, rocm_ops) {
       "decode_attention_rdna2(Tensor q, Tensor k_cache, Tensor v_cache, "
       "Tensor! segm_out, Tensor! segm_max, Tensor! segm_sum, "
       "Tensor cu_seqlens_q, Tensor seqused_k, Tensor block_table, int tile, "
-      "int max_seqlen_q, float scale) -> ()");
+      "int max_seqlen_q, float scale, Tensor? k_scale=None, "
+      "Tensor? v_scale=None, int window=0, float softcap=0.0, "
+      "Tensor? sinks=None) -> ()");
   rocm_ops.impl("decode_attention_rdna2", torch::kCUDA,
                 &decode_attention_rdna2);
   // Gated DeltaNet prefill: post-conv1d q/k/v split, l2 norm and gating.

@@ -2149,6 +2149,32 @@ def gemv_w8a16_rdna2(
     return torch.ops._rocm_C.gemv_w8a16_rdna2(a, w, scale, bias)
 
 
+def gemv_fp8_rdna2(
+    a: torch.Tensor,
+    w: torch.Tensor,
+    scale: torch.Tensor,
+    block_n: int,
+    block_k: int,
+    bias: torch.Tensor | None = None,
+) -> torch.Tensor:
+    """RDNA2 GEMV on fp8 e4m3fn weights ``w`` [N, K] with fp32 ``scale``
+    [ceil(N / block_n), 1] (per block_n rows) or [ceil(N / block_n),
+    ceil(K / block_k)] (2D blocks), for fp16/bf16 ``a`` of at most 8 rows."""
+    return torch.ops._rocm_C.gemv_fp8_rdna2(a, w, scale, block_n, block_k, bias)
+
+
+def dequant_fp8_rdna2(
+    out: torch.Tensor,
+    w: torch.Tensor,
+    scale: torch.Tensor,
+    block_n: int,
+    block_k: int,
+) -> None:
+    """Writes fp8 ``w`` times its scales (as in ``gemv_fp8_rdna2``) to the
+    fp16/bf16 ``out`` of the same shape."""
+    torch.ops._rocm_C.dequant_fp8_rdna2(out, w, scale, block_n, block_k)
+
+
 def gemm_w4a16_exl_rdna2(
     a: torch.Tensor,
     w: torch.Tensor,
@@ -2183,6 +2209,38 @@ def moe_int8_decode_rdna2(
     fp16 activations; ``act`` is a ``[M * topk, I]`` workspace."""
     torch.ops._rocm_C.moe_int8_decode_rdna2(
         output, x, topk_ids, topk_weights, w13, w13_scale, w2, w2_scale, act
+    )
+
+
+def moe_fp8_decode_rdna2(
+    output: torch.Tensor,
+    x: torch.Tensor,
+    topk_ids: torch.Tensor,
+    topk_weights: torch.Tensor,
+    w13: torch.Tensor,
+    w13_scale: torch.Tensor,
+    w2: torch.Tensor,
+    w2_scale: torch.Tensor,
+    block_n: int,
+    block_k: int,
+    act: torch.Tensor,
+) -> None:
+    """RDNA2 fp8-weight fused-MoE decode (SiLU) into ``output``, on ``[E, N,
+    K]`` float8_e4m3fn weights with fp32 scales ``[E]`` or ``[E, ceil(N /
+    block_n), S]`` (S == 1 or ceil(K / block_k)), with fp16 activations;
+    ``act`` is a ``[M * topk, I]`` workspace."""
+    torch.ops._rocm_C.moe_fp8_decode_rdna2(
+        output,
+        x,
+        topk_ids,
+        topk_weights,
+        w13,
+        w13_scale,
+        w2,
+        w2_scale,
+        block_n,
+        block_k,
+        act,
     )
 
 
@@ -2251,6 +2309,40 @@ def moe_wna16_gemm_rdna2(
     )
 
 
+def moe_fp8_gemm_rdna2(
+    output: torch.Tensor,
+    a: torch.Tensor,
+    w: torch.Tensor,
+    scales: torch.Tensor,
+    block_n: int,
+    block_k: int,
+    sorted_ids: torch.Tensor,
+    expert_ids: torch.Tensor,
+    num_tokens_post_padded: torch.Tensor,
+    topk_weights: torch.Tensor,
+    top_k: int,
+    mul_routed_weight: bool,
+    block_m: int,
+) -> None:
+    """``moe_wna16_gemm_rdna2`` on ``[E, N, K]`` float8_e4m3fn weights with
+    fp32 scales as in ``moe_fp8_decode_rdna2``."""
+    torch.ops._rocm_C.moe_fp8_gemm_rdna2(
+        output,
+        a,
+        w,
+        scales,
+        block_n,
+        block_k,
+        sorted_ids,
+        expert_ids,
+        num_tokens_post_padded,
+        topk_weights,
+        top_k,
+        mul_routed_weight,
+        block_m,
+    )
+
+
 def moe_int8_gemm_rdna2(
     output: torch.Tensor,
     a: torch.Tensor,
@@ -2297,10 +2389,13 @@ def unified_attention_rdna2(
     window: int = 0,
     softcap: float = 0.0,
     sinks: torch.Tensor | None = None,
+    k_scale: torch.Tensor | None = None,
+    v_scale: torch.Tensor | None = None,
 ) -> None:
     """RDNA2 paged causal GQA attention: fp16 ``q`` [tokens, heads, D] against
     ``k_cache`` / ``v_cache`` [blocks, block_size, kv_heads, D] (D in 64, 128,
-    256) with unified_attention's varlen metadata, into ``out``. ``window`` > 0
+    256; fp16, or float8_e4m3fn with fp32 per-tensor ``k_scale`` / ``v_scale``)
+    with unified_attention's varlen metadata, into ``out``. ``window`` > 0
     keeps each query's last ``window`` keys; ``softcap`` > 0 caps the scores;
     ``sinks`` (fp32, one per query head) join each softmax normalizer."""
     torch.ops._rocm_C.unified_attention_rdna2(
@@ -2315,6 +2410,8 @@ def unified_attention_rdna2(
         window,
         softcap,
         sinks,
+        k_scale,
+        v_scale,
     )
 
 
@@ -2331,9 +2428,16 @@ def decode_attention_rdna2(
     tile: int,
     max_seqlen_q: int,
     scale: float,
+    k_scale: torch.Tensor | None = None,
+    v_scale: torch.Tensor | None = None,
+    window: int = 0,
+    softcap: float = 0.0,
+    sinks: torch.Tensor | None = None,
 ) -> None:
-    """RDNA2 split-KV decode / spec-verify attention (head 256): writes the
-    per-segment partials of unified_attention's 3D path for reduce_segments."""
+    """RDNA2 split-KV decode / spec-verify attention (head 64 / 128 / 256;
+    caches, scales, window, softcap and sinks as for
+    ``unified_attention_rdna2``): writes the per-segment partials of
+    unified_attention's 3D path for reduce_segments."""
     torch.ops._rocm_C.decode_attention_rdna2(
         q,
         k_cache,
@@ -2347,6 +2451,11 @@ def decode_attention_rdna2(
         tile,
         max_seqlen_q,
         scale,
+        k_scale,
+        v_scale,
+        window,
+        softcap,
+        sinks,
     )
 
 

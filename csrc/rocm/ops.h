@@ -48,6 +48,24 @@ torch::Tensor gemv_w8a16_rdna2(const at::Tensor& a, const at::Tensor& w,
                                const at::Tensor& scale,
                                const std::optional<at::Tensor>& bias);
 
+torch::Tensor gemv_fp8_rdna2(const at::Tensor& a, const at::Tensor& w,
+                             const at::Tensor& scale, int64_t block_n,
+                             int64_t block_k,
+                             const std::optional<at::Tensor>& bias);
+
+void dequant_fp8_rdna2(torch::Tensor& out, const at::Tensor& w,
+                       const at::Tensor& scale, int64_t block_n,
+                       int64_t block_k);
+
+torch::Tensor gemm_rocblas_rdna2(const at::Tensor& a, const at::Tensor& w,
+                                 int64_t solution, bool w_kn);
+
+std::vector<int64_t> gemm_rocblas_solutions_rdna2(const at::Tensor& a,
+                                                  const at::Tensor& w,
+                                                  bool w_kn);
+
+std::string rocblas_version_rdna2();
+
 torch::Tensor gemm_w4a16_exl_rdna2(const at::Tensor& a, const at::Tensor& w,
                                    const at::Tensor& zeros,
                                    const at::Tensor& scales, bool symmetric,
@@ -59,6 +77,22 @@ void moe_int8_decode_rdna2(torch::Tensor& output, const torch::Tensor& x,
                            const torch::Tensor& w13, const torch::Tensor& s13,
                            const torch::Tensor& w2, const torch::Tensor& s2,
                            torch::Tensor& act);
+
+void moe_fp8_decode_rdna2(torch::Tensor& output, const torch::Tensor& x,
+                          const torch::Tensor& topk_ids,
+                          const torch::Tensor& topk_weights,
+                          const torch::Tensor& w13, const torch::Tensor& s13,
+                          const torch::Tensor& w2, const torch::Tensor& s2,
+                          int64_t block_n, int64_t block_k, torch::Tensor& act);
+
+void moe_fp8_gemm_rdna2(torch::Tensor& output, const torch::Tensor& a,
+                        const torch::Tensor& w, const torch::Tensor& scales,
+                        int64_t block_n, int64_t block_k,
+                        const torch::Tensor& sorted_ids,
+                        const torch::Tensor& expert_ids,
+                        const torch::Tensor& num_tokens_post_padded,
+                        const torch::Tensor& topk_weights, int64_t top_k,
+                        bool mul_routed_weight, int64_t block_m);
 
 void moe_wna16_decode_rdna2(torch::Tensor& output, const torch::Tensor& x,
                             const torch::Tensor& topk_ids,
@@ -94,17 +128,19 @@ void unified_attention_rdna2(torch::Tensor& out, const torch::Tensor& q,
                              const torch::Tensor& seqused_k,
                              const torch::Tensor& block_table, double scale,
                              int64_t window, double softcap,
-                             const std::optional<torch::Tensor>& sinks);
+                             const std::optional<torch::Tensor>& sinks,
+                             const std::optional<torch::Tensor>& k_scale,
+                             const std::optional<torch::Tensor>& v_scale);
 
-void decode_attention_rdna2(const torch::Tensor& q,
-                            const torch::Tensor& k_cache,
-                            const torch::Tensor& v_cache,
-                            torch::Tensor& segm_out, torch::Tensor& segm_max,
-                            torch::Tensor& segm_sum,
-                            const torch::Tensor& cu_seqlens_q,
-                            const torch::Tensor& seqused_k,
-                            const torch::Tensor& block_table, int64_t tile,
-                            int64_t max_seqlen_q, double scale);
+void decode_attention_rdna2(
+    const torch::Tensor& q, const torch::Tensor& k_cache,
+    const torch::Tensor& v_cache, torch::Tensor& segm_out,
+    torch::Tensor& segm_max, torch::Tensor& segm_sum,
+    const torch::Tensor& cu_seqlens_q, const torch::Tensor& seqused_k,
+    const torch::Tensor& block_table, int64_t tile, int64_t max_seqlen_q,
+    double scale, const std::optional<torch::Tensor>& k_scale,
+    const std::optional<torch::Tensor>& v_scale, int64_t window, double softcap,
+    const std::optional<torch::Tensor>& sinks);
 
 void gdn_post_conv_rdna2(const torch::Tensor& conv_output,
                          const torch::Tensor& a, const torch::Tensor& b,

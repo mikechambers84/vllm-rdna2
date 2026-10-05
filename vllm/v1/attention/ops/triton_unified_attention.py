@@ -70,6 +70,28 @@ def _rdna2_attention_operands_ok(*tensors: torch.Tensor) -> bool:
     )
 
 
+def _rdna2_kv_ok(
+    q: torch.Tensor,
+    k: torch.Tensor,
+    v: torch.Tensor,
+    kv_quant_mode: KVQuantMode,
+) -> bool:
+    """fp16 caches, or fp8 e4m3fn caches with per-tensor scales (fp16 q)."""
+    if kv_quant_mode == KVQuantMode.NONE:
+        return _rdna2_attention_operands_ok(q, k, v)
+    return (
+        kv_quant_mode == KVQuantMode.FP8_PER_TENSOR
+        and k.dtype == v.dtype == torch.float8_e4m3fn
+        and _rdna2_attention_operands_ok(q)
+        and all(
+            t.stride(-1) == 1
+            and t.data_ptr() % 16 == 0
+            and all(st % 16 == 0 for st in t.stride()[:-1])
+            for t in (k, v)
+        )
+    )
+
+
 @triton.jit
 def _cast_kv_tile(data, Q, tensor_scale, KV_QUANT_MODE: tl.constexpr):
     """Cast a loaded KV tile to Q's dtype, dequantizing if needed.
@@ -1002,12 +1024,12 @@ def unified_attention(
         and not use_per_seq_causal
         and not (use_alibi_slopes or use_qq_bias or use_mm_prefix or use_rswa)
         and chunk_lookback < 0
-        and kv_quant_mode == KVQuantMode.NONE
         and output_scale is None
         and not use_td
         and not is_batch_invariant
         and _rdna2_attention_available()
-        and _rdna2_attention_operands_ok(q, k, v, out)
+        and _rdna2_attention_operands_ok(out)
+        and _rdna2_kv_ok(q, k, v, kv_quant_mode)
         and block_table.dtype == torch.int32
         and block_table.stride(1) == 1
     ):
@@ -1025,6 +1047,8 @@ def unified_attention(
             window=1 + window_size[0] if window_size[0] >= 0 else 0,
             softcap=softcap or 0.0,
             sinks=None if sinks is None else sinks.float().contiguous(),
+            k_scale=k_descale if k.dtype != torch.float16 else None,
+            v_scale=v_descale if k.dtype != torch.float16 else None,
         )
         return
 
@@ -1200,18 +1224,14 @@ def unified_attention(
 
     rdna2_decode = (
         use_3d
-        and head_size == 256
+        and head_size in (64, 128, 256)
         and use_causal
         and not use_per_seq_causal
-        and window_size[0] < 0
-        and not softcap
-        and sinks is None
         and not (use_alibi_slopes or use_qq_bias or use_mm_prefix or use_rswa)
         and chunk_lookback < 0
-        and kv_quant_mode == KVQuantMode.NONE
         and not use_td
         and _rdna2_attention_available()
-        and _rdna2_attention_operands_ok(q, k, v)
+        and _rdna2_kv_ok(q, k, v, kv_quant_mode)
         and block_table.dtype == torch.int32
         and block_table.stride(1) == 1
         and softmax_segm_output.dtype == torch.float32
@@ -1233,6 +1253,11 @@ def unified_attention(
             RDNA2_DECODE_TILE,
             max_seqlen_q,
             softmax_scale,
+            k_scale=k_descale if k.dtype != torch.float16 else None,
+            v_scale=v_descale if k.dtype != torch.float16 else None,
+            window=1 + window_size[0] if window_size[0] >= 0 else 0,
+            softcap=softcap or 0.0,
+            sinks=None if sinks is None else sinks.float().contiguous(),
         )
     else:
         kernel_unified_attention[grid](

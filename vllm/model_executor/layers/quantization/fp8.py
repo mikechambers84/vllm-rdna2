@@ -14,6 +14,7 @@ from vllm.model_executor.kernels.linear import (
 from vllm.model_executor.kernels.linear.scaled_mm import (
     CutlassFP8ScaledMMLinearKernel,
     MarlinFP8ScaledMMLinearKernel,
+    RDNA2FP8ScaledMMLinearKernel,
 )
 from vllm.model_executor.layers.attention import Attention
 from vllm.model_executor.layers.fused_moe import (
@@ -353,7 +354,11 @@ class Fp8LinearMethod(LinearMethodBase):
             module_name=self.__class__.__name__,
         )
 
-        self.use_marlin = isinstance(self.fp8_linear, MarlinFP8ScaledMMLinearKernel)
+        # Weight-only kernels take the checkpoint's shards and scales as is.
+        self.use_marlin = isinstance(
+            self.fp8_linear,
+            (MarlinFP8ScaledMMLinearKernel, RDNA2FP8ScaledMMLinearKernel),
+        )
 
     def process_weights_after_loading(self, layer: torch.nn.Module) -> None:
         if is_weights_pre_processed():
