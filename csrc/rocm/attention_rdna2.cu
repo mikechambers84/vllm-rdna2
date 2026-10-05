@@ -22,6 +22,12 @@
 // lanes of a DPP row, row sums once at the end. Tiles are scheduled longest
 // first. Head 256 runs 14-15 TFLOPS on a V620 at 140 W (2.5-2.9x the Triton
 // unified kernel), head 128 4.2-4.6x, head 64 3.1x.
+//
+// decode_attention_rdna2: the split-KV (3D) decode / spec-verify path for head
+// 256: one workgroup per (sequence x 16-row group, KV head, segment) on the
+// same 64-key LDS tiles (S: 1 row x 4 keys per thread, PV: 1 row x 16
+// columns), writing the segment partials that unified_attention's
+// reduce_segments combines. 1.4-1.9x the Triton 3D kernel (240-330 GB/s).
 
 #include <torch/all.h>
 #include <c10/cuda/CUDAGuard.h>
@@ -376,6 +382,248 @@ __global__ void __launch_bounds__(THREADS) unified_attention_rdna2_kernel(
   }
 }
 
+// Split-KV decode / spec-verify attention: 16 rows (query token, q-head) per
+// workgroup, the prefill kernel's 64-key tiles (S: 1 row x 4 keys per thread,
+// PV: 1 row x D/16 columns), segment partials for reduce_segments.
+template <int D, int DC>
+__global__ void __launch_bounds__(THREADS) decode_attention_rdna2_kernel(
+    const __half* __restrict__ Q, const __half* __restrict__ Kc,
+    const __half* __restrict__ Vc, float* __restrict__ segm_out,
+    float* __restrict__ segm_max, float* __restrict__ segm_sum,
+    const int* __restrict__ cu_q, const int* __restrict__ seqused_k,
+    const int* __restrict__ block_table, const int G, const int HQ,
+    const int block_size, const long bt_stride, const long q_st,
+    const long q_sh, const long k_sb, const long k_st, const long k_sh,
+    const long v_sb, const long v_st, const long v_sh, const int tile,
+    const int nseg, const int dpad, const int rgroups,
+    const float scale_log2e) {
+  constexpr float LOG2E = 1.4426950408889634f;
+  constexpr int RB = 16;  // rows per workgroup
+  constexpr int D2 = D / 2;
+  constexpr int TN = D / 16;
+  constexpr int Q_ITEMS = (RB * (D / 8) + THREADS - 1) / THREADS;
+  constexpr int KS = D / DC;
+  constexpr int KL = DC / 8;
+  constexpr int K_ITEMS = BN * KL / THREADS;
+  constexpr int K_STAGE = (DC / 2) * BN;
+  constexpr int VS = BN / VC;
+  constexpr int V_TOTAL = (VC / 2) * (D / 8);
+  constexpr int V_ITEMS = (V_TOTAL + THREADS - 1) / THREADS;
+  constexpr int V_STAGE = (VC / 2) * D;
+  constexpr int U_STAGE = K_STAGE > V_STAGE ? K_STAGE : V_STAGE;
+  constexpr int PLD =
+      RB + 1;  // sP row stride: conflict-free transposing stores
+  __shared__ __align__(16) uint32_t sQ[D2][RB];
+  __shared__ __align__(16) uint32_t sU[2][U_STAGE];
+  __shared__ uint32_t sP[(BN / 2) * PLD];
+
+  const int tid = threadIdx.x, tx = tid % 16, ty = tid / 16;
+  const int s = blockIdx.x / rgroups, rg = blockIdx.x % rgroups;
+  const int kvh = blockIdx.y, seg = blockIdx.z;
+  const int q0 = cu_q[s], qlen = cu_q[s + 1] - q0;
+  const int klen = seqused_k[s];
+  const int ctx = klen - qlen;
+  const int tps = (klen + nseg * tile - 1) / (nseg * tile);
+  const int k0 = seg * tps * tile;
+  if (k0 >= klen || qlen <= 0 || rg * RB >= qlen * G) return;
+  const int k1 = min(k0 + tps * tile, klen);
+  const int* bt = block_table + s * bt_stride;
+
+  #pragma unroll
+  for (int it = 0; it < Q_ITEMS; it++) {
+    const int idx = tid + it * THREADS;
+    if (idx >= RB * (D / 8)) break;
+    const int r = idx % RB, c = idx / RB;
+    const int row = rg * RB + r, tq = row / G, g = row % G;
+    uint4 v = make_uint4(0, 0, 0, 0);
+    if (tq < qlen)
+      v = *reinterpret_cast<const uint4*>(Q + (q0 + tq) * q_st +
+                                          (kvh * G + g) * q_sh + c * 8);
+    sQ[c * 4 + 0][r] = v.x;
+    sQ[c * 4 + 1][r] = v.y;
+    sQ[c * 4 + 2][r] = v.z;
+    sQ[c * 4 + 3][r] = v.w;
+  }
+  const int my_row = rg * RB + ty, my_tq = my_row / G, my_g = my_row % G;
+  const int lim = my_tq < qlen ? ctx + my_tq : -1;  // key <= lim
+
+  float acc[TN];
+  #pragma unroll
+  for (int j = 0; j < TN; j++) acc[j] = 0.f;
+  float m_i = -INFINITY, l_i = 0.f;
+
+  auto k_off = [&](int key) -> long {
+    return bt[key / block_size] * k_sb + key % block_size * k_st + kvh * k_sh;
+  };
+  auto v_off = [&](int key) -> long {
+    return bt[key / block_size] * v_sb + key % block_size * v_st + kvh * v_sh;
+  };
+  long krow[K_ITEMS];
+  uint4 kr[K_ITEMS];
+  auto kaddr = [&](int kt) {
+  #pragma unroll
+    for (int it = 0; it < K_ITEMS; it++) {
+      const int key = kt + (tid + it * THREADS) / KL;
+      krow[it] = key < k1 ? k_off(key) : -1;
+    }
+  };
+  auto kload = [&](int dc) {
+  #pragma unroll
+    for (int it = 0; it < K_ITEMS; it++) {
+      const int part = (tid + it * THREADS) % KL;
+      kr[it] = krow[it] >= 0 ? *reinterpret_cast<const uint4*>(
+                                   Kc + krow[it] + dc * DC + part * 8)
+                             : make_uint4(0, 0, 0, 0);
+    }
+  };
+  auto kstore = [&](int buf) {
+  #pragma unroll
+    for (int it = 0; it < K_ITEMS; it++) {
+      const int idx = tid + it * THREADS;
+      const int key = idx / KL, part = idx % KL;
+      uint32_t* d = &sU[buf][part * 4 * BN + (key ^ (part * (32 / KL)))];
+      d[0] = kr[it].x;
+      d[BN] = kr[it].y;
+      d[2 * BN] = kr[it].z;
+      d[3 * BN] = kr[it].w;
+    }
+  };
+  uint4 va[V_ITEMS], vb[V_ITEMS];
+  auto vload = [&](int kt, int vc) {
+  #pragma unroll
+    for (int it = 0; it < V_ITEMS; it++) {
+      const int idx = tid + it * THREADS;
+      const int kp = idx / (D / 8), c = idx % (D / 8);
+      const int key0 = kt + vc * VC + kp * 2;
+      va[it] = idx < V_TOTAL && key0 < k1
+                   ? *reinterpret_cast<const uint4*>(Vc + v_off(key0) + c * 8)
+                   : make_uint4(0, 0, 0, 0);
+      vb[it] =
+          idx < V_TOTAL && key0 + 1 < k1
+              ? *reinterpret_cast<const uint4*>(Vc + v_off(key0 + 1) + c * 8)
+              : make_uint4(0, 0, 0, 0);
+    }
+  };
+  auto vstore = [&](int buf) {
+  #pragma unroll
+    for (int it = 0; it < V_ITEMS; it++) {
+      const int idx = tid + it * THREADS;
+      if (idx >= V_TOTAL) continue;
+      const int kp = idx / (D / 8), c = idx % (D / 8);
+      const uint32_t* a = reinterpret_cast<const uint32_t*>(&va[it]);
+      const uint32_t* b = reinterpret_cast<const uint32_t*>(&vb[it]);
+      uint32_t w[8];
+  #pragma unroll
+      for (int e = 0; e < 4; e++) {
+        w[2 * e] = (a[e] & 0xFFFFu) | (b[e] << 16);
+        w[2 * e + 1] = (a[e] >> 16) | (b[e] & 0xFFFF0000u);
+      }
+      uint32_t* d = &sU[buf][kp * D + c * 8];
+      *reinterpret_cast<uint4*>(d) = make_uint4(w[0], w[1], w[2], w[3]);
+      *reinterpret_cast<uint4*>(d + 4) = make_uint4(w[4], w[5], w[6], w[7]);
+    }
+  };
+
+  kaddr(k0);
+  kload(0);
+  for (int kt = k0; kt < k1; kt += BN) {
+    kstore(0);
+    __syncthreads();
+    float sacc[4] = {0.f, 0.f, 0.f, 0.f};
+    for (int dc = 0; dc < KS; dc++) {
+      const int cur = dc & 1;
+      if (dc + 1 < KS)
+        kload(dc + 1);
+      else
+        vload(kt, 0);
+  #pragma unroll 8
+      for (int k2 = 0; k2 < DC / 2; k2++) {
+        const int sw = ((k2 >> 2) % KL) * (32 / KL);
+        const half2 a = as_h2(sQ[dc * (DC / 2) + k2][ty]);
+        const uint4 kb = *reinterpret_cast<const uint4*>(
+            &sU[cur][k2 * BN + ((tx * 4) ^ sw)]);
+        sacc[0] = __builtin_amdgcn_fdot2(a, as_h2(kb.x), sacc[0], false);
+        sacc[1] = __builtin_amdgcn_fdot2(a, as_h2(kb.y), sacc[1], false);
+        sacc[2] = __builtin_amdgcn_fdot2(a, as_h2(kb.z), sacc[2], false);
+        sacc[3] = __builtin_amdgcn_fdot2(a, as_h2(kb.w), sacc[3], false);
+      }
+      if (dc + 1 < KS) {
+        kstore(cur ^ 1);
+        __syncthreads();
+      }
+    }
+    float sv[4], mx = -INFINITY;
+  #pragma unroll
+    for (int j = 0; j < 4; j++) {
+      const int key = kt + tx * 4 + j;
+      sv[j] = (key < k1 && key <= lim) ? sacc[j] * scale_log2e : -INFINITY;
+      mx = fmaxf(mx, sv[j]);
+    }
+    mx = row16_max(mx);
+    const float m_new = fmaxf(fmaxf(m_i, mx), -1e30f);
+    const float alpha = exp2f(m_i - m_new);
+    m_i = m_new;
+    float p[4], ps = 0.f;
+  #pragma unroll
+    for (int j = 0; j < 4; j++) {
+      p[j] = exp2f(sv[j] - m_new);
+      ps += p[j];
+    }
+    l_i = l_i * alpha + ps;
+  #pragma unroll
+    for (int j = 0; j < TN; j++) acc[j] *= alpha;
+    {
+      const half2 h0 = __floats2half2_rn(p[0], p[1]);
+      const half2 h1 = __floats2half2_rn(p[2], p[3]);
+      sP[(tx * 2) * PLD + ty] = *reinterpret_cast<const uint32_t*>(&h0);
+      sP[(tx * 2 + 1) * PLD + ty] = *reinterpret_cast<const uint32_t*>(&h1);
+    }
+    vstore(0);
+    __syncthreads();
+    for (int vc = 0; vc < VS; vc++) {
+      const int cur = vc & 1;
+      if (vc + 1 < VS) {
+        vload(kt, vc + 1);
+      } else if (kt + BN < k1) {
+        kaddr(kt + BN);
+        kload(0);
+      }
+  #pragma unroll
+      for (int k2 = 0; k2 < VC / 2; k2++) {
+        const half2 a = as_h2(sP[(vc * (VC / 2) + k2) * PLD + ty]);
+  #pragma unroll
+        for (int j = 0; j < TN; j += 4) {
+          const uint4 vv = *reinterpret_cast<const uint4*>(
+              &sU[cur][k2 * D + j * 16 + tx * 4]);
+          acc[j] = __builtin_amdgcn_fdot2(a, as_h2(vv.x), acc[j], false);
+          acc[j + 1] =
+              __builtin_amdgcn_fdot2(a, as_h2(vv.y), acc[j + 1], false);
+          acc[j + 2] =
+              __builtin_amdgcn_fdot2(a, as_h2(vv.z), acc[j + 2], false);
+          acc[j + 3] =
+              __builtin_amdgcn_fdot2(a, as_h2(vv.w), acc[j + 3], false);
+        }
+      }
+      if (vc + 1 < VS) {
+        vstore(cur ^ 1);
+        __syncthreads();
+      }
+    }
+  }
+  const float l = row16_sum(l_i);
+  if (my_tq >= qlen) return;
+  const long base = ((long)(q0 + my_tq) * HQ + kvh * G + my_g) * nseg + seg;
+  float* o = segm_out + base * dpad;
+  #pragma unroll
+  for (int j = 0; j < TN; j += 4)
+    *reinterpret_cast<float4*>(o + j * 16 + tx * 4) =
+        make_float4(acc[j], acc[j + 1], acc[j + 2], acc[j + 3]);
+  if (tx == 0) {
+    segm_max[base] = m_i / LOG2E;
+    segm_sum[base] = l;
+  }
+}
+
 #else  // non-RDNA2 device pass: empty stub for symbol parity.
 
 template <int D, int DC, bool EXT>
@@ -385,6 +633,14 @@ __global__ void unified_attention_rdna2_kernel(
     const long, const long, const long, const long, const long, const long,
     const long, const long, const long, const long, const long, const float,
     const int, const float, const float*) {}
+
+template <int D, int DC>
+__global__ void decode_attention_rdna2_kernel(
+    const __half*, const __half*, const __half*, float*, float*, float*,
+    const int*, const int*, const int*, const int, const int, const int,
+    const long, const long, const long, const long, const long, const long,
+    const long, const long, const long, const int, const int, const int,
+    const int, const float) {}
 
 #endif  // __HIP__RDNA2__ || !__HIP_DEVICE_COMPILE__
 
@@ -484,4 +740,69 @@ void unified_attention_rdna2(torch::Tensor& out, const torch::Tensor& q,
   }
 #undef VLLM_ATTN_RDNA2_BY_EXT
 #undef VLLM_ATTN_RDNA2_LAUNCH
+}
+
+// Split-KV decode / spec-verify attention for head 256 (fp16): q [num_tokens,
+// num_q_heads, 256], paged caches as for unified_attention_rdna2; writes the
+// unnormalized per-segment outputs segm_out [>= num_tokens, num_q_heads, S,
+// 256] fp32 and their maxima (natural log) / exp sums segm_max, segm_sum
+// [>= num_tokens, num_q_heads, S], segments of ceil(len / (S * tile)) * tile
+// keys as in reduce_segments.
+void decode_attention_rdna2(const torch::Tensor& q,
+                            const torch::Tensor& k_cache,
+                            const torch::Tensor& v_cache,
+                            torch::Tensor& segm_out, torch::Tensor& segm_max,
+                            torch::Tensor& segm_sum,
+                            const torch::Tensor& cu_seqlens_q,
+                            const torch::Tensor& seqused_k,
+                            const torch::Tensor& block_table, int64_t tile,
+                            int64_t max_seqlen_q, double scale) {
+  using namespace vllm::attention_rdna2;
+  TORCH_CHECK(q.dtype() == torch::kFloat16 &&
+                  k_cache.dtype() == torch::kFloat16 &&
+                  v_cache.dtype() == torch::kFloat16 &&
+                  segm_out.dtype() == torch::kFloat32 &&
+                  segm_max.dtype() == torch::kFloat32 &&
+                  segm_sum.dtype() == torch::kFloat32,
+              "decode_attention_rdna2: fp16 q / caches, fp32 segment scratch");
+  const int HQ = q.size(1), D = q.size(2), HKV = k_cache.size(2);
+  TORCH_CHECK(D == 256 && k_cache.size(3) == D &&
+                  v_cache.sizes() == k_cache.sizes() && HQ % HKV == 0,
+              "decode_attention_rdna2 supports head size 256");
+  for (const torch::Tensor* t : {&q, &k_cache, &v_cache}) {
+    TORCH_CHECK(t->stride(-1) == 1 &&
+                    reinterpret_cast<uintptr_t>(t->data_ptr()) % 16 == 0,
+                "decode_attention_rdna2 needs 16-byte aligned heads");
+    for (int d = 0; d < t->dim() - 1; d++)
+      TORCH_CHECK(t->stride(d) % 8 == 0,
+                  "decode_attention_rdna2 needs 16-byte aligned head strides");
+  }
+  const int nseg = segm_max.size(2);
+  TORCH_CHECK(segm_out.is_contiguous() && segm_max.is_contiguous() &&
+                  segm_sum.is_contiguous() && segm_out.size(1) == HQ &&
+                  segm_out.size(2) == nseg && segm_out.size(3) >= D &&
+                  segm_max.size(0) >= q.size(0),
+              "decode_attention_rdna2: segment scratch shape");
+  TORCH_CHECK(cu_seqlens_q.dtype() == torch::kInt32 &&
+                  seqused_k.dtype() == torch::kInt32 &&
+                  block_table.dtype() == torch::kInt32 &&
+                  block_table.stride(1) == 1,
+              "decode_attention_rdna2: int32 metadata");
+  const int num_seqs = cu_seqlens_q.size(0) - 1;
+  if (num_seqs <= 0 || q.size(0) == 0) return;
+  const int G = HQ / HKV;
+  const int rgroups = (max_seqlen_q * G + 15) / 16;
+  const at::cuda::OptionalCUDAGuard device_guard(device_of(q));
+  const cudaStream_t stream = at::cuda::getCurrentCUDAStream();
+  const dim3 grid(num_seqs * rgroups, HKV, nseg);
+  decode_attention_rdna2_kernel<256, 64><<<grid, THREADS, 0, stream>>>(
+      (const __half*)q.data_ptr(), (const __half*)k_cache.data_ptr(),
+      (const __half*)v_cache.data_ptr(), segm_out.data_ptr<float>(),
+      segm_max.data_ptr<float>(), segm_sum.data_ptr<float>(),
+      cu_seqlens_q.data_ptr<int>(), seqused_k.data_ptr<int>(),
+      block_table.data_ptr<int>(), G, HQ, k_cache.size(1),
+      block_table.stride(0), q.stride(0), q.stride(1), k_cache.stride(0),
+      k_cache.stride(1), k_cache.stride(2), v_cache.stride(0),
+      v_cache.stride(1), v_cache.stride(2), (int)tile, nseg, segm_out.size(3),
+      rgroups, (float)(scale * 1.4426950408889634));
 }

@@ -2303,6 +2303,38 @@ def unified_attention_rdna2(
     )
 
 
+def decode_attention_rdna2(
+    q: torch.Tensor,
+    k_cache: torch.Tensor,
+    v_cache: torch.Tensor,
+    segm_out: torch.Tensor,
+    segm_max: torch.Tensor,
+    segm_sum: torch.Tensor,
+    cu_seqlens_q: torch.Tensor,
+    seqused_k: torch.Tensor,
+    block_table: torch.Tensor,
+    tile: int,
+    max_seqlen_q: int,
+    scale: float,
+) -> None:
+    """RDNA2 split-KV decode / spec-verify attention (head 256): writes the
+    per-segment partials of unified_attention's 3D path for reduce_segments."""
+    torch.ops._rocm_C.decode_attention_rdna2(
+        q,
+        k_cache,
+        v_cache,
+        segm_out,
+        segm_max,
+        segm_sum,
+        cu_seqlens_q,
+        seqused_k,
+        block_table,
+        tile,
+        max_seqlen_q,
+        scale,
+    )
+
+
 def gdn_post_conv_rdna2(
     conv_output: torch.Tensor,
     a: torch.Tensor,

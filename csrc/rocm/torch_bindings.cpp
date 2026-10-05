@@ -118,6 +118,14 @@ TORCH_LIBRARY_EXPAND(TORCH_EXTENSION_NAME, rocm_ops) {
       "Tensor? sinks) -> ()");
   rocm_ops.impl("unified_attention_rdna2", torch::kCUDA,
                 &unified_attention_rdna2);
+  // Split-KV decode / spec-verify attention, head 256 (segment partials).
+  rocm_ops.def(
+      "decode_attention_rdna2(Tensor q, Tensor k_cache, Tensor v_cache, "
+      "Tensor! segm_out, Tensor! segm_max, Tensor! segm_sum, "
+      "Tensor cu_seqlens_q, Tensor seqused_k, Tensor block_table, int tile, "
+      "int max_seqlen_q, float scale) -> ()");
+  rocm_ops.impl("decode_attention_rdna2", torch::kCUDA,
+                &decode_attention_rdna2);
   // Gated DeltaNet prefill: post-conv1d q/k/v split, l2 norm and gating.
   rocm_ops.def(
       "gdn_post_conv_rdna2(Tensor conv_output, Tensor a, Tensor b, "
