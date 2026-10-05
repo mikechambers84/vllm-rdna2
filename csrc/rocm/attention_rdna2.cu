@@ -422,7 +422,11 @@ __global__ void __launch_bounds__(THREADS) unified_attention_rdna2_kernel(
 
 // Split-KV decode / spec-verify attention: 16 rows (query token, q-head) per
 // workgroup, the prefill kernel's 64-key tiles (S: 1 row x 4 keys per thread,
-// PV: 1 row x D/16 columns), segment partials for reduce_segments.
+// PV: 1 row x W/16 columns), segment partials for reduce_segments. Heads
+// narrower than W = 256 are packed: a workgroup takes PACK = W / D adjacent
+// kv heads with 16 / PACK rows each, every row's query is zero outside its
+// head's D-wide slice of the W-wide tiles, and each row writes only that
+// slice of its output (so low GQA ratios still fill the 16 rows).
 template <int D, int DC, bool KV8>
 __global__ void __launch_bounds__(THREADS) decode_attention_rdna2_kernel(
     const __half* __restrict__ Q, const void* __restrict__ Kc,
@@ -437,54 +441,62 @@ __global__ void __launch_bounds__(THREADS) decode_attention_rdna2_kernel(
     const float* __restrict__ k_scale, const float* __restrict__ v_scale) {
   constexpr float LOG2E = 1.4426950408889634f;
   constexpr int RB = 16;  // rows per workgroup
-  constexpr int D2 = D / 2;
-  constexpr int TN = D / 16;
-  constexpr int Q_ITEMS = (RB * (D / 8) + THREADS - 1) / THREADS;
-  constexpr int KS = D / DC;
+  constexpr int W = 256;  // tile width: PACK heads of D
+  constexpr int PACK = W / D;
+  constexpr int RH = RB / PACK;  // rows per head
+  constexpr int W2 = W / 2;
+  constexpr int TN = W / 16;
+  constexpr int Q_ITEMS = (RB * (W / 8) + THREADS - 1) / THREADS;
+  constexpr int KS = W / DC;
   constexpr int KL = DC / 8;
   constexpr int K_ITEMS = BN * KL / THREADS;
   constexpr int K_STAGE = (DC / 2) * BN;
   constexpr int VS = BN / VC;
-  constexpr int V_TOTAL = (VC / 2) * (D / 8);
+  constexpr int V_TOTAL = (VC / 2) * (W / 8);
   constexpr int V_ITEMS = (V_TOTAL + THREADS - 1) / THREADS;
-  constexpr int V_STAGE = (VC / 2) * D;
+  constexpr int V_STAGE = (VC / 2) * W;
+  static_assert(D % DC == 0 && PACK * D == W, "head packing");
+  const int HKV = HQ / G;
   constexpr int U_STAGE = K_STAGE > V_STAGE ? K_STAGE : V_STAGE;
   constexpr int PLD =
       RB + 1;  // sP row stride: conflict-free transposing stores
   const float scale_log2e = scale * LOG2E * kv_scale<KV8>(k_scale);
-  __shared__ __align__(16) uint32_t sQ[D2][RB];
+  __shared__ __align__(16) uint32_t sQ[W2][RB];
   __shared__ __align__(16) uint32_t sU[2][U_STAGE];
   __shared__ uint32_t sP[(BN / 2) * PLD];
 
   const int tid = threadIdx.x, tx = tid % 16, ty = tid / 16;
   const int s = blockIdx.x / rgroups, rg = blockIdx.x % rgroups;
-  const int kvh = blockIdx.y, seg = blockIdx.z;
+  const int kvh = blockIdx.y * PACK, seg = blockIdx.z;  // first packed head
   const int q0 = cu_q[s], qlen = cu_q[s + 1] - q0;
   const int klen = seqused_k[s];
   const int ctx = klen - qlen;
   const int tps = (klen + nseg * tile - 1) / (nseg * tile);
   const int k0 = seg * tps * tile;
-  if (k0 >= klen || qlen <= 0 || rg * RB >= qlen * G) return;
+  if (k0 >= klen || qlen <= 0 || rg * RH >= qlen * G) return;
   const int k1 = min(k0 + tps * tile, klen);
   const int* bt = block_table + s * bt_stride;
 
+  // Row r: head kvh + r / RH, query row rg * RH + r % RH of that head.
   #pragma unroll
   for (int it = 0; it < Q_ITEMS; it++) {
     const int idx = tid + it * THREADS;
-    if (idx >= RB * (D / 8)) break;
+    if (idx >= RB * (W / 8)) break;
     const int r = idx % RB, c = idx / RB;
-    const int row = rg * RB + r, tq = row / G, g = row % G;
+    const int hl = r / RH, row = rg * RH + r % RH, tq = row / G, g = row % G;
     uint4 v = make_uint4(0, 0, 0, 0);
-    if (tq < qlen)
-      v = *reinterpret_cast<const uint4*>(Q + (q0 + tq) * q_st +
-                                          (kvh * G + g) * q_sh + c * 8);
+    if (tq < qlen && c * 8 / D == hl && kvh + hl < HKV)
+      v = *reinterpret_cast<const uint4*>(
+          Q + (q0 + tq) * q_st + ((kvh + hl) * G + g) * q_sh + c * 8 % D);
     sQ[c * 4 + 0][r] = v.x;
     sQ[c * 4 + 1][r] = v.y;
     sQ[c * 4 + 2][r] = v.z;
     sQ[c * 4 + 3][r] = v.w;
   }
-  const int my_row = rg * RB + ty, my_tq = my_row / G, my_g = my_row % G;
-  const int lim = my_tq < qlen ? ctx + my_tq : -1;  // key <= lim
+  const int my_hl = ty / RH, my_row = rg * RH + ty % RH;
+  const int my_tq = my_row / G, my_g = my_row % G;
+  const bool my_ok = my_tq < qlen && kvh + my_hl < HKV;
+  const int lim = my_ok ? ctx + my_tq : -1;  // key <= lim
 
   float acc[TN];
   #pragma unroll
@@ -507,11 +519,15 @@ __global__ void __launch_bounds__(THREADS) decode_attention_rdna2_kernel(
     }
   };
   auto kload = [&](int dc) {
+    // Stage dc covers dims dc * DC .. of packed head dc * DC / D.
+    const int hl = dc * DC / D;
+    const long hoff = hl * k_sh + dc * DC % D;
   #pragma unroll
     for (int it = 0; it < K_ITEMS; it++) {
       const int part = (tid + it * THREADS) % KL;
-      kr[it] = krow[it] >= 0 ? kv_load<KV8>(Kc, krow[it] + dc * DC + part * 8)
-                             : KvRaw<KV8>{};
+      kr[it] = krow[it] >= 0 && kvh + hl < HKV
+                   ? kv_load<KV8>(Kc, krow[it] + hoff + part * 8)
+                   : KvRaw<KV8>{};
     }
   };
   auto kstore = [&](int buf) {
@@ -532,14 +548,15 @@ __global__ void __launch_bounds__(THREADS) decode_attention_rdna2_kernel(
   #pragma unroll
     for (int it = 0; it < V_ITEMS; it++) {
       const int idx = tid + it * THREADS;
-      const int kp = idx / (D / 8), c = idx % (D / 8);
+      const int kp = idx / (W / 8), c = idx % (W / 8);
       const int key0 = kt + vc * VC + kp * 2;
-      va[it] = idx < V_TOTAL && key0 < k1
-                   ? kv_load<KV8>(Vc, v_off(key0) + c * 8)
-                   : KvRaw<KV8>{};
-      vb[it] = idx < V_TOTAL && key0 + 1 < k1
-                   ? kv_load<KV8>(Vc, v_off(key0 + 1) + c * 8)
-                   : KvRaw<KV8>{};
+      const int hl = c * 8 / D;
+      const long hoff = hl * v_sh + c * 8 % D;
+      const bool ok = idx < V_TOTAL && kvh + hl < HKV;
+      va[it] =
+          ok && key0 < k1 ? kv_load<KV8>(Vc, v_off(key0) + hoff) : KvRaw<KV8>{};
+      vb[it] = ok && key0 + 1 < k1 ? kv_load<KV8>(Vc, v_off(key0 + 1) + hoff)
+                                   : KvRaw<KV8>{};
     }
   };
   auto vstore = [&](int buf) {
@@ -547,7 +564,7 @@ __global__ void __launch_bounds__(THREADS) decode_attention_rdna2_kernel(
     for (int it = 0; it < V_ITEMS; it++) {
       const int idx = tid + it * THREADS;
       if (idx >= V_TOTAL) continue;
-      const int kp = idx / (D / 8), c = idx % (D / 8);
+      const int kp = idx / (W / 8), c = idx % (W / 8);
       const uint4 av = kv_widen(va[it]), bv = kv_widen(vb[it]);
       const uint32_t* a = reinterpret_cast<const uint32_t*>(&av);
       const uint32_t* b = reinterpret_cast<const uint32_t*>(&bv);
@@ -557,7 +574,7 @@ __global__ void __launch_bounds__(THREADS) decode_attention_rdna2_kernel(
         w[2 * e] = (a[e] & 0xFFFFu) | (b[e] << 16);
         w[2 * e + 1] = (a[e] >> 16) | (b[e] & 0xFFFF0000u);
       }
-      uint32_t* d = &sU[buf][kp * D + c * 8];
+      uint32_t* d = &sU[buf][kp * W + c * 8];
       *reinterpret_cast<uint4*>(d) = make_uint4(w[0], w[1], w[2], w[3]);
       *reinterpret_cast<uint4*>(d + 4) = make_uint4(w[4], w[5], w[6], w[7]);
     }
@@ -633,7 +650,7 @@ __global__ void __launch_bounds__(THREADS) decode_attention_rdna2_kernel(
   #pragma unroll
         for (int j = 0; j < TN; j += 4) {
           const uint4 vv = *reinterpret_cast<const uint4*>(
-              &sU[cur][k2 * D + j * 16 + tx * 4]);
+              &sU[cur][k2 * W + j * 16 + tx * 4]);
           acc[j] = __builtin_amdgcn_fdot2(a, as_h2(vv.x), acc[j], false);
           acc[j + 1] =
               __builtin_amdgcn_fdot2(a, as_h2(vv.y), acc[j + 1], false);
@@ -650,14 +667,18 @@ __global__ void __launch_bounds__(THREADS) decode_attention_rdna2_kernel(
     }
   }
   const float l = row16_sum(l_i);
-  if (my_tq >= qlen) return;
-  const long base = ((long)(q0 + my_tq) * HQ + kvh * G + my_g) * nseg + seg;
-  float* o = segm_out + base * dpad;
+  if (!my_ok) return;
+  const long base =
+      ((long)(q0 + my_tq) * HQ + (kvh + my_hl) * G + my_g) * nseg + seg;
+  float* o = segm_out + base * dpad - my_hl * D;  // dims of the row's head
   const float vs = kv_scale<KV8>(v_scale);
   #pragma unroll
-  for (int j = 0; j < TN; j += 4)
-    *reinterpret_cast<float4*>(o + j * 16 + tx * 4) = make_float4(
-        acc[j] * vs, acc[j + 1] * vs, acc[j + 2] * vs, acc[j + 3] * vs);
+  for (int j = 0; j < TN; j += 4) {
+    const int col = j * 16 + tx * 4;
+    if (col / D == my_hl)
+      *reinterpret_cast<float4*>(o + col) = make_float4(
+          acc[j] * vs, acc[j + 1] * vs, acc[j + 2] * vs, acc[j + 3] * vs);
+  }
   if (tx == 0) {
     segm_max[base] = m_i / LOG2E;
     segm_sum[base] = l;
@@ -817,13 +838,12 @@ void unified_attention_rdna2(torch::Tensor& out, const torch::Tensor& q,
 #undef VLLM_ATTN_RDNA2_LAUNCH
 }
 
-// Split-KV decode / spec-verify attention for head 256: q [num_tokens,
-// num_q_heads, 256], paged caches (and scales) as for unified_attention_rdna2;
-// writes the
-// unnormalized per-segment outputs segm_out [>= num_tokens, num_q_heads, S,
-// 256] fp32 and their maxima (natural log) / exp sums segm_max, segm_sum
-// [>= num_tokens, num_q_heads, S], segments of ceil(len / (S * tile)) * tile
-// keys as in reduce_segments.
+// Split-KV decode / spec-verify attention for head 64, 128 or 256: q
+// [num_tokens, num_q_heads, D], paged caches (and scales) as for
+// unified_attention_rdna2; writes the unnormalized per-segment outputs
+// segm_out [>= num_tokens, num_q_heads, S, >= D] fp32 and their maxima
+// (natural log) / exp sums segm_max, segm_sum [>= num_tokens, num_q_heads, S],
+// segments of ceil(len / (S * tile)) * tile keys as in reduce_segments.
 void decode_attention_rdna2(
     const torch::Tensor& q, const torch::Tensor& k_cache,
     const torch::Tensor& v_cache, torch::Tensor& segm_out,
@@ -841,9 +861,9 @@ void decode_attention_rdna2(
   const bool kv8 = check_kv_dtype("decode_attention_rdna2", k_cache, v_cache,
                                   k_scale, v_scale);
   const int HQ = q.size(1), D = q.size(2), HKV = k_cache.size(2);
-  TORCH_CHECK(D == 256 && k_cache.size(3) == D &&
+  TORCH_CHECK((D == 64 || D == 128 || D == 256) && k_cache.size(3) == D &&
                   v_cache.sizes() == k_cache.sizes() && HQ % HKV == 0,
-              "decode_attention_rdna2 supports head size 256");
+              "decode_attention_rdna2 supports head sizes 64, 128 and 256");
   for (const torch::Tensor* t : {&q, &k_cache, &v_cache}) {
     TORCH_CHECK(t->stride(-1) == 1 &&
                     reinterpret_cast<uintptr_t>(t->data_ptr()) % 16 == 0,
@@ -865,11 +885,13 @@ void decode_attention_rdna2(
               "decode_attention_rdna2: int32 metadata");
   const int num_seqs = cu_seqlens_q.size(0) - 1;
   if (num_seqs <= 0 || q.size(0) == 0) return;
-  const int G = HQ / HKV;
-  const int rgroups = (max_seqlen_q * G + 15) / 16;
+  // Heads narrower than 256 are packed 256 / D per workgroup, 16 * D / 256
+  // query rows each.
+  const int G = HQ / HKV, pack = 256 / D, rows = 16 / pack;
+  const int rgroups = (max_seqlen_q * G + rows - 1) / rows;
   const at::cuda::OptionalCUDAGuard device_guard(device_of(q));
   const cudaStream_t stream = at::cuda::getCurrentCUDAStream();
-  const dim3 grid(num_seqs * rgroups, HKV, nseg);
+  const dim3 grid(num_seqs * rgroups, (HKV + pack - 1) / pack, nseg);
   auto launch = [&](auto kernel) {
     kernel<<<grid, THREADS, 0, stream>>>(
         (const __half*)q.data_ptr(), k_cache.data_ptr(), v_cache.data_ptr(),
@@ -882,9 +904,18 @@ void decode_attention_rdna2(
         nseg, segm_out.size(3), rgroups, (float)scale, scale_ptr(k_scale),
         scale_ptr(v_scale));
   };
-  if (kv8) {
-    launch(decode_attention_rdna2_kernel<256, 64, true>);
-  } else {
-    launch(decode_attention_rdna2_kernel<256, 64, false>);
+#define VLLM_DECODE_RDNA2_BY_KV(HD)                       \
+  if (kv8) {                                              \
+    launch(decode_attention_rdna2_kernel<HD, 64, true>);  \
+  } else {                                                \
+    launch(decode_attention_rdna2_kernel<HD, 64, false>); \
   }
+  if (D == 256) {
+    VLLM_DECODE_RDNA2_BY_KV(256);
+  } else if (D == 128) {
+    VLLM_DECODE_RDNA2_BY_KV(128);
+  } else {
+    VLLM_DECODE_RDNA2_BY_KV(64);
+  }
+#undef VLLM_DECODE_RDNA2_BY_KV
 }

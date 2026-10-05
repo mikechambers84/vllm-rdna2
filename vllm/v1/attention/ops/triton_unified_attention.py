@@ -1224,7 +1224,7 @@ def unified_attention(
 
     rdna2_decode = (
         use_3d
-        and head_size == 256
+        and head_size in (64, 128, 256)
         and use_causal
         and not use_per_seq_causal
         and window_size[0] < 0

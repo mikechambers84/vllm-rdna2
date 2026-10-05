@@ -1206,19 +1206,25 @@ def test_unified_attn_rdna2_prefill(
 
 @pytest.mark.skipif(not _rdna2_attention(), reason="gfx1030 HIP attention only")
 @pytest.mark.parametrize("q_len", [1, 3])
-@pytest.mark.parametrize("num_heads", [(24, 4), (16, 2)])
+@pytest.mark.parametrize("num_heads", [(24, 4), (16, 2), (32, 8), (12, 3)])
+@pytest.mark.parametrize("head_size", [256, 128, 64])
 @pytest.mark.parametrize("block_size", [16, 784])
 @torch.inference_mode()
 def test_unified_attn_rdna2_decode(
-    q_len: int, num_heads: tuple[int, int], block_size: int, monkeypatch
+    q_len: int,
+    num_heads: tuple[int, int],
+    head_size: int,
+    block_size: int,
+    monkeypatch,
 ) -> None:
-    """Head-256 decode and spec-decode verify batches (the 3D split-KV path) on
-    gfx1030 run the HIP segment kernel and match the reference."""
+    """Decode and spec-decode verify batches (the 3D split-KV path) on gfx1030
+    run the HIP segment kernel and match the reference; heads below 256 are
+    packed several per workgroup (odd kv head counts leave a partial pack)."""
     from vllm import _custom_ops as ops
 
     torch.set_default_device(DEVICE_TYPE)
     set_random_seed(0)
-    head_size, segments = 256, 32
+    segments = 32
     kv_lens = [37, 900, 3000, 8192]
     query_lens = [q_len] * len(kv_lens)
     num_query_heads, num_kv_heads = num_heads
