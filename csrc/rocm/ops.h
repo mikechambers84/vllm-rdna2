@@ -57,6 +57,15 @@ void dequant_fp8_rdna2(torch::Tensor& out, const at::Tensor& w,
                        const at::Tensor& scale, int64_t block_n,
                        int64_t block_k);
 
+torch::Tensor gemm_rocblas_rdna2(const at::Tensor& a, const at::Tensor& w,
+                                 int64_t solution, bool w_kn);
+
+std::vector<int64_t> gemm_rocblas_solutions_rdna2(const at::Tensor& a,
+                                                  const at::Tensor& w,
+                                                  bool w_kn);
+
+std::string rocblas_version_rdna2();
+
 torch::Tensor gemm_w4a16_exl_rdna2(const at::Tensor& a, const at::Tensor& w,
                                    const at::Tensor& zeros,
                                    const at::Tensor& scales, bool symmetric,

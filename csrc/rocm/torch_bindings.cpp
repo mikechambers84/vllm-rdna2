@@ -87,6 +87,18 @@ TORCH_LIBRARY_EXPAND(TORCH_EXTENSION_NAME, rocm_ops) {
       "dequant_fp8_rdna2(Tensor! out, Tensor w, Tensor scale, int block_n, "
       "int block_k) -> ()");
   rocm_ops.impl("dequant_fp8_rdna2", torch::kCUDA, &dequant_fp8_rdna2);
+  // fp16/bf16 GEMM with an explicit rocBLAS solution, and the solutions and
+  // rocBLAS version for tuning them.
+  rocm_ops.def(
+      "gemm_rocblas_rdna2(Tensor a, Tensor w, int solution, bool w_kn) -> "
+      "Tensor");
+  rocm_ops.impl("gemm_rocblas_rdna2", torch::kCUDA, &gemm_rocblas_rdna2);
+  rocm_ops.def(
+      "gemm_rocblas_solutions_rdna2(Tensor a, Tensor w, bool w_kn) -> int[]");
+  rocm_ops.impl("gemm_rocblas_solutions_rdna2", torch::kCUDA,
+                &gemm_rocblas_solutions_rdna2);
+  rocm_ops.def("rocblas_version_rdna2() -> str");
+  rocm_ops.impl("rocblas_version_rdna2", &rocblas_version_rdna2);
   // 4-bit GPTQ GEMM for decode and small batches on Exllama's weight layout.
   rocm_ops.def(
       "gemm_w4a16_exl_rdna2(Tensor a, Tensor w, Tensor zeros, Tensor scales, "

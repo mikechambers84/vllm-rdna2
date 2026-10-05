@@ -10,9 +10,12 @@ activations keep full precision, so a checkpoint's activation scheme (static
 or dynamic FP8) is ignored, as with Marlin on CUDA GPUs without FP8.
 """
 
+import math
+
 import torch
 
 from vllm import _custom_ops as ops
+from vllm.model_executor.kernels.linear import rdna2_gemm
 from vllm.model_executor.kernels.linear.rdna2_w8a16 import (
     reserve_dequant_workspace,
 )
@@ -30,6 +33,15 @@ _MAX_GEMV_TOKENS = 32
 # Bigger weights dequantize and multiply in row chunks of at most this many
 # elements, which bounds the shared workspace.
 _MAX_WORKSPACE_NUMEL = 64 << 20
+
+
+def _chunk_rows(n: int, k: int, block_n: int) -> int:
+    """Rows dequantized per GEMM: all of them when they fit
+    _MAX_WORKSPACE_NUMEL, else equal shares of whole scale blocks."""
+    if n * k <= _MAX_WORKSPACE_NUMEL:
+        return n
+    chunks = math.ceil(n * k / _MAX_WORKSPACE_NUMEL)
+    return math.ceil(math.ceil(n / block_n) / chunks) * block_n
 
 
 def _rdna2_fp8_linear(
@@ -53,11 +65,11 @@ def _rdna2_fp8_linear(
                 ]
             )
             return out.reshape(*x.shape[:-1], n)
-    rows = workspace.numel() // k // block_n * block_n
+    rows = _chunk_rows(n, k, block_n)
     if rows >= n:
         dense = workspace.view(x.dtype)[: n * k].view(n, k)
         ops.dequant_fp8_rdna2(dense, weight, scale, block_n, block_k)
-        return torch.nn.functional.linear(x, dense, bias)
+        return rdna2_gemm.linear(x, dense, bias)
     out = x_2d.new_empty(x_2d.shape[0], n)
     for n0 in range(0, n, rows):
         nr = min(rows, n - n0)
@@ -70,7 +82,7 @@ def _rdna2_fp8_linear(
             block_n,
             block_k,
         )
-        out[:, n0 : n0 + nr] = x_2d @ dense.t()
+        out[:, n0 : n0 + nr] = rdna2_gemm.linear(x_2d, dense)
     if bias is not None:
         out += bias
     return out.reshape(*x.shape[:-1], n)
@@ -171,13 +183,13 @@ class RDNA2FP8ScaledMMLinearKernel(FP8ScaledMMLinearKernel):
         replace_parameter(layer, name, scale)
         layer.rdna2_fp8_scale_name = name
         layer.rdna2_fp8_block = (block_n, block_k)
-        reserve_dequant_workspace(
-            layer.weight.device,
-            min(
-                layer.weight.numel(),
-                max(_MAX_WORKSPACE_NUMEL, block_n * weight.shape[1]),
-            ),
-        )
+        n, k = layer.weight.shape
+        rows = _chunk_rows(n, k, block_n)
+        reserve_dequant_workspace(layer.weight.device, rows * k)
+        dtype = self.config.input_dtype
+        rdna2_gemm.register(rows, k, dtype)
+        if n % rows:
+            rdna2_gemm.register(n % rows, k, dtype)
 
     def apply_weights(
         self,

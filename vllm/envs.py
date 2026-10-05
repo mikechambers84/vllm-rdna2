@@ -163,6 +163,8 @@ if TYPE_CHECKING:
     VLLM_ROCM_W8A16_UNQUANTIZED: bool = False
     VLLM_ROCM_RDNA2_ATTENTION: bool = True
     VLLM_ROCM_W8A16_LM_HEAD: bool = False
+    VLLM_ROCM_RDNA2_GEMM_TABLE: str | None = None
+    VLLM_ROCM_RDNA2_GEMM_TUNE: bool = False
     VLLM_ROCM_FP8_PADDING: bool = True
     VLLM_ROCM_MOE_PADDING: bool = True
     VLLM_ROCM_SHUFFLE_KV_CACHE_LAYOUT: bool = False
@@ -1435,6 +1437,15 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # window, softcap and sinks, no ALiBi) in the HIP kernel instead of Triton.
     "VLLM_ROCM_RDNA2_ATTENTION": lambda: (
         os.getenv("VLLM_ROCM_RDNA2_ATTENTION", "1").lower() in ("1", "true")
+    ),
+    # gfx1030: JSON table of tuned rocBLAS solutions for fp16/bf16 GEMMs, read
+    # with the shipped one (default: rdna2_rocblas_gemm.json in the cache root)
+    # and written by VLLM_ROCM_RDNA2_GEMM_TUNE.
+    "VLLM_ROCM_RDNA2_GEMM_TABLE": lambda: os.getenv("VLLM_ROCM_RDNA2_GEMM_TABLE"),
+    # gfx1030: benchmark rocBLAS solutions for weight shapes missing from the
+    # tables while loading the model (~30 s per shape, once) and save them.
+    "VLLM_ROCM_RDNA2_GEMM_TUNE": lambda: (
+        os.getenv("VLLM_ROCM_RDNA2_GEMM_TUNE", "0").lower() in ("1", "true")
     ),
     # Pad the fp8 weights to 256 bytes for ROCm
     "VLLM_ROCM_FP8_PADDING": lambda: bool(int(os.getenv("VLLM_ROCM_FP8_PADDING", "1"))),

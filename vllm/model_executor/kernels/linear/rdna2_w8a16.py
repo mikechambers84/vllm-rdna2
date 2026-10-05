@@ -18,6 +18,7 @@ import torch
 
 import vllm.envs as envs
 from vllm import _custom_ops as ops
+from vllm.model_executor.kernels.linear import rdna2_gemm
 from vllm.platforms import current_platform
 from vllm.triton_utils import tl, triton
 from vllm.utils.torch_utils import direct_register_custom_op
@@ -80,6 +81,8 @@ def quantize_weight(layer: torch.nn.Module, chunked: bool = False) -> None:
     numel = weight.numel()
     if chunked:
         numel = min(numel, max(_MAX_WORKSPACE_NUMEL, weight.shape[1]))
+    else:
+        rdna2_gemm.register(weight.shape[0], weight.shape[1], weight.dtype, weight)
     reserve_dequant_workspace(weight.device, numel)
 
 
@@ -128,7 +131,7 @@ def _rdna2_w8a16_linear(
         dense = workspace.view(x.dtype)[: n * k].view(n, k)
         grid = (triton.cdiv(n, 64), triton.cdiv(k, 128))
         _dequant_kernel[grid](weight, scale, dense, n, k, BN=64, BK=128)
-        return torch.nn.functional.linear(x, dense, bias)
+        return rdna2_gemm.linear(x, dense, bias)
     # Weight larger than the workspace: dequantize and multiply in row chunks.
     rows = workspace.numel() // k
     out = x_2d.new_empty(x_2d.shape[0], n)
@@ -137,7 +140,7 @@ def _rdna2_w8a16_linear(
         dense = workspace.view(x.dtype)[: nr * k].view(nr, k)
         grid = (triton.cdiv(nr, 64), triton.cdiv(k, 128))
         _dequant_kernel[grid](weight[n0:], scale[n0:], dense, nr, k, BN=64, BK=128)
-        out[:, n0 : n0 + nr] = x_2d @ dense.t()
+        out[:, n0 : n0 + nr] = rdna2_gemm.linear(x_2d, dense)
     if bias is not None:
         out += bias
     return out.reshape(*x.shape[:-1], n)

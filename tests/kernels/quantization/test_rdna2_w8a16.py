@@ -168,11 +168,12 @@ def test_fp8_linear_is_weight_only(dist_init, default_vllm_config, block, num_to
 
 
 @pytest.mark.skipif(not on_gfx1030(), reason="gfx1030 only")
-def test_fp8_linear_dequantizes_in_row_chunks():
+def test_fp8_linear_dequantizes_in_row_chunks(monkeypatch):
     """A weight larger than the dequantization workspace is multiplied in row
     chunks that keep each block's scales (N not a multiple of block_n)."""
-    import vllm.model_executor.kernels.linear.scaled_mm.rdna2  # noqa: F401
+    from vllm.model_executor.kernels.linear.scaled_mm import rdna2
 
+    monkeypatch.setattr(rdna2, "_MAX_WORKSPACE_NUMEL", 300 * 1024)
     torch.manual_seed(0)
     n, k = 1000, 1024
     w = torch.randn(n, k, device="cuda").to(torch.float8_e4m3fn)
