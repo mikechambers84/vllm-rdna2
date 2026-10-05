@@ -1392,3 +1392,107 @@ def test_unified_attn_rdna2_fp8_kv(
         soft_cap=soft_cap,
     )
     torch.testing.assert_close(output, ref_output, atol=1.5e-2, rtol=1e-2)
+
+
+@pytest.mark.skipif(not _rdna2_attention(), reason="gfx1030 HIP attention only")
+@pytest.mark.parametrize("q_len", [1, 3])
+@pytest.mark.parametrize(
+    "head_size,num_heads", [(256, (16, 2)), (128, (32, 8)), (64, (64, 8))]
+)
+@pytest.mark.parametrize(
+    "sliding_window,soft_cap,use_sinks",
+    [(128, None, False), (None, 30.0, False), (None, None, True), (100, 30.0, True)],
+)
+@torch.inference_mode()
+def test_unified_attn_rdna2_decode_features(
+    q_len: int,
+    head_size: int,
+    num_heads: tuple[int, int],
+    sliding_window: int | None,
+    soft_cap: float | None,
+    use_sinks: bool,
+    monkeypatch,
+) -> None:
+    """The HIP decode kernel applies sliding window (segments before the
+    window stay empty), softcap and sinks (in segment 0 only) like the
+    reference."""
+    from vllm import _custom_ops as ops
+
+    torch.set_default_device(DEVICE_TYPE)
+    set_random_seed(0)
+    block_size, segments = 16, 32
+    kv_lens = [37, 900, 3000]
+    query_lens = [q_len] * len(kv_lens)
+    num_query_heads, num_kv_heads = num_heads
+    num_blocks = sum(kv_lens) // block_size + 64
+    query = torch.randn(
+        sum(query_lens), num_query_heads, head_size, dtype=torch.float16
+    )
+    key_cache = torch.randn(
+        num_blocks, block_size, num_kv_heads, head_size, dtype=torch.float16
+    )
+    value_cache = torch.randn_like(key_cache)
+    cu_query_lens = torch.tensor([0] + query_lens, dtype=torch.int32).cumsum(
+        dim=0, dtype=torch.int32
+    )
+    block_tables = torch.randint(
+        0,
+        num_blocks,
+        (len(kv_lens), (max(kv_lens) + block_size - 1) // block_size),
+        dtype=torch.int32,
+    )
+    sinks = torch.randn(num_query_heads) * 2 if use_sinks else None
+    output = torch.empty_like(query)
+    scale = head_size**-0.5
+    rows = query.shape[0]
+
+    calls = []
+    hip_decode = ops.decode_attention_rdna2
+
+    def spy(*args, **kwargs) -> None:
+        calls.append(args)
+        hip_decode(*args, **kwargs)
+
+    monkeypatch.setattr(ops, "decode_attention_rdna2", spy)
+    unified_attention(
+        q=query,
+        k=key_cache,
+        v=value_cache,
+        out=output,
+        cu_seqlens_q=cu_query_lens,
+        seqused_k=torch.tensor(kv_lens, dtype=torch.int32),
+        max_seqlen_q=q_len,
+        max_seqlen_k=max(kv_lens),
+        softmax_scale=scale,
+        causal=True,
+        window_size=(sliding_window - 1, 0) if sliding_window else (-1, -1),
+        block_table=block_tables,
+        softcap=soft_cap or 0,
+        q_descale=None,
+        k_descale=None,
+        v_descale=None,
+        sinks=sinks,
+        seq_threshold_3D=len(kv_lens),
+        num_par_softmax_segments=segments,
+        softmax_segm_output=torch.empty(
+            rows, num_query_heads, segments, head_size, dtype=torch.float32
+        ),
+        softmax_segm_max=torch.empty(rows, num_query_heads, segments),
+        softmax_segm_expsum=torch.empty(rows, num_query_heads, segments),
+        max_seqlen_q_3d=q_len,
+    )
+    assert len(calls) == 1
+
+    ref_output = ref_paged_attn_sinks(
+        query,
+        key_cache,
+        value_cache,
+        query_lens,
+        kv_lens,
+        block_tables,
+        scale,
+        sliding_window,
+        soft_cap,
+        sinks,
+    )
+    torch.testing.assert_close(output.float(), ref_output, atol=1.5e-2, rtol=1e-2)

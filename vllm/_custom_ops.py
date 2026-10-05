@@ -2430,10 +2430,14 @@ def decode_attention_rdna2(
     scale: float,
     k_scale: torch.Tensor | None = None,
     v_scale: torch.Tensor | None = None,
+    window: int = 0,
+    softcap: float = 0.0,
+    sinks: torch.Tensor | None = None,
 ) -> None:
-    """RDNA2 split-KV decode / spec-verify attention (head 256; caches and
-    scales as for ``unified_attention_rdna2``): writes the per-segment partials
-    of unified_attention's 3D path for reduce_segments."""
+    """RDNA2 split-KV decode / spec-verify attention (head 64 / 128 / 256;
+    caches, scales, window, softcap and sinks as for
+    ``unified_attention_rdna2``): writes the per-segment partials of
+    unified_attention's 3D path for reduce_segments."""
     torch.ops._rocm_C.decode_attention_rdna2(
         q,
         k_cache,
@@ -2449,6 +2453,9 @@ def decode_attention_rdna2(
         scale,
         k_scale,
         v_scale,
+        window,
+        softcap,
+        sinks,
     )
 
 

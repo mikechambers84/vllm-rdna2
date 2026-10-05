@@ -1227,9 +1227,6 @@ def unified_attention(
         and head_size in (64, 128, 256)
         and use_causal
         and not use_per_seq_causal
-        and window_size[0] < 0
-        and not softcap
-        and sinks is None
         and not (use_alibi_slopes or use_qq_bias or use_mm_prefix or use_rswa)
         and chunk_lookback < 0
         and not use_td
@@ -1258,6 +1255,9 @@ def unified_attention(
             softmax_scale,
             k_scale=k_descale if k.dtype != torch.float16 else None,
             v_scale=v_descale if k.dtype != torch.float16 else None,
+            window=1 + window_size[0] if window_size[0] >= 0 else 0,
+            softcap=softcap or 0.0,
+            sinks=None if sinks is None else sinks.float().contiguous(),
         )
     else:
         kernel_unified_attention[grid](

@@ -159,7 +159,8 @@ TORCH_LIBRARY_EXPAND(TORCH_EXTENSION_NAME, rocm_ops) {
       "Tensor! segm_out, Tensor! segm_max, Tensor! segm_sum, "
       "Tensor cu_seqlens_q, Tensor seqused_k, Tensor block_table, int tile, "
       "int max_seqlen_q, float scale, Tensor? k_scale=None, "
-      "Tensor? v_scale=None) -> ()");
+      "Tensor? v_scale=None, int window=0, float softcap=0.0, "
+      "Tensor? sinks=None) -> ()");
   rocm_ops.impl("decode_attention_rdna2", torch::kCUDA,
                 &decode_attention_rdna2);
   // Gated DeltaNet prefill: post-conv1d q/k/v split, l2 norm and gating.
