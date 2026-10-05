@@ -2196,12 +2196,25 @@ def moe_wna16_decode_rdna2(
     w2: torch.Tensor,
     w2_scale: torch.Tensor,
     act: torch.Tensor,
+    w13_zeros: torch.Tensor | None = None,
+    w2_zeros: torch.Tensor | None = None,
 ) -> None:
-    """RDNA2 W4A16 fused-MoE decode (SiLU, symmetric int4 g32) into ``output``,
-    on the uint8-packed ``[E, N, K/2]`` weights of the Triton WNA16 backend;
-    ``act`` is a ``[M * topk, I]`` workspace."""
+    """RDNA2 W4A16 fused-MoE decode (SiLU, int4 with group size a multiple of
+    32, optional ``[E, N/2, K/G]`` zero points) into ``output``, on the
+    uint8-packed ``[E, N, K/2]`` weights of the Triton WNA16 backend; ``act`` is
+    a ``[M * topk, I]`` workspace."""
     torch.ops._rocm_C.moe_wna16_decode_rdna2(
-        output, x, topk_ids, topk_weights, w13, w13_scale, w2, w2_scale, act
+        output,
+        x,
+        topk_ids,
+        topk_weights,
+        w13,
+        w13_scale,
+        w2,
+        w2_scale,
+        w13_zeros,
+        w2_zeros,
+        act,
     )
 
 
@@ -2210,6 +2223,7 @@ def moe_wna16_gemm_rdna2(
     a: torch.Tensor,
     w: torch.Tensor,
     scales: torch.Tensor,
+    zeros: torch.Tensor | None,
     sorted_ids: torch.Tensor,
     expert_ids: torch.Tensor,
     num_tokens_post_padded: torch.Tensor,
@@ -2226,6 +2240,7 @@ def moe_wna16_gemm_rdna2(
         a,
         w,
         scales,
+        zeros,
         sorted_ids,
         expert_ids,
         num_tokens_post_padded,

@@ -65,10 +65,13 @@ void moe_wna16_decode_rdna2(torch::Tensor& output, const torch::Tensor& x,
                             const torch::Tensor& topk_weights,
                             const torch::Tensor& w13, const torch::Tensor& s13,
                             const torch::Tensor& w2, const torch::Tensor& s2,
+                            const std::optional<torch::Tensor>& z13,
+                            const std::optional<torch::Tensor>& z2,
                             torch::Tensor& act);
 
 void moe_wna16_gemm_rdna2(torch::Tensor& output, const torch::Tensor& a,
                           const torch::Tensor& w, const torch::Tensor& scales,
+                          const std::optional<torch::Tensor>& zeros,
                           const torch::Tensor& sorted_ids,
                           const torch::Tensor& expert_ids,
                           const torch::Tensor& num_tokens_post_padded,

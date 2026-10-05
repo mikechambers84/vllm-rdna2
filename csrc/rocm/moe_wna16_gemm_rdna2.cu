@@ -42,14 +42,15 @@ static constexpr int CH = BK / 8;  // 8-element chunks per row per stage
 
 // UNR: unroll of the k2 loop; a full unroll lets the compiler hoist every
 // LDS read and spill.
-template <int RM, int UNR, bool MUL_W>
+template <int RM, int UNR, bool MUL_W, bool ZP>
 __global__ void __launch_bounds__(THREADS) moe_wna16_gemm_rdna2_kernel(
     const __half* __restrict__ A, const uint8_t* __restrict__ W,
-    const __half* __restrict__ S, __half* __restrict__ C,
-    const int* __restrict__ sorted_ids, const int* __restrict__ expert_ids,
-    const int* __restrict__ num_post_padded, const float* __restrict__ topk_w,
-    const int num_valid, const int top_k, const int N, const int K,
-    const int group_size, const int E, const int lda, const int ldc) {
+    const __half* __restrict__ S, const uint8_t* __restrict__ Z,
+    __half* __restrict__ C, const int* __restrict__ sorted_ids,
+    const int* __restrict__ expert_ids, const int* __restrict__ num_post_padded,
+    const float* __restrict__ topk_w, const int num_valid, const int top_k,
+    const int N, const int K, const int group_size, const int E, const int lda,
+    const int ldc) {
   constexpr int BM = 16 * RM;
   constexpr int A_ITEMS = (BM * CH + THREADS - 1) / THREADS;
   constexpr int W_ITEMS = BN * CH / THREADS;
@@ -63,6 +64,7 @@ __global__ void __launch_bounds__(THREADS) moe_wna16_gemm_rdna2_kernel(
   const int n0 = blockIdx.y * BN;
   const uint8_t* We = W + (long)e * N * (K / 2);
   const __half* Se = S + (long)e * N * (K / group_size);
+  const uint8_t* Ze = ZP ? Z + (long)e * (N / 2) * (K / group_size) : nullptr;
 
   // Element offset of each gathered activation chunk; -1 for padding rows.
   int a_off[A_ITEMS];
@@ -79,6 +81,7 @@ __global__ void __launch_bounds__(THREADS) moe_wna16_gemm_rdna2_kernel(
   uint4 ra[A_ITEMS];
   uint32_t rw[W_ITEMS];
   __half rs[W_ITEMS];
+  uint32_t rz[W_ITEMS];  // zero point of the item's (column, group)
   auto load = [&](int k0) {
   #pragma unroll
     for (int it = 0; it < A_ITEMS; it++)
@@ -93,6 +96,10 @@ __global__ void __launch_bounds__(THREADS) moe_wna16_gemm_rdna2_kernel(
       rw[it] =
           *reinterpret_cast<const uint32_t*>(We + (long)col * (K / 2) + k / 2);
       rs[it] = Se[(long)col * (K / group_size) + k / group_size];
+      if constexpr (ZP)
+        rz[it] = (Ze[(long)(col / 2) * (K / group_size) + k / group_size] >>
+                  ((col & 1) * 4)) &
+                 0xFu;
     }
   };
   auto store = [&](int buf) {
@@ -107,13 +114,17 @@ __global__ void __launch_bounds__(THREADS) moe_wna16_gemm_rdna2_kernel(
         sA[buf][c * 4 + 3][r] = ra[it].w;
       }
     }
-    const half2 bias =
+    half2 bias =
         __halves2half2(__ushort_as_half(0x6408), __ushort_as_half(0x6408));
   #pragma unroll
     for (int it = 0; it < W_ITEMS; it++) {
       const int idx = tid + it * THREADS;
       const int n = idx / CH, c = idx % CH;
       const half2 s2 = __halves2half2(rs[it], rs[it]);
+      if constexpr (ZP) {
+        const __half zb = __ushort_as_half(0x6400 | rz[it]);  // 1024 + zp
+        bias = __halves2half2(zb, zb);
+      }
   #pragma unroll
       for (int j = 0; j < 4; j++) {
         // Byte j holds k = 2j (low nibble) and 2j + 1: one half2 pair.
@@ -197,13 +208,11 @@ __global__ void __launch_bounds__(THREADS) moe_wna16_gemm_rdna2_kernel(
 
 #else  // non-RDNA2 device pass: empty stub for symbol parity.
 
-template <int RM, int UNR, bool MUL_W>
-__global__ void moe_wna16_gemm_rdna2_kernel(const __half*, const uint8_t*,
-                                            const __half*, __half*, const int*,
-                                            const int*, const int*,
-                                            const float*, const int, const int,
-                                            const int, const int, const int,
-                                            const int, const int, const int) {}
+template <int RM, int UNR, bool MUL_W, bool ZP>
+__global__ void moe_wna16_gemm_rdna2_kernel(
+    const __half*, const uint8_t*, const __half*, const uint8_t*, __half*,
+    const int*, const int*, const int*, const float*, const int, const int,
+    const int, const int, const int, const int, const int, const int) {}
 
 #endif  // __HIP__RDNA2__ || !__HIP_DEVICE_COMPILE__
 
@@ -213,12 +222,15 @@ __global__ void moe_wna16_gemm_rdna2_kernel(const __half*, const uint8_t*,
 // output [num_valid, N] fp16 (num_valid = topk_weights.numel()) receives row
 // sorted_ids[r] of every routed row r; a [rows, K] fp16 is read at row
 // sorted_ids[r] / top_k; w [E, N, K/2] uint8 and scales [E, N, K/G] fp16 are
-// symmetric int4 with G a multiple of 32 dividing K; K % 32 == 0, N % 8 == 0.
+// int4 with G a multiple of 32 dividing K, zero points zeros [E, N/2, K/G]
+// uint8 (two columns per byte, low nibble = even column) or 8 when absent;
+// K % 32 == 0, N % 8 == 0.
 // sorted_ids / expert_ids / num_tokens_post_padded come from
 // moe_align_block_size with block_m in {16, 32, 64, 128}. mul_routed_weight
 // scales each row by its fp32 top-k weight.
 void moe_wna16_gemm_rdna2(torch::Tensor& output, const torch::Tensor& a,
                           const torch::Tensor& w, const torch::Tensor& scales,
+                          const std::optional<torch::Tensor>& zeros,
                           const torch::Tensor& sorted_ids,
                           const torch::Tensor& expert_ids,
                           const torch::Tensor& num_tokens_post_padded,
@@ -258,17 +270,31 @@ void moe_wna16_gemm_rdna2(torch::Tensor& output, const torch::Tensor& a,
   TORCH_CHECK(block_m == 16 || block_m == 32 || block_m == 64 || block_m == 128,
               "moe_wna16_gemm_rdna2 supports block_m 16, 32, 64 and 128");
 
+  const uint8_t* zp = nullptr;
+  if (zeros) {
+    TORCH_CHECK(zeros->dtype() == torch::kUInt8 && zeros->is_contiguous() &&
+                    zeros->numel() == (long)E * (N / 2) * groups,
+                "moe_wna16_gemm_rdna2: zeros must be contiguous uint8 "
+                "[E, N/2, K/G]");
+    zp = zeros->data_ptr<uint8_t>();
+  }
   const at::cuda::OptionalCUDAGuard device_guard(device_of(a));
   const cudaStream_t stream = at::cuda::getCurrentCUDAStream();
   const dim3 grid(expert_ids.numel(), (N + BN - 1) / BN);
 
-#define VLLM_MOE_GEMM_LAUNCH(RM, UNR, MW)                                     \
-  moe_wna16_gemm_rdna2_kernel<RM, UNR, MW><<<grid, THREADS, 0, stream>>>(     \
-      (const __half*)a.data_ptr(), w.data_ptr<uint8_t>(),                     \
-      (const __half*)scales.data_ptr(), (__half*)output.data_ptr(),           \
-      sorted_ids.data_ptr<int>(), expert_ids.data_ptr<int>(),                 \
-      num_tokens_post_padded.data_ptr<int>(), topk_weights.data_ptr<float>(), \
+#define VLLM_MOE_GEMM_LAUNCH_Z(RM, UNR, MW, ZPV)                               \
+  moe_wna16_gemm_rdna2_kernel<RM, UNR, MW, ZPV><<<grid, THREADS, 0, stream>>>( \
+      (const __half*)a.data_ptr(), w.data_ptr<uint8_t>(),                      \
+      (const __half*)scales.data_ptr(), zp, (__half*)output.data_ptr(),        \
+      sorted_ids.data_ptr<int>(), expert_ids.data_ptr<int>(),                  \
+      num_tokens_post_padded.data_ptr<int>(), topk_weights.data_ptr<float>(),  \
       num_valid, top_k, N, K, K / groups, E, a.stride(0), N)
+#define VLLM_MOE_GEMM_LAUNCH(RM, UNR, MW)       \
+  if (zp) {                                     \
+    VLLM_MOE_GEMM_LAUNCH_Z(RM, UNR, MW, true);  \
+  } else {                                      \
+    VLLM_MOE_GEMM_LAUNCH_Z(RM, UNR, MW, false); \
+  }
 #define VLLM_MOE_GEMM_BY_W(RM, UNR)       \
   if (mul_routed_weight) {                \
     VLLM_MOE_GEMM_LAUNCH(RM, UNR, true);  \
@@ -291,4 +317,5 @@ void moe_wna16_gemm_rdna2(torch::Tensor& output, const torch::Tensor& a,
   }
 #undef VLLM_MOE_GEMM_BY_W
 #undef VLLM_MOE_GEMM_LAUNCH
+#undef VLLM_MOE_GEMM_LAUNCH_Z
 }
