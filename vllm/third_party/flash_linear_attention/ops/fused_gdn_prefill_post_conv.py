@@ -11,6 +11,8 @@ and writes directly to q/k/v/g/beta in the target contiguous layout.
 
 from __future__ import annotations
 
+import functools
+
 import torch
 
 from vllm.triton_utils import tl, triton
@@ -22,6 +24,16 @@ def _on_gfx10() -> bool:
     from vllm.platforms.rocm import on_gfx10
 
     return on_gfx10()
+
+
+@functools.cache
+def _rdna2_post_conv_available() -> bool:
+    if not torch.version.hip:
+        return False
+    import vllm._custom_ops  # noqa: F401  (loads _rocm_C)
+    from vllm.platforms.rocm import on_gfx1030
+
+    return on_gfx1030() and hasattr(torch.ops._rocm_C, "gdn_post_conv_rdna2")
 
 
 @triton.jit
@@ -211,6 +223,29 @@ def fused_post_conv_prep(
     beta = torch.empty(L, HV, dtype=torch.float32, device=device)
 
     if L == 0:
+        return q, k, v, g, beta
+
+    if (
+        dtype == torch.float16
+        and K in (64, 128, 256)
+        and V % 8 == 0
+        and conv_output.stride(1) == 1
+        and conv_output.stride(0) % 8 == 0
+        and conv_output.data_ptr() % 16 == 0
+        and a.dtype == b.dtype == torch.float16
+        and dt_bias.dtype in (torch.float16, torch.float32)
+        and A_log.dtype == torch.float32
+        and a.stride(1) == b.stride(1) == 1
+        and A_log.is_contiguous()
+        and dt_bias.is_contiguous()
+        and _rdna2_post_conv_available()
+    ):
+        from vllm import _custom_ops as ops
+
+        ops.gdn_post_conv_rdna2(
+            conv_output, a, b, A_log, dt_bias, q, k, v, g, beta, apply_l2norm,
+            output_g_exp, 1e-6,
+        )
         return q, k, v, g, beta
 
     # ---- Kernel config ----

@@ -77,7 +77,7 @@ def reference_post_conv(
 @pytest.mark.parametrize("L", [1, 16, 128, 512, 2048])
 @pytest.mark.parametrize("apply_l2norm", [True, False])
 @pytest.mark.parametrize("output_g_exp", [True, False])
-@pytest.mark.parametrize("dtype", [torch.bfloat16])
+@pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16])
 def test_fused_post_conv_correctness(H, HV, K, V, L, apply_l2norm, output_g_exp, dtype):
     """Test fused kernel matches reference for all configs."""
     torch.manual_seed(42)
@@ -387,3 +387,30 @@ def test_fused_gdn_decode_post_conv_mtp_head_ratios(
         )
 
     torch.testing.assert_close(state_actual, state_ref, atol=3e-2, rtol=3e-2)
+
+
+def test_fused_post_conv_rdna2_route(monkeypatch):
+    """fp16 prefill on gfx1030 runs the HIP kernel (covered by the fp16 cases
+    of test_fused_post_conv_correctness)."""
+    from vllm.third_party.flash_linear_attention.ops import (
+        fused_gdn_prefill_post_conv as post_conv,
+    )
+
+    if not post_conv._rdna2_post_conv_available():
+        pytest.skip("gfx1030 HIP kernel only")
+    H, HV, K, V, L = 16, 32, 128, 128, 64
+    conv_output = torch.randn(L, 2 * H * K + HV * V, dtype=torch.float16, device="cuda")
+    a = torch.randn(L, HV, dtype=torch.float16, device="cuda")
+    b = torch.randn(L, HV, dtype=torch.float16, device="cuda")
+    A_log = torch.randn(HV, dtype=torch.float32, device="cuda")
+    dt_bias = torch.randn(HV, dtype=torch.float16, device="cuda")
+    calls = []
+    hip_post_conv = ops.gdn_post_conv_rdna2
+
+    def spy(*args) -> None:
+        calls.append(args)
+        hip_post_conv(*args)
+
+    monkeypatch.setattr(ops, "gdn_post_conv_rdna2", spy)
+    fused_post_conv_prep(conv_output, a, b, A_log, dt_bias, H, K, V)
+    assert len(calls) == 1

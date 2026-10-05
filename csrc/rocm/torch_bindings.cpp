@@ -116,6 +116,13 @@ TORCH_LIBRARY_EXPAND(TORCH_EXTENSION_NAME, rocm_ops) {
       "Tensor block_table, float scale) -> ()");
   rocm_ops.impl("unified_attention_rdna2", torch::kCUDA,
                 &unified_attention_rdna2);
+  // Gated DeltaNet prefill: post-conv1d q/k/v split, l2 norm and gating.
+  rocm_ops.def(
+      "gdn_post_conv_rdna2(Tensor conv_output, Tensor a, Tensor b, "
+      "Tensor A_log, Tensor dt_bias, Tensor! q, Tensor! k, Tensor! v, "
+      "Tensor! g, Tensor! beta, bool apply_l2norm, bool output_g_exp, "
+      "float eps) -> ()");
+  rocm_ops.impl("gdn_post_conv_rdna2", torch::kCUDA, &gdn_post_conv_rdna2);
 #endif  // VLLM_ROCM_GFX1030
 
 #ifdef VLLM_ROCM_GFX1100

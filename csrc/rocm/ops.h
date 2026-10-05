@@ -91,6 +91,14 @@ void unified_attention_rdna2(torch::Tensor& out, const torch::Tensor& q,
                              const torch::Tensor& seqused_k,
                              const torch::Tensor& block_table, double scale);
 
+void gdn_post_conv_rdna2(const torch::Tensor& conv_output,
+                         const torch::Tensor& a, const torch::Tensor& b,
+                         const torch::Tensor& A_log,
+                         const torch::Tensor& dt_bias, torch::Tensor& q,
+                         torch::Tensor& k, torch::Tensor& v, torch::Tensor& g,
+                         torch::Tensor& beta, bool apply_l2norm,
+                         bool output_g_exp, double eps);
+
 torch::Tensor gptq_gemm_rdna3(torch::Tensor a, torch::Tensor b_q_weight,
                               torch::Tensor b_qzeros, torch::Tensor b_scales,
                               bool use_v2_format);

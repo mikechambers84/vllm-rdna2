@@ -2288,6 +2288,41 @@ def unified_attention_rdna2(
     )
 
 
+def gdn_post_conv_rdna2(
+    conv_output: torch.Tensor,
+    a: torch.Tensor,
+    b: torch.Tensor,
+    A_log: torch.Tensor,
+    dt_bias: torch.Tensor,
+    q: torch.Tensor,
+    k: torch.Tensor,
+    v: torch.Tensor,
+    g: torch.Tensor,
+    beta: torch.Tensor,
+    apply_l2norm: bool,
+    output_g_exp: bool,
+    eps: float,
+) -> None:
+    """RDNA2 Gated DeltaNet post-conv1d prep: split ``conv_output`` into
+    ``q`` / ``k`` (l2-normalized if ``apply_l2norm``) / ``v`` and write the
+    gates ``g`` (``exp(g)`` if ``output_g_exp``) and ``beta``."""
+    torch.ops._rocm_C.gdn_post_conv_rdna2(
+        conv_output,
+        a,
+        b,
+        A_log,
+        dt_bias,
+        q,
+        k,
+        v,
+        g,
+        beta,
+        apply_l2norm,
+        output_g_exp,
+        eps,
+    )
+
+
 def wvSplitK_int4_g(
     weight: torch.Tensor,
     activation: torch.Tensor,
