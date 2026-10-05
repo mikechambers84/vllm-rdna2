@@ -54,6 +54,12 @@ def _rdna2_attention_available() -> bool:
     return on_gfx1030() and hasattr(torch.ops._rocm_C, "unified_attention_rdna2")
 
 
+# Segment granularity of the gfx1030 decode kernel (its key tile): segments of
+# whole tiles, so short contexts take a few full workgroups instead of 32
+# mostly empty ones (2.4-2.8x at 512 keys, same at 8K).
+RDNA2_DECODE_TILE = 64
+
+
 def _rdna2_attention_operands_ok(*tensors: torch.Tensor) -> bool:
     return all(
         t.dtype == torch.float16
@@ -1224,7 +1230,7 @@ def unified_attention(
             cu_seqlens_q,
             seqused_k,
             block_table,
-            TILE_SIZE_DECODE,
+            RDNA2_DECODE_TILE,
             max_seqlen_q,
             softmax_scale,
         )
@@ -1321,7 +1327,7 @@ def unified_attention(
             output_stride_0=out.stride(0),
             output_stride_1=out.stride(1),
             block_table_stride=block_table.stride(0),
-            TILE_SIZE=TILE_SIZE_DECODE,
+            TILE_SIZE=RDNA2_DECODE_TILE if rdna2_decode else TILE_SIZE_DECODE,
             HEAD_SIZE=head_size,
             HEAD_SIZE_PADDED=head_size_padded,
             query_start_len_ptr=cu_seqlens_q,
