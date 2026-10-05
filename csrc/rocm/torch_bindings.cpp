@@ -109,11 +109,13 @@ TORCH_LIBRARY_EXPAND(TORCH_EXTENSION_NAME, rocm_ops) {
       "Tensor num_tokens_post_padded, Tensor topk_weights, int top_k, "
       "bool mul_routed_weight, int block_m) -> ()");
   rocm_ops.impl("moe_int8_gemm_rdna2", torch::kCUDA, &moe_int8_gemm_rdna2);
-  // Paged causal GQA attention for prefill (fp16, head 64/128/256).
+  // Paged causal GQA attention for prefill (fp16, head 64/128/256; sliding
+  // window, softcap, sinks).
   rocm_ops.def(
       "unified_attention_rdna2(Tensor! out, Tensor q, Tensor k_cache, "
       "Tensor v_cache, Tensor cu_seqlens_q, Tensor seqused_k, "
-      "Tensor block_table, float scale) -> ()");
+      "Tensor block_table, float scale, int window, float softcap, "
+      "Tensor? sinks) -> ()");
   rocm_ops.impl("unified_attention_rdna2", torch::kCUDA,
                 &unified_attention_rdna2);
   // Gated DeltaNet prefill: post-conv1d q/k/v split, l2 norm and gating.

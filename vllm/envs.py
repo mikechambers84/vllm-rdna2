@@ -1431,8 +1431,8 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "VLLM_ROCM_W8A16_LM_HEAD": lambda: (
         os.getenv("VLLM_ROCM_W8A16_LM_HEAD", "0").lower() in ("1", "true")
     ),
-    # gfx1030: run fp16 prefill attention (head 64/128/256, causal, no sliding
-    # window / softcap / ALiBi / sinks) in the HIP kernel instead of Triton.
+    # gfx1030: run fp16 causal prefill attention (head 64/128/256; sliding
+    # window, softcap and sinks, no ALiBi) in the HIP kernel instead of Triton.
     "VLLM_ROCM_RDNA2_ATTENTION": lambda: (
         os.getenv("VLLM_ROCM_RDNA2_ATTENTION", "1").lower() in ("1", "true")
     ),

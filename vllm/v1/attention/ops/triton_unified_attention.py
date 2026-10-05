@@ -994,10 +994,7 @@ def unified_attention(
         and num_queries_per_kv <= 64
         and use_causal
         and not use_per_seq_causal
-        and window_size[0] < 0
-        and not softcap
         and not (use_alibi_slopes or use_qq_bias or use_mm_prefix or use_rswa)
-        and sinks is None
         and chunk_lookback < 0
         and kv_quant_mode == KVQuantMode.NONE
         and output_scale is None
@@ -1011,7 +1008,17 @@ def unified_attention(
         from vllm import _custom_ops as ops
 
         ops.unified_attention_rdna2(
-            out, q, k, v, cu_seqlens_q, seqused_k, block_table, softmax_scale
+            out,
+            q,
+            k,
+            v,
+            cu_seqlens_q,
+            seqused_k,
+            block_table,
+            softmax_scale,
+            window=1 + window_size[0] if window_size[0] >= 0 else 0,
+            softcap=softcap or 0.0,
+            sinks=None if sinks is None else sinks.float().contiguous(),
         )
         return
 

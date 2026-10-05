@@ -2279,12 +2279,27 @@ def unified_attention_rdna2(
     seqused_k: torch.Tensor,
     block_table: torch.Tensor,
     scale: float,
+    window: int = 0,
+    softcap: float = 0.0,
+    sinks: torch.Tensor | None = None,
 ) -> None:
     """RDNA2 paged causal GQA attention: fp16 ``q`` [tokens, heads, D] against
     ``k_cache`` / ``v_cache`` [blocks, block_size, kv_heads, D] (D in 64, 128,
-    256) with unified_attention's varlen metadata, into ``out``."""
+    256) with unified_attention's varlen metadata, into ``out``. ``window`` > 0
+    keeps each query's last ``window`` keys; ``softcap`` > 0 caps the scores;
+    ``sinks`` (fp32, one per query head) join each softmax normalizer."""
     torch.ops._rocm_C.unified_attention_rdna2(
-        out, q, k_cache, v_cache, cu_seqlens_q, seqused_k, block_table, scale
+        out,
+        q,
+        k_cache,
+        v_cache,
+        cu_seqlens_q,
+        seqused_k,
+        block_table,
+        scale,
+        window,
+        softcap,
+        sinks,
     )
 
 

@@ -60,7 +60,8 @@ __device__ __forceinline__ float row16_sum(float v) {
   return v;
 }
 
-template <int D, int DC>
+// EXT: sliding window / softcap / sinks compiled in (plain causal otherwise).
+template <int D, int DC, bool EXT>
 __global__ void __launch_bounds__(THREADS) unified_attention_rdna2_kernel(
     const __half* __restrict__ Q, const __half* __restrict__ Kc,
     const __half* __restrict__ Vc, __half* __restrict__ O,
@@ -69,7 +70,10 @@ __global__ void __launch_bounds__(THREADS) unified_attention_rdna2_kernel(
     const int BQ, const int block_size, const long bt_stride, const long q_st,
     const long q_sh, const long k_sb, const long k_st, const long k_sh,
     const long v_sb, const long v_st, const long v_sh, const long o_st,
-    const long o_sh, const float scale_log2e) {
+    const long o_sh, const float scale, const int window, const float softcap,
+    const float* __restrict__ sinks) {
+  constexpr float LOG2E = 1.4426950408889634f;
+  const float scale_log2e = scale * LOG2E;
   constexpr int D2 = D / 2;
   constexpr int TN = D / 16;  // output columns per thread
   constexpr int Q_ITEMS = BM * (D / 8) / THREADS;
@@ -128,10 +132,17 @@ __global__ void __launch_bounds__(THREADS) unified_attention_rdna2_kernel(
     sQ[c * 4 + 3][r] = v.w;
   }
 
-  int lim[4];  // causal limit of this thread's rows (key index <= lim)
+  // Visible keys of this thread's rows: klo[i] <= key <= lim[i] (causal, and
+  // the sliding window when window > 0).
+  int lim[4], klo[4];
   #pragma unroll
-  for (int i = 0; i < 4; i++)
+  for (int i = 0; i < 4; i++) {
     lim[i] = ctx + t0 + min((ty * 4 + i) / G, ntok - 1);
+    klo[i] = EXT && window > 0 ? lim[i] - window + 1 : 0;
+  }
+  const int key_begin =
+      EXT && window > 0 ? max(0, ctx + t0 - window + 1) / BN * BN : 0;
+  const int lo_max = EXT && window > 0 ? ctx + t0 + ntok - window : 0;
 
   float acc[4][TN];
   #pragma unroll
@@ -141,8 +152,11 @@ __global__ void __launch_bounds__(THREADS) unified_attention_rdna2_kernel(
   float m_i[4], l_i[4];
   #pragma unroll
   for (int i = 0; i < 4; i++) {
-    m_i[i] = -INFINITY;
-    l_i[i] = 0.f;
+    // A sink adds exp(sink) to the row's normalizer: start the running max
+    // there with one unit of mass (on one lane; the row sums are per lane).
+    const int r = ty * 4 + i;
+    m_i[i] = EXT && sinks ? sinks[kvh * G + r % G] * LOG2E : -INFINITY;
+    l_i[i] = (EXT && sinks && tx == 0) ? 1.f : 0.f;
   }
 
   auto k_off = [&](int key) -> long {
@@ -217,9 +231,9 @@ __global__ void __launch_bounds__(THREADS) unified_attention_rdna2_kernel(
     }
   };
 
-  kaddr(0);
+  kaddr(key_begin);
   kload(0);
-  for (int kt = 0; kt < key_end; kt += BN) {
+  for (int kt = key_begin; kt < key_end; kt += BN) {
     // sU[0] was last read two V stages ago; sP is rewritten after barriers.
     kstore(0);
     __syncthreads();
@@ -256,7 +270,7 @@ __global__ void __launch_bounds__(THREADS) unified_attention_rdna2_kernel(
     }
 
     // Online softmax on this thread's 4 rows x 4 keys.
-    const bool need_mask = kt + BN - 1 > ctx + t0;
+    const bool need_mask = kt + BN - 1 > ctx + t0 || (EXT && kt < lo_max);
     float alpha[4];
     uint32_t pw[4][2];
   #pragma unroll
@@ -265,12 +279,22 @@ __global__ void __launch_bounds__(THREADS) unified_attention_rdna2_kernel(
       float mx = -INFINITY;
   #pragma unroll
       for (int j = 0; j < 4; j++) {
-        sv[j] = sacc[i][j] * scale_log2e;
-        if (need_mask && kt + tx * 4 + j > lim[i]) sv[j] = -INFINITY;
+        if (EXT &&
+            softcap > 0.f) {  // softcap * tanh(s / softcap), overflow-safe
+          const float y = sacc[i][j] * scale / softcap;
+          sv[j] = softcap * (1.f - 2.f / (__expf(2.f * y) + 1.f)) * LOG2E;
+        } else {
+          sv[j] = sacc[i][j] * scale_log2e;
+        }
+        const int key = kt + tx * 4 + j;
+        if (need_mask && (key > lim[i] || (EXT && key < klo[i])))
+          sv[j] = -INFINITY;
         mx = fmaxf(mx, sv[j]);
       }
       mx = row16_max(mx);
-      const float m_new = fmaxf(m_i[i], mx);
+      // A row with every key of the tile masked so far keeps m = -inf.
+      const float m_new =
+          EXT ? fmaxf(fmaxf(m_i[i], mx), -1e30f) : fmaxf(m_i[i], mx);
       alpha[i] = exp2f(m_i[i] - m_new);
       m_i[i] = m_new;
       float p[4], ps = 0.f;
@@ -354,12 +378,13 @@ __global__ void __launch_bounds__(THREADS) unified_attention_rdna2_kernel(
 
 #else  // non-RDNA2 device pass: empty stub for symbol parity.
 
-template <int D, int DC>
+template <int D, int DC, bool EXT>
 __global__ void unified_attention_rdna2_kernel(
     const __half*, const __half*, const __half*, __half*, const int*,
     const int*, const int*, const int, const int, const int, const int,
     const long, const long, const long, const long, const long, const long,
-    const long, const long, const long, const long, const long, const float) {}
+    const long, const long, const long, const long, const long, const float,
+    const int, const float, const float*) {}
 
 #endif  // __HIP__RDNA2__ || !__HIP_DEVICE_COMPILE__
 
@@ -370,13 +395,18 @@ __global__ void unified_attention_rdna2_kernel(
 // caches k_cache / v_cache [num_blocks, block_size, num_kv_heads, D] into
 // out [num_tokens, num_q_heads, D]; D in {64, 128, 256}. Sequence s owns query
 // tokens cu_seqlens_q[s] .. cu_seqlens_q[s + 1] - 1, which are the last ones
-// of its seqused_k[s] keys, whose cache blocks are block_table[s].
+// of its seqused_k[s] keys, whose cache blocks are block_table[s]. window > 0
+// limits each query to its last `window` keys (sliding window), softcap > 0
+// applies softcap * tanh(score / softcap), sinks [num_q_heads] fp32 adds
+// exp(sinks[h]) to each softmax normalizer.
 void unified_attention_rdna2(torch::Tensor& out, const torch::Tensor& q,
                              const torch::Tensor& k_cache,
                              const torch::Tensor& v_cache,
                              const torch::Tensor& cu_seqlens_q,
                              const torch::Tensor& seqused_k,
-                             const torch::Tensor& block_table, double scale) {
+                             const torch::Tensor& block_table, double scale,
+                             int64_t window, double softcap,
+                             const std::optional<torch::Tensor>& sinks) {
   using namespace vllm::attention_rdna2;
   TORCH_CHECK(
       q.dtype() == torch::kFloat16 && k_cache.dtype() == torch::kFloat16 &&
@@ -420,24 +450,38 @@ void unified_attention_rdna2(torch::Tensor& out, const torch::Tensor& q,
   // Each sequence gets cu_seqlens_q[s + 1] / BQ - cu_seqlens_q[s] / BQ + 1 >=
   // ceil(query_len / BQ) tiles; the extra ones exit at once.
   const dim3 grid(q.size(0) / BQ + num_seqs, HKV);
-  const float scale_log2e = scale * 1.4426950408889634;
-
-#define VLLM_ATTN_RDNA2_LAUNCH(HD, DC)                                    \
-  unified_attention_rdna2_kernel<HD, DC><<<grid, THREADS, 0, stream>>>(   \
-      (const __half*)q.data_ptr(), (const __half*)k_cache.data_ptr(),     \
-      (const __half*)v_cache.data_ptr(), (__half*)out.data_ptr(),         \
-      cu_seqlens_q.data_ptr<int>(), seqused_k.data_ptr<int>(),            \
-      block_table.data_ptr<int>(), num_seqs, G, BQ, k_cache.size(1),      \
-      block_table.stride(0), q.stride(0), q.stride(1), k_cache.stride(0), \
-      k_cache.stride(1), k_cache.stride(2), v_cache.stride(0),            \
-      v_cache.stride(1), v_cache.stride(2), out.stride(0), out.stride(1), \
-      scale_log2e)
-  if (D == 256) {
-    VLLM_ATTN_RDNA2_LAUNCH(256, 64);
-  } else if (D == 128) {
-    VLLM_ATTN_RDNA2_LAUNCH(128, 64);
-  } else {
-    VLLM_ATTN_RDNA2_LAUNCH(64, 32);
+  const float* sinks_ptr = nullptr;
+  if (sinks) {
+    TORCH_CHECK(sinks->dtype() == torch::kFloat32 && sinks->is_contiguous() &&
+                    sinks->numel() == HQ,
+                "unified_attention_rdna2: sinks must be fp32 [num_q_heads]");
+    sinks_ptr = sinks->data_ptr<float>();
   }
+
+#define VLLM_ATTN_RDNA2_LAUNCH(HD, DC, X)                                  \
+  unified_attention_rdna2_kernel<HD, DC, X><<<grid, THREADS, 0, stream>>>( \
+      (const __half*)q.data_ptr(), (const __half*)k_cache.data_ptr(),      \
+      (const __half*)v_cache.data_ptr(), (__half*)out.data_ptr(),          \
+      cu_seqlens_q.data_ptr<int>(), seqused_k.data_ptr<int>(),             \
+      block_table.data_ptr<int>(), num_seqs, G, BQ, k_cache.size(1),       \
+      block_table.stride(0), q.stride(0), q.stride(1), k_cache.stride(0),  \
+      k_cache.stride(1), k_cache.stride(2), v_cache.stride(0),             \
+      v_cache.stride(1), v_cache.stride(2), out.stride(0), out.stride(1),  \
+      (float)scale, (int)window, (float)softcap, sinks_ptr)
+#define VLLM_ATTN_RDNA2_BY_EXT(HD, DC)     \
+  if (ext) {                               \
+    VLLM_ATTN_RDNA2_LAUNCH(HD, DC, true);  \
+  } else {                                 \
+    VLLM_ATTN_RDNA2_LAUNCH(HD, DC, false); \
+  }
+  const bool ext = window > 0 || softcap > 0 || sinks_ptr != nullptr;
+  if (D == 256) {
+    VLLM_ATTN_RDNA2_BY_EXT(256, 64);
+  } else if (D == 128) {
+    VLLM_ATTN_RDNA2_BY_EXT(128, 64);
+  } else {
+    VLLM_ATTN_RDNA2_BY_EXT(64, 32);
+  }
+#undef VLLM_ATTN_RDNA2_BY_EXT
 #undef VLLM_ATTN_RDNA2_LAUNCH
 }
