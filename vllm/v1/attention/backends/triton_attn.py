@@ -97,6 +97,23 @@ class TritonAttentionMetadata:
     max_seqlen_q_3d: int = 1
 
 
+def _rdna2_decode_supported(vllm_config: VllmConfig, head_size: int) -> bool:
+    """Whether decode batches run gfx1030's HIP decode attention kernel."""
+    if not current_platform.is_rocm():
+        return False
+    from vllm.platforms.rocm import on_gfx1030
+
+    if not (on_gfx1030() and hasattr(torch.ops._rocm_C, "decode_attention_rdna2")):
+        return False
+    cache_config = getattr(vllm_config, "cache_config", None)
+    cache_dtype = getattr(cache_config, "cache_dtype", "auto")
+    return (
+        getattr(vllm_config.model_config, "dtype", None) == torch.float16
+        and head_size in (64, 128, 256)
+        and cache_dtype in ("auto", "float16", "fp8", "fp8_e4m3")
+    )
+
+
 class TritonAttentionMetadataBuilder(AttentionMetadataBuilder[TritonAttentionMetadata]):
     _cudagraph_support: ClassVar[AttentionCGSupport] = AttentionCGSupport.ALWAYS
     # Step-dependent fields reference persistent input buffers directly.
@@ -183,6 +200,14 @@ class TritonAttentionMetadataBuilder(AttentionMetadataBuilder[TritonAttentionMet
                     max_num_tokens_3d,
                     self.num_par_softmax_segments // NUM_PAR_SOFTMAX_SEGMENTS,
                 ),
+            )
+        # gfx1030: decode batches above the threshold also take the 3D path,
+        # whose HIP kernel beats Triton's 2D one 1.3-2.2x at 32-128 sequences,
+        # with proportionally fewer segments (down to 4) in the same scratch.
+        self.max_seqs_rdna2_3d = 0
+        if _rdna2_decode_supported(vllm_config, self.headdim):
+            self.max_seqs_rdna2_3d = (
+                self.seq_threshold_3D * self.num_par_softmax_segments // 4
             )
         headdim_padded = next_power_of_2(self.headdim)
         self.softmax_segm_output = torch.empty(
@@ -279,6 +304,26 @@ class TritonAttentionMetadataBuilder(AttentionMetadataBuilder[TritonAttentionMet
             softmax_segm_expsum=self.softmax_segm_expsum,
             max_seqlen_q_3d=self.max_seqlen_q_3d,
         )
+        if (
+            self.seq_threshold_3D < num_reqs <= self.max_seqs_rdna2_3d
+            and max_query_len <= self.max_seqlen_q_3d
+        ):
+            segments = self.num_par_softmax_segments
+            while num_reqs * segments > self.seq_threshold_3D * (
+                self.num_par_softmax_segments
+            ):
+                segments //= 2
+            attn_metadata.seq_threshold_3D = num_reqs
+            attn_metadata.num_par_softmax_segments = segments
+            attn_metadata.softmax_segm_output = self.softmax_segm_output.view(
+                -1, self.num_heads_q, segments, self.softmax_segm_output.shape[-1]
+            )
+            attn_metadata.softmax_segm_max = self.softmax_segm_max.view(
+                -1, self.num_heads_q, segments
+            )
+            attn_metadata.softmax_segm_expsum = self.softmax_segm_expsum.view(
+                -1, self.num_heads_q, segments
+            )
         if self.max_seqs_64_segments > 0 and (
             self.max_seqs_64_segments < seq_lens.shape[0]
             or self.softmax_segm_max.shape[0] < num_actual_tokens
