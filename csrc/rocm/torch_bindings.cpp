@@ -77,6 +77,16 @@ TORCH_LIBRARY_EXPAND(TORCH_EXTENSION_NAME, rocm_ops) {
       "gemv_w8a16_rdna2(Tensor a, Tensor w, Tensor scale, Tensor? bias) -> "
       "Tensor");
   rocm_ops.impl("gemv_w8a16_rdna2", torch::kCUDA, &gemv_w8a16_rdna2);
+  // fp8 e4m3fn-weight GEMV (per-row or 2D block scales) with fp16/bf16
+  // activations (M <= 8), and the matching dequantization for larger batches.
+  rocm_ops.def(
+      "gemv_fp8_rdna2(Tensor a, Tensor w, Tensor scale, int block_n, "
+      "int block_k, Tensor? bias) -> Tensor");
+  rocm_ops.impl("gemv_fp8_rdna2", torch::kCUDA, &gemv_fp8_rdna2);
+  rocm_ops.def(
+      "dequant_fp8_rdna2(Tensor! out, Tensor w, Tensor scale, int block_n, "
+      "int block_k) -> ()");
+  rocm_ops.impl("dequant_fp8_rdna2", torch::kCUDA, &dequant_fp8_rdna2);
   // 4-bit GPTQ GEMM for decode and small batches on Exllama's weight layout.
   rocm_ops.def(
       "gemm_w4a16_exl_rdna2(Tensor a, Tensor w, Tensor zeros, Tensor scales, "

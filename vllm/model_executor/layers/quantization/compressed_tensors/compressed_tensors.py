@@ -849,8 +849,13 @@ class CompressedTensorsConfig(QuantizationConfig):
                         is_fp8_w8a8_supported = True
 
                 else:
+                    # ROCm GPUs without FP8 (e.g. gfx1030, which reports
+                    # capability 10.3) run FP8 weights weight-only.
                     is_fp8_w8a8_supported = self._check_scheme_supported(
                         CompressedTensorsW8A8Fp8.get_min_capability(), error=False
+                    ) and (
+                        not current_platform.is_rocm()
+                        or current_platform.supports_fp8()
                     )
                 if is_fp8_w8a8_supported:
                     return CompressedTensorsW8A8Fp8(

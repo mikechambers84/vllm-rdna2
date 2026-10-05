@@ -1,7 +1,10 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
-"""Opt-in int8 weight-only storage of unquantized linear layers on gfx1030
-(VLLM_ROCM_W8A16_UNQUANTIZED)."""
+"""8-bit weight-only linear layers on gfx1030: opt-in int8 storage of
+unquantized layers (VLLM_ROCM_W8A16_UNQUANTIZED, VLLM_ROCM_W8A16_LM_HEAD) and
+FP8 checkpoints (no FP8 instructions on gfx1030)."""
+
+from types import SimpleNamespace
 
 import pytest
 import torch
@@ -102,3 +105,83 @@ def test_tied_lm_head_stays_fp16(monkeypatch):
     head.quant_method.process_weights_after_loading(head)
 
     assert not hasattr(head, "w8a16_weight") and head.weight is embed.weight
+
+
+def _fp8_dequant(w, scale, block_n, block_k):
+    s = scale.float().repeat_interleave(block_n, 0)[: w.shape[0]]
+    if scale.shape[1] > 1:
+        s = s.repeat_interleave(block_k, 1)[:, : w.shape[1]]
+    return w.float() * s
+
+
+@pytest.mark.skipif(not on_gfx1030(), reason="gfx1030 only")
+@pytest.mark.parametrize("block", [False, True])
+@pytest.mark.parametrize("num_tokens", [1, 8, 24, 64])
+def test_fp8_linear_is_weight_only(dist_init, default_vllm_config, block, num_tokens):
+    """An FP8 checkpoint's fused linear layer (per-shard tensor scales, or
+    128x128 block scales) runs weight-only on gfx1030: the GEMV (<= 32
+    tokens) and the dequantize + GEMM path both match the checkpoint's
+    dequantized weights; per-shard scales are kept, not requantized."""
+    from vllm.model_executor.kernels.linear.scaled_mm.rdna2 import (
+        RDNA2FP8ScaledMMLinearKernel,
+    )
+    from vllm.model_executor.layers.linear import MergedColumnParallelLinear
+    from vllm.model_executor.layers.quantization.fp8 import (
+        Fp8Config,
+        Fp8LinearMethod,
+    )
+
+    default_vllm_config.model_config = SimpleNamespace(dtype=torch.float16)
+    torch.manual_seed(0)
+    config = Fp8Config(
+        is_checkpoint_fp8_serialized=True,
+        activation_scheme="dynamic",
+        weight_block_size=[128, 128] if block else None,
+    )
+    k, widths = 512, [384, 640]
+    with torch.device("cuda"):
+        layer = MergedColumnParallelLinear(
+            k, widths, bias=False, params_dtype=torch.float16, quant_config=config
+        )
+    method = layer.quant_method
+    assert isinstance(method, Fp8LinearMethod)
+    assert isinstance(method.fp8_linear, RDNA2FP8ScaledMMLinearKernel)
+    dequant = []
+    for shard, n in enumerate(widths):
+        w = torch.randn(n, k, device="cuda").to(torch.float8_e4m3fn)
+        if block:
+            scale = torch.rand(n // 128, k // 128, device="cuda") * 0.01 + 1e-3
+            layer.weight_scale_inv.weight_loader(layer.weight_scale_inv, scale, shard)
+            dequant.append(_fp8_dequant(w, scale, 128, 128))
+        else:
+            scale = torch.tensor(0.002 + 0.0013 * shard, device="cuda")
+            layer.weight_scale.weight_loader(layer.weight_scale, scale, shard)
+            dequant.append(w.float() * scale)
+        layer.weight.weight_loader(layer.weight, w, shard)
+
+    method.process_weights_after_loading(layer)
+
+    x = torch.randn(num_tokens, k, dtype=torch.float16, device="cuda")
+    out = method.apply(layer, x)
+    ref = x.float() @ torch.cat(dequant).t()
+    assert ((out.float() - ref).norm() / ref.norm()).item() < 1e-3
+
+
+@pytest.mark.skipif(not on_gfx1030(), reason="gfx1030 only")
+def test_fp8_linear_dequantizes_in_row_chunks():
+    """A weight larger than the dequantization workspace is multiplied in row
+    chunks that keep each block's scales (N not a multiple of block_n)."""
+    import vllm.model_executor.kernels.linear.scaled_mm.rdna2  # noqa: F401
+
+    torch.manual_seed(0)
+    n, k = 1000, 1024
+    w = torch.randn(n, k, device="cuda").to(torch.float8_e4m3fn)
+    scale = torch.rand(-(-n // 128), k // 128, device="cuda") * 0.01 + 1e-3
+    bias = torch.randn(n, dtype=torch.float16, device="cuda")
+    x = torch.randn(40, k, dtype=torch.float16, device="cuda")
+    workspace = torch.empty(300 * k, dtype=torch.float16, device="cuda")
+
+    out = torch.ops.vllm.rdna2_fp8_linear(x, w, scale, 128, 128, bias, workspace)
+
+    ref = x.float() @ _fp8_dequant(w, scale, 128, 128).t() + bias.float()
+    assert ((out.float() - ref).norm() / ref.norm()).item() < 1e-3

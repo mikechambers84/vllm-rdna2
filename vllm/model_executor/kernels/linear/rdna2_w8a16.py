@@ -80,11 +80,17 @@ def quantize_weight(layer: torch.nn.Module, chunked: bool = False) -> None:
     numel = weight.numel()
     if chunked:
         numel = min(numel, max(_MAX_WORKSPACE_NUMEL, weight.shape[1]))
-    workspace = _dequant_workspaces.get(weight.device)
+    reserve_dequant_workspace(weight.device, numel)
+
+
+def reserve_dequant_workspace(device: torch.device, numel: int) -> torch.Tensor:
+    """The 16-bit dequantization workspace shared by all layers on device,
+    grown to at least numel elements."""
+    workspace = _dequant_workspaces.get(device)
     if workspace is None or workspace.numel() < numel:
-        _dequant_workspaces[weight.device] = torch.empty(
-            numel, dtype=torch.float16, device=weight.device
-        )
+        workspace = torch.empty(numel, dtype=torch.float16, device=device)
+        _dequant_workspaces[device] = workspace
+    return workspace
 
 
 @triton.jit

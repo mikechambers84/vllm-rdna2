@@ -2149,6 +2149,32 @@ def gemv_w8a16_rdna2(
     return torch.ops._rocm_C.gemv_w8a16_rdna2(a, w, scale, bias)
 
 
+def gemv_fp8_rdna2(
+    a: torch.Tensor,
+    w: torch.Tensor,
+    scale: torch.Tensor,
+    block_n: int,
+    block_k: int,
+    bias: torch.Tensor | None = None,
+) -> torch.Tensor:
+    """RDNA2 GEMV on fp8 e4m3fn weights ``w`` [N, K] with fp32 ``scale``
+    [ceil(N / block_n), 1] (per block_n rows) or [ceil(N / block_n),
+    ceil(K / block_k)] (2D blocks), for fp16/bf16 ``a`` of at most 8 rows."""
+    return torch.ops._rocm_C.gemv_fp8_rdna2(a, w, scale, block_n, block_k, bias)
+
+
+def dequant_fp8_rdna2(
+    out: torch.Tensor,
+    w: torch.Tensor,
+    scale: torch.Tensor,
+    block_n: int,
+    block_k: int,
+) -> None:
+    """Writes fp8 ``w`` times its scales (as in ``gemv_fp8_rdna2``) to the
+    fp16/bf16 ``out`` of the same shape."""
+    torch.ops._rocm_C.dequant_fp8_rdna2(out, w, scale, block_n, block_k)
+
+
 def gemm_w4a16_exl_rdna2(
     a: torch.Tensor,
     w: torch.Tensor,

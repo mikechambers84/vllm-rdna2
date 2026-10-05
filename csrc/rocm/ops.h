@@ -48,6 +48,15 @@ torch::Tensor gemv_w8a16_rdna2(const at::Tensor& a, const at::Tensor& w,
                                const at::Tensor& scale,
                                const std::optional<at::Tensor>& bias);
 
+torch::Tensor gemv_fp8_rdna2(const at::Tensor& a, const at::Tensor& w,
+                             const at::Tensor& scale, int64_t block_n,
+                             int64_t block_k,
+                             const std::optional<at::Tensor>& bias);
+
+void dequant_fp8_rdna2(torch::Tensor& out, const at::Tensor& w,
+                       const at::Tensor& scale, int64_t block_n,
+                       int64_t block_k);
+
 torch::Tensor gemm_w4a16_exl_rdna2(const at::Tensor& a, const at::Tensor& w,
                                    const at::Tensor& zeros,
                                    const at::Tensor& scales, bool symmetric,
