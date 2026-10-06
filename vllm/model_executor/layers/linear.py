@@ -218,11 +218,15 @@ class UnquantizedLinearMethod(LinearMethodBase):
             from vllm.model_executor.kernels.linear import rdna2_gemm
             from vllm.model_executor.kernels.linear.rdna2_w8a16 import (
                 quantize_weight,
+                relayout_weight,
+                use_rdna2_kmajor_fp16,
                 use_rdna2_w8a16,
             )
 
             if use_rdna2_w8a16(layer.weight):
                 quantize_weight(layer)
+            elif use_rdna2_kmajor_fp16(layer.weight):
+                relayout_weight(layer)
             elif layer.weight.dim() == 2:
                 n, k = layer.weight.shape
                 rdna2_gemm.register(n, k, layer.weight.dtype, layer.weight)
@@ -248,12 +252,12 @@ class UnquantizedLinearMethod(LinearMethodBase):
             current_platform.is_cuda_alike() or current_platform.is_xpu()
         ):
             return linear_batch_invariant(x, layer.weight, bias)
-        if hasattr(layer, "w8a16_weight"):
+        if hasattr(layer, "kmajor_weight"):
             from vllm.model_executor.kernels.linear.rdna2_w8a16 import (
-                apply_rdna2_w8a16,
+                apply_rdna2_kmajor,
             )
 
-            return apply_rdna2_w8a16(layer, x, bias)
+            return apply_rdna2_kmajor(layer, x, bias)
         return self._gemm_impl(layer, x, layer.weight, bias)
 
 

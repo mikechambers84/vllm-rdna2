@@ -18,7 +18,8 @@ from vllm.platforms.rocm import on_gfx1030  # noqa: E402
 
 
 def _from_kmajor(w: torch.Tensor) -> torch.Tensor:
-    """K-major 8-bit weights [K / 4, N, 4] back to [N, K]."""
+    """K-major weights [K / 4, N, 4] (8-bit) or [K / 2, N, 2] (fp16) back to
+    [N, K]."""
     return w.transpose(0, 1).reshape(w.shape[1], -1)
 
 
@@ -39,15 +40,45 @@ def test_unquantized_linear_stores_int8_weights(monkeypatch, num_tokens):
 
     method.process_weights_after_loading(layer)
 
-    assert layer.w8a16_weight.dtype == torch.int8 and layer.weight.numel() == 0
-    assert layer.w8a16_weight.shape == (256, 2048, 4)
+    assert layer.kmajor_weight.dtype == torch.int8 and layer.weight.numel() == 0
+    assert layer.kmajor_weight.shape == (256, 2048, 4)
     x = torch.randn(num_tokens, 1024, dtype=torch.float16, device="cuda")
     out = method.apply(layer, x)
-    dequant = _from_kmajor(layer.w8a16_weight).float() * layer.w8a16_scale[:, None]
+    dequant = _from_kmajor(layer.kmajor_weight).float() * layer.kmajor_scale[:, None]
     ref = torch.nn.functional.linear(x.float(), dequant)
     assert ((out.float() - ref).norm() / ref.norm()).item() < 1e-3
     exact = torch.nn.functional.linear(x.float(), weight.float())
     assert ((out.float() - exact).norm() / exact.norm()).item() < 1e-2
+
+
+@pytest.mark.skipif(not on_gfx1030(), reason="gfx1030 only")
+@pytest.mark.parametrize("num_tokens", [1, 8, 24, 64, 600])
+def test_unquantized_linear_stores_kmajor_fp16_weights(monkeypatch, num_tokens):
+    """VLLM_ROCM_KMAJOR_UNQUANTIZED: the fp16 weight is stored K-major
+    (lossless), so every batch size matches F.linear on the original weight
+    up to fp16 rounding; small layers keep their weight."""
+    from vllm.model_executor.layers.linear import UnquantizedLinearMethod
+
+    monkeypatch.setenv("VLLM_ROCM_KMAJOR_UNQUANTIZED", "1")
+    torch.manual_seed(0)
+    method = UnquantizedLinearMethod()
+    layer = torch.nn.Module()
+    weight = torch.randn(2048, 1024, dtype=torch.float16, device="cuda") * 0.02
+    layer.weight = torch.nn.Parameter(weight.clone(), requires_grad=False)
+    small = torch.nn.Module()
+    small.weight = torch.nn.Parameter(weight[:256].clone(), requires_grad=False)
+
+    method.process_weights_after_loading(layer)
+    method.process_weights_after_loading(small)
+
+    assert layer.kmajor_weight.shape == (512, 2048, 2) and layer.weight.numel() == 0
+    assert torch.equal(_from_kmajor(layer.kmajor_weight), weight)
+    assert not hasattr(small, "kmajor_weight")
+    x = torch.randn(num_tokens, 1024, dtype=torch.float16, device="cuda")
+    bias = torch.randn(2048, dtype=torch.float16, device="cuda")
+    out = method.apply(layer, x, bias)
+    ref = torch.nn.functional.linear(x.float(), weight.float(), bias.float())
+    assert ((out.float() - ref).norm() / ref.norm()).item() < 1e-3
 
 
 def _lm_head(vocab: int, hidden: int):
@@ -76,18 +107,44 @@ def test_lm_head_stores_int8_weights(monkeypatch, num_tokens):
 
     head.quant_method.process_weights_after_loading(head)
 
-    assert head.w8a16_weight.dtype == torch.int8 and head.weight.numel() == 0
+    assert head.kmajor_weight.dtype == torch.int8 and head.weight.numel() == 0
     x = torch.randn(num_tokens, 1024, dtype=torch.float16, device="cuda")
-    dequant = _from_kmajor(head.w8a16_weight).float() * head.w8a16_scale[:, None]
+    dequant = _from_kmajor(head.kmajor_weight).float() * head.kmajor_scale[:, None]
     for rows in (None, 3001):
         if rows is None:
             out = head.quant_method.apply(head, x)
         else:
-            out = rdna2_w8a16.apply_rdna2_w8a16(head, x, None, rows)
+            out = rdna2_w8a16.apply_rdna2_kmajor(head, x, None, rows)
         ref = torch.nn.functional.linear(x.float(), dequant[:rows])
         assert ((out.float() - ref).norm() / ref.norm()).item() < 1e-3
         exact = torch.nn.functional.linear(x.float(), weight[:rows].float())
         assert ((out.float() - exact).norm() / exact.norm()).item() < 1e-2
+
+
+@pytest.mark.skipif(not on_gfx1030(), reason="gfx1030 only")
+@pytest.mark.parametrize("num_tokens", [1, 8, 40])
+def test_lm_head_stores_kmajor_fp16(monkeypatch, num_tokens):
+    """VLLM_ROCM_KMAJOR_UNQUANTIZED: the untied lm_head goes K-major fp16;
+    logits match the original weight, also for a vocabulary prefix that does
+    not end on a whole dword of 4 channels."""
+    from vllm.model_executor.kernels.linear import rdna2_w8a16
+
+    monkeypatch.setenv("VLLM_ROCM_KMAJOR_UNQUANTIZED", "1")
+    torch.manual_seed(0)
+    head = _lm_head(8192, 1024)
+    weight = head.weight.data.clone()
+
+    head.quant_method.process_weights_after_loading(head)
+
+    assert head.kmajor_weight.dtype == torch.float16 and head.weight.numel() == 0
+    x = torch.randn(num_tokens, 1024, dtype=torch.float16, device="cuda")
+    for rows in (None, 3001):
+        if rows is None:
+            out = head.quant_method.apply(head, x)
+        else:
+            out = rdna2_w8a16.apply_rdna2_kmajor(head, x, None, rows)
+        ref = torch.nn.functional.linear(x.float(), weight[:rows].float())
+        assert ((out.float() - ref).norm() / ref.norm()).item() < 1e-3
 
 
 @pytest.mark.skipif(not on_gfx1030(), reason="gfx1030 only")
@@ -98,6 +155,7 @@ def test_tied_lm_head_stays_fp16(monkeypatch):
     )
 
     monkeypatch.setenv("VLLM_ROCM_W8A16_LM_HEAD", "1")
+    monkeypatch.setenv("VLLM_ROCM_KMAJOR_UNQUANTIZED", "1")
     with torch.device("cuda"):
         embed = VocabParallelEmbedding(
             4096, 512, params_dtype=torch.float16, disable_tp=True
@@ -106,7 +164,7 @@ def test_tied_lm_head_stays_fp16(monkeypatch):
 
     head.quant_method.process_weights_after_loading(head)
 
-    assert not hasattr(head, "w8a16_weight") and head.weight is embed.weight
+    assert not hasattr(head, "kmajor_weight") and head.weight is embed.weight
 
 
 def _fp8_dequant(w, scale, block_n, block_k):

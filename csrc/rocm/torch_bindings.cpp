@@ -76,7 +76,7 @@ TORCH_LIBRARY_EXPAND(TORCH_EXTENSION_NAME, rocm_ops) {
   // with 2D block scales) with fp16/bf16 activations, or int8 weights with
   // int8 activations (W8A8, per-token scale_a), any number of rows.
   rocm_ops.def(
-      "gemm_w8_rdna2(Tensor a, Tensor w, Tensor scale, Tensor? block_scale, "
+      "gemm_w8_rdna2(Tensor a, Tensor w, Tensor? scale, Tensor? block_scale, "
       "int block_n, int block_k, Tensor? bias, int cfg, Tensor? scale_a=None, "
       "ScalarType? out_dtype=None) -> Tensor");
   rocm_ops.impl("gemm_w8_rdna2", torch::kCUDA, &gemm_w8_rdna2);
@@ -146,6 +146,13 @@ TORCH_LIBRARY_EXPAND(TORCH_EXTENSION_NAME, rocm_ops) {
       "Tensor num_tokens_post_padded, Tensor topk_weights, int top_k, "
       "bool mul_routed_weight, int block_m) -> ()");
   rocm_ops.impl("moe_int8_gemm_rdna2", torch::kCUDA, &moe_int8_gemm_rdna2);
+  // The same on int4 group-quantized weights (W4A8 opt-in).
+  rocm_ops.def(
+      "moe_w4a8_gemm_rdna2(Tensor! output, Tensor a, Tensor a_scale, Tensor w, "
+      "Tensor scales, Tensor? zeros, Tensor sorted_ids, Tensor expert_ids, "
+      "Tensor num_tokens_post_padded, Tensor topk_weights, int top_k, "
+      "bool mul_routed_weight, int block_m) -> ()");
+  rocm_ops.impl("moe_w4a8_gemm_rdna2", torch::kCUDA, &moe_w4a8_gemm_rdna2);
   // Paged causal GQA attention for prefill (fp16, head 64/128/256; sliding
   // window, softcap, sinks).
   rocm_ops.def(

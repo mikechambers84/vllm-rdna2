@@ -34,11 +34,13 @@ def _rdna2_gdn_available() -> bool:
 
 
 def _use_rdna2_gdn(q, k, v, beta, g, cu_seqlens, initial_state) -> bool:
+    # bf16 runs through the fp16 kernels (see chunk_gated_delta_rule_fwd).
     return (
         cu_seqlens is not None
         and cu_seqlens.dtype == torch.int32
         and k.shape[0] == 1
-        and q.dtype == k.dtype == v.dtype == torch.float16
+        and q.dtype == k.dtype == v.dtype
+        and q.dtype in (torch.float16, torch.bfloat16)
         and beta.dtype == g.dtype == torch.float32
         and q.shape[-1] == k.shape[-1] == v.shape[-1] == 128
         and FLA_CHUNK_SIZE == 64
@@ -47,7 +49,8 @@ def _use_rdna2_gdn(q, k, v, beta, g, cu_seqlens, initial_state) -> bool:
             initial_state is None
             or (
                 initial_state.is_contiguous()
-                and initial_state.dtype in (torch.float32, torch.float16)
+                and initial_state.dtype
+                in (torch.float32, torch.float16, torch.bfloat16)
             )
         )
         and _rdna2_gdn_available()
@@ -106,10 +109,23 @@ def chunk_gated_delta_rule_fwd(
     core_attn_out: torch.Tensor | None = None,
 ):
     if _use_rdna2_gdn(q, k, v, beta, g, cu_seqlens, initial_state):
+        bf16 = q.dtype == torch.bfloat16
+        if bf16:
+            # fp16 kernels: q and k are l2-normalized, v saturates at fp16's
+            # range, the state stays fp32.
+            q, k, v = (t.clamp(-65504.0, 65504.0).half() for t in (q, k, v))
+            if initial_state is not None and initial_state.dtype == torch.bfloat16:
+                initial_state = initial_state.float()
+            bf16_out, core_attn_out = core_attn_out, None
         g, o, w, h, v_new, final_state = _chunk_gated_delta_rule_fwd_rdna2(
             q, k, v, g, beta, scale, initial_state, output_final_state,
             cu_seqlens, chunk_indices, chunk_offsets, core_attn_out,
         )
+        if bf16:
+            if bf16_out is not None:
+                o = bf16_out[: o.numel()].view(*o.shape).copy_(o)
+            else:
+                o = o.to(torch.bfloat16)
         if SUPPRESS_LEVEL < 3:
             return g, o, None, final_state, None, None, None
         return g, o, None, final_state, w, h, v_new

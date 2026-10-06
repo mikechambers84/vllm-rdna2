@@ -1120,6 +1120,7 @@ def ref_paged_attn_sinks(
         (40, 30.0, True),
     ],
 )
+@pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
 @torch.inference_mode()
 def test_unified_attn_rdna2_prefill(
     seq_lens: list[tuple[int, int]],
@@ -1129,11 +1130,12 @@ def test_unified_attn_rdna2_prefill(
     sliding_window: int | None,
     soft_cap: float | None,
     use_sinks: bool,
+    dtype: torch.dtype,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """fp16 prefill batches on gfx1030 run the HIP kernel, with sliding window,
-    softcap and sinks, and match the reference, decode rows of mixed batches
-    included."""
+    """fp16 and bf16 (run in fp16) prefill batches on gfx1030 run the HIP
+    kernel, with sliding window, softcap and sinks, and match the reference,
+    decode rows of mixed batches included."""
     from vllm import _custom_ops as ops
 
     torch.set_default_device(DEVICE_TYPE)
@@ -1142,11 +1144,9 @@ def test_unified_attn_rdna2_prefill(
     kv_lens = [x[1] for x in seq_lens]
     num_query_heads, num_kv_heads = num_heads
     num_blocks = 4096 // block_size + 64
-    query = torch.randn(
-        sum(query_lens), num_query_heads, head_size, dtype=torch.float16
-    )
+    query = torch.randn(sum(query_lens), num_query_heads, head_size, dtype=dtype)
     key_cache = torch.randn(
-        num_blocks, block_size, num_kv_heads, head_size, dtype=torch.float16
+        num_blocks, block_size, num_kv_heads, head_size, dtype=dtype
     )
     value_cache = torch.randn_like(key_cache)
     cu_query_lens = torch.tensor([0] + query_lens, dtype=torch.int32).cumsum(
@@ -1209,17 +1209,20 @@ def test_unified_attn_rdna2_prefill(
 @pytest.mark.parametrize("num_heads", [(24, 4), (16, 2), (32, 8), (12, 3)])
 @pytest.mark.parametrize("head_size", [256, 128, 64])
 @pytest.mark.parametrize("block_size", [16, 784])
+@pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
 @torch.inference_mode()
 def test_unified_attn_rdna2_decode(
     q_len: int,
     num_heads: tuple[int, int],
     head_size: int,
     block_size: int,
+    dtype: torch.dtype,
     monkeypatch,
 ) -> None:
     """Decode and spec-decode verify batches (the 3D split-KV path) on gfx1030
-    run the HIP segment kernel and match the reference; heads below 256 are
-    packed several per workgroup (odd kv head counts leave a partial pack)."""
+    run the HIP segment kernel (bf16 in fp16) and match the reference; heads
+    below 256 are packed several per workgroup (odd kv head counts leave a
+    partial pack)."""
     from vllm import _custom_ops as ops
 
     torch.set_default_device(DEVICE_TYPE)
@@ -1229,11 +1232,9 @@ def test_unified_attn_rdna2_decode(
     query_lens = [q_len] * len(kv_lens)
     num_query_heads, num_kv_heads = num_heads
     num_blocks = sum(kv_lens) // block_size + 64
-    query = torch.randn(
-        sum(query_lens), num_query_heads, head_size, dtype=torch.float16
-    )
+    query = torch.randn(sum(query_lens), num_query_heads, head_size, dtype=dtype)
     key_cache = torch.randn(
-        num_blocks, block_size, num_kv_heads, head_size, dtype=torch.float16
+        num_blocks, block_size, num_kv_heads, head_size, dtype=dtype
     )
     value_cache = torch.randn_like(key_cache)
     cu_query_lens = torch.tensor([0] + query_lens, dtype=torch.int32).cumsum(
