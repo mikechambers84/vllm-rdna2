@@ -47,23 +47,27 @@ def _experts(n, k, group=GROUP, zp=False):
 
 def _reference(x, topk_weights, topk_ids, w13_ref, w2_ref):
     gate_up = torch.einsum("tk,tjnk->tjn", x.float(), w13_ref[topk_ids])
-    hidden = F.silu(gate_up[..., :INTER]) * gate_up[..., INTER:]
+    inter = gate_up.shape[-1] // 2
+    hidden = F.silu(gate_up[..., :inter]) * gate_up[..., inter:]
     return torch.einsum("tj,tjhn,tjn->th", topk_weights, w2_ref[topk_ids], hidden)
 
 
 @pytest.mark.parametrize("zp", [False, True])
 @pytest.mark.parametrize("group", [32, 128])
 @pytest.mark.parametrize("num_tokens", [1, 3, 16])
-def test_moe_wna16_decode_rdna2_matches_reference(num_tokens, group, zp):
+@pytest.mark.parametrize("dims", [(H, INTER), (1152, 384)])
+def test_moe_wna16_decode_rdna2_matches_reference(num_tokens, group, zp, dims):
     """Exact integer dequant with the group scale applied in fp32 keeps the
     error at fp16-rounding level (a scale-folded fp16 dequant costs ~2.5%),
-    for both group sizes and with zero points."""
+    for both group sizes and with zero points; H and I need not be multiples
+    of 256 (or of the 8 * R rows a workgroup covers)."""
     from vllm import _custom_ops as ops
 
+    hidden, inter = dims
     torch.manual_seed(0)
-    w13, s13, w13_ref, z13 = _experts(2 * INTER, H, group, zp)
-    w2, s2, w2_ref, z2 = _experts(H, INTER, group, zp)
-    x = torch.randn(num_tokens, H, dtype=torch.float16, device="cuda") * 0.5
+    w13, s13, w13_ref, z13 = _experts(2 * inter, hidden, group, zp)
+    w2, s2, w2_ref, z2 = _experts(hidden, inter, group, zp)
+    x = torch.randn(num_tokens, hidden, dtype=torch.float16, device="cuda") * 0.5
     topk_weights, topk_ids = torch.topk(
         torch.randn(num_tokens, E, device="cuda").softmax(-1), TOPK, dim=-1
     )
@@ -72,8 +76,8 @@ def test_moe_wna16_decode_rdna2_matches_reference(num_tokens, group, zp):
     # Triton path's alignment drops) must contribute nothing, not fault.
     topk_ids[0, -1] = E
     topk_weights[0, -1] = 0.0
-    out = torch.empty(num_tokens, H, dtype=torch.float16, device="cuda")
-    act = torch.empty(num_tokens * TOPK, INTER, dtype=torch.float16, device="cuda")
+    out = torch.empty(num_tokens, hidden, dtype=torch.float16, device="cuda")
+    act = torch.empty(num_tokens * TOPK, inter, dtype=torch.float16, device="cuda")
 
     ops.moe_wna16_decode_rdna2(
         out, x, topk_ids, topk_weights, w13, s13, w2, s2, act, z13, z2
@@ -85,24 +89,28 @@ def test_moe_wna16_decode_rdna2_matches_reference(num_tokens, group, zp):
 
 
 @pytest.mark.parametrize("num_tokens", [1, 3, 32])
-def test_moe_int8_decode_rdna2_matches_reference(num_tokens):
+@pytest.mark.parametrize("dims", [(H, INTER), (1040, 176)])
+def test_moe_int8_decode_rdna2_matches_reference(num_tokens, dims):
     """int8 weights are converted exactly to fp16 and the activations stay
     fp16, so the error is fp16 rounding (the W8A8 path also quantizes the
-    activations, ~2e-2)."""
+    activations, ~2e-2); H and I need only be multiples of 16."""
     from vllm import _custom_ops as ops
 
+    hidden, inter = dims
     torch.manual_seed(0)
-    w13 = torch.randint(-127, 128, (E, 2 * INTER, H), dtype=torch.int8, device="cuda")
-    w2 = torch.randint(-127, 128, (E, H, INTER), dtype=torch.int8, device="cuda")
-    s13 = torch.rand(E, 2 * INTER, 1, device="cuda") * 2e-4 + 1e-5
-    s2 = torch.rand(E, H, 1, device="cuda") * 2e-4 + 1e-5
-    x = torch.randn(num_tokens, H, dtype=torch.float16, device="cuda") * 0.5
+    w13 = torch.randint(
+        -127, 128, (E, 2 * inter, hidden), dtype=torch.int8, device="cuda"
+    )
+    w2 = torch.randint(-127, 128, (E, hidden, inter), dtype=torch.int8, device="cuda")
+    s13 = torch.rand(E, 2 * inter, 1, device="cuda") * 2e-4 + 1e-5
+    s2 = torch.rand(E, hidden, 1, device="cuda") * 2e-4 + 1e-5
+    x = torch.randn(num_tokens, hidden, dtype=torch.float16, device="cuda") * 0.5
     topk_weights, topk_ids = torch.topk(
         torch.randn(num_tokens, E, device="cuda").softmax(-1), TOPK, dim=-1
     )
     topk_ids = topk_ids.int()
-    out = torch.empty(num_tokens, H, dtype=torch.float16, device="cuda")
-    act = torch.empty(num_tokens * TOPK, INTER, dtype=torch.float16, device="cuda")
+    out = torch.empty(num_tokens, hidden, dtype=torch.float16, device="cuda")
+    act = torch.empty(num_tokens * TOPK, inter, dtype=torch.float16, device="cuda")
 
     ops.moe_int8_decode_rdna2(out, x, topk_ids, topk_weights, w13, s13, w2, s2, act)
 
