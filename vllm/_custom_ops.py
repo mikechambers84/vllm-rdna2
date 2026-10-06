@@ -2426,6 +2426,38 @@ def moe_int8_gemm_rdna2(
     )
 
 
+def moe_int8_skinny_rdna2(
+    output: torch.Tensor,
+    a: torch.Tensor,
+    a_scale: torch.Tensor,
+    w: torch.Tensor,
+    w_scale: torch.Tensor,
+    sorted_ids: torch.Tensor,
+    expert_ids: torch.Tensor,
+    num_tokens_post_padded: torch.Tensor,
+    topk_weights: torch.Tensor,
+    top_k: int,
+    mul_routed_weight: bool,
+    block_m: int,
+) -> None:
+    """``moe_int8_gemm_rdna2`` for a few routed rows per expert
+    (moe_align_block_size(16) blocks, weights streamed once per block)."""
+    torch.ops._rocm_C.moe_int8_skinny_rdna2(
+        output,
+        a,
+        a_scale,
+        w,
+        w_scale,
+        sorted_ids,
+        expert_ids,
+        num_tokens_post_padded,
+        topk_weights,
+        top_k,
+        mul_routed_weight,
+        block_m,
+    )
+
+
 def moe_w4a8_gemm_rdna2(
     output: torch.Tensor,
     a: torch.Tensor,

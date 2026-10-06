@@ -201,12 +201,21 @@ def test_moe_wna16_skinny_rdna2_matches_reference(block_m, group, zp, dims):
     assert ((out - ref).norm() / ref.norm()).item() < 2e-3
 
 
-@pytest.mark.parametrize("block_m", [64, 128])
-def test_moe_int8_gemm_rdna2_prefill_matches_triton(block_m):
-    """The W8A8 prefill GEMM runs the same integer math as the Triton int8
-    kernel (int8 rows gathered by moe_align_block_size, per-row activation and
-    per-channel weight scales, top-k weights on the second GEMM), so both
-    routed GEMMs match it to fp16 output rounding."""
+@pytest.mark.parametrize(
+    "op,block_m",
+    [
+        ("moe_int8_gemm_rdna2", 64),
+        ("moe_int8_gemm_rdna2", 128),
+        ("moe_int8_skinny_rdna2", 16),
+    ],
+)
+@pytest.mark.parametrize("dims", [(H, INTER), (1040, 176)])
+def test_moe_int8_gemm_rdna2_prefill_matches_triton(op, block_m, dims):
+    """The W8A8 routed GEMMs (tiled, and skinny for a few rows per expert) run
+    the same integer math as the Triton int8 kernel (int8 rows gathered by
+    moe_align_block_size, per-row activation and per-channel weight scales,
+    top-k weights on the second GEMM), so both routed GEMMs match it to fp16
+    output rounding; the skinny kernel also on K off its 256-wide batches."""
     import triton.language as tl
 
     from vllm import _custom_ops as ops
@@ -217,14 +226,19 @@ def test_moe_int8_gemm_rdna2_prefill_matches_triton(block_m):
         moe_align_block_size,
     )
 
+    hidden, inter = dims
+    if op == "moe_int8_gemm_rdna2" and (hidden % 64 or inter % 64):
+        pytest.skip("the tiled GEMM needs K % 64 == 0")
     torch.manual_seed(0)
     num_tokens = 128
-    w13 = torch.randint(-127, 128, (E, 2 * INTER, H), dtype=torch.int8, device="cuda")
-    w2 = torch.randint(-127, 128, (E, H, INTER), dtype=torch.int8, device="cuda")
-    s13 = torch.rand(E, 2 * INTER, 1, device="cuda") * 2e-4 + 1e-5
-    s2 = torch.rand(E, H, 1, device="cuda") * 2e-4 + 1e-5
-    x = torch.randn(num_tokens, H, dtype=torch.float16, device="cuda") * 0.5
-    act = torch.randn(num_tokens * TOPK, INTER, dtype=x.dtype, device="cuda") * 0.5
+    w13 = torch.randint(
+        -127, 128, (E, 2 * inter, hidden), dtype=torch.int8, device="cuda"
+    )
+    w2 = torch.randint(-127, 128, (E, hidden, inter), dtype=torch.int8, device="cuda")
+    s13 = torch.rand(E, 2 * inter, 1, device="cuda") * 2e-4 + 1e-5
+    s2 = torch.rand(E, hidden, 1, device="cuda") * 2e-4 + 1e-5
+    x = torch.randn(num_tokens, hidden, dtype=torch.float16, device="cuda") * 0.5
+    act = torch.randn(num_tokens * TOPK, inter, dtype=x.dtype, device="cuda") * 0.5
     x_q, x_s, _ = ops.scaled_int8_quant(x, None, None, True)
     act_q, act_s, _ = ops.scaled_int8_quant(act, None, None, True)
     topk_weights, topk_ids = torch.topk(
@@ -271,7 +285,7 @@ def test_moe_int8_gemm_rdna2_prefill_matches_triton(block_m):
             **flags,
         )
         out = torch.empty_like(ref)
-        ops.moe_int8_gemm_rdna2(
+        getattr(ops, op)(
             out, a, a_s.view(-1), w, w_s, *align, topk_weights, top_k, mul, block_m
         )
         torch.testing.assert_close(out, ref, rtol=2e-3, atol=1e-3)

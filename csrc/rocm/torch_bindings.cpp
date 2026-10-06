@@ -156,6 +156,14 @@ TORCH_LIBRARY_EXPAND(TORCH_EXTENSION_NAME, rocm_ops) {
       "Tensor num_tokens_post_padded, Tensor topk_weights, int top_k, "
       "bool mul_routed_weight, int block_m) -> ()");
   rocm_ops.impl("moe_int8_gemm_rdna2", torch::kCUDA, &moe_int8_gemm_rdna2);
+  // The same at a few routed rows per expert (lanes along N).
+  rocm_ops.def(
+      "moe_int8_skinny_rdna2(Tensor! output, Tensor a, Tensor a_scale, Tensor "
+      "w, "
+      "Tensor w_scale, Tensor sorted_ids, Tensor expert_ids, "
+      "Tensor num_tokens_post_padded, Tensor topk_weights, int top_k, "
+      "bool mul_routed_weight, int block_m) -> ()");
+  rocm_ops.impl("moe_int8_skinny_rdna2", torch::kCUDA, &moe_int8_skinny_rdna2);
   // The same on int4 group-quantized weights (W4A8 opt-in).
   rocm_ops.def(
       "moe_w4a8_gemm_rdna2(Tensor! output, Tensor a, Tensor a_scale, Tensor w, "

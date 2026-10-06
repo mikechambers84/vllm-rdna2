@@ -410,10 +410,12 @@ class Rdna2Int8Experts(TritonExperts):
     with the fp16 activations (no activation quantization, so more accurate
     than the Triton W8A8 path): 7x tuned Triton at 1 token, 2.2x at 8, 1.5x at
     32 on a V620 (E=256, top-8), even near 64. With dynamic per-token
-    activation scales, batches with at least 32 routed rows per expert run
-    the two routed GEMMs on ``moe_int8_gemm_rdna2`` (same integer math as the
-    Triton W8A8 kernel; 1.24x at 1024 tokens, 1.3x at 2048, 1.47x at 8192). Other
-    batches take the Triton path."""
+    activation scales, the two routed GEMMs of larger batches run with the
+    Triton W8A8 kernel's integer math on ``moe_int8_skinny_rdna2`` below 32
+    routed rows per expert (lanes along N, weights streamed once per 16-row
+    block; 1.25-1.34x Triton at 1-8 rows, 1.14x at 16) and on
+    ``moe_int8_gemm_rdna2`` from 32 (1.24x at 1024 tokens, 1.3x at 2048, 1.47x
+    at 8192). Other batches take the Triton path."""
 
     MAX_DECODE_TOKENS = 32
 
@@ -466,8 +468,11 @@ class Rdna2Int8Experts(TritonExperts):
         w1_scale, w2_scale = self.w1_scale, self.w2_scale
         num_tokens, top_k = topk_ids.shape
         return (
-            num_tokens * top_k >= 32 * w1.size(0)
-            and rdna2_moe_kernel_available("moe_int8_gemm_rdna2")
+            rdna2_moe_kernel_available(
+                "moe_int8_gemm_rdna2"
+                if num_tokens * top_k >= 32 * w1.size(0)
+                else "moe_int8_skinny_rdna2"
+            )
             and hidden_states.dtype == torch.float16
             and self.quant_config.use_int8_w8a8
             and self.block_shape is None
@@ -504,14 +509,19 @@ class Rdna2Int8Experts(TritonExperts):
     ) -> None:
         num_tokens, top_k = topk_ids.shape
         num_experts, n = w1.size(0), w1.size(1)
-        block_m = 64 if num_tokens * top_k <= 96 * num_experts else 128
+        rows = num_tokens * top_k
+        if rows < 32 * num_experts:
+            gemm, block_m = ops.moe_int8_skinny_rdna2, 16
+        else:
+            gemm = ops.moe_int8_gemm_rdna2
+            block_m = 64 if rows <= 96 * num_experts else 128
         sorted_ids, expert_ids, num_post_padded = moe_align_block_size(
             topk_ids, block_m, num_experts
         )
         weights = topk_weights.to(torch.float32).contiguous()
         x_q, x_s, _ = ops.scaled_int8_quant(hidden_states, None, None, True)
         cache1 = _resize_cache(workspace2, (num_tokens, top_k, n))
-        ops.moe_int8_gemm_rdna2(
+        gemm(
             cache1,
             x_q,
             x_s.view(-1),
@@ -532,7 +542,7 @@ class Rdna2Int8Experts(TritonExperts):
         self.activation(activation, cache2, cache1.view(-1, n))
         a2_q, a2_s, _ = ops.scaled_int8_quant(cache2, None, None, True)
         cache3 = _resize_cache(workspace2, (num_tokens, top_k, hidden_states.size(1)))
-        ops.moe_int8_gemm_rdna2(
+        gemm(
             cache3,
             a2_q,
             a2_s.view(-1),

@@ -22,6 +22,14 @@
 // re-quantizes the nibbles to int8 on their way into LDS, as the dense W4A8
 // prefill path does. 35B experts: 1.6-1.8x moe_wna16_gemm_rdna2 at 1K-8K
 // tokens.
+// moe_int8_skinny_rdna2 is the int8 counterpart of moe_wna16_skinny_rdna2 for
+// a few routed rows per expert: one moe_align_block_size(16) block and a
+// column slice per workgroup, lanes along N streaming their columns' int8
+// weights from global memory in 8 x 16-byte batches (16 k each, straight
+// v_dot4 operands), the block's int8 rows in LDS (K phases over 32 KB), two
+// waves along K. That range is weight-bandwidth bound with int8 weights (805
+// MB of 35B experts per layer): 1.25-1.34x the Triton int8 kernel at 1-8 rows
+// per expert, 1.14x at 16.
 
 #include <torch/all.h>
 #include <c10/cuda/CUDAGuard.h>
@@ -43,6 +51,7 @@ static constexpr int K4 = BK / 4;
 static constexpr int CH = BK / 16;  // 16-byte chunks per row per stage
 static constexpr int TN = 16;
 static constexpr int BN = 16 * TN;
+static constexpr int SKINNY_LDS_BYTES = 32768;  // int8 activations per phase
 
 #if defined(__HIP__RDNA2__) || !defined(__HIP_DEVICE_COMPILE__)
 
@@ -251,7 +260,108 @@ __global__ void __launch_bounds__(THREADS) moe_int8_gemm_rdna2_kernel(
   }
 }
 
+// Skinny variant: T rows per workgroup, NW waves along K (8 / NW along N, one
+// column per lane), U 16-byte batches; kp: K per activation phase.
+template <int T, int NW, int U, bool MUL_W>
+__global__ void __launch_bounds__(THREADS) moe_int8_skinny_rdna2_kernel(
+    const int8_t* __restrict__ A, const float* __restrict__ AS,
+    const int8_t* __restrict__ W, const float* __restrict__ WS,
+    __half* __restrict__ C, const int* __restrict__ sorted_ids,
+    const int* __restrict__ expert_ids, const int* __restrict__ num_post_padded,
+    const float* __restrict__ topk_w, const int num_valid, const int top_k,
+    const int N, const int K, const int E, const int lda, const int ldc,
+    const int kp) {
+  constexpr int WC = 8 / NW;
+  constexpr int NC = WC * 32;
+  constexpr int KB = 16 * U;
+  __shared__ __align__(16) int sA[SKINNY_LDS_BYTES / 4];
+  __shared__ int sR[NW > 1 ? NW - 1 : 1][T][NC];
+  const int tid = threadIdx.x, lane = tid % 32, wave = tid / 32;
+  const int row0 = blockIdx.x * T;
+  if (row0 >= num_post_padded[0]) return;
+  const int e = expert_ids[blockIdx.x];
+  if (e < 0 || e >= E) return;
+  int sid[T];
+  #pragma unroll
+  for (int t = 0; t < T; t++) sid[t] = sorted_ids[row0 + t];
+  const int wn = wave % WC, wk = wave / WC;
+  const int n = blockIdx.y * NC + wn * 32 + lane;
+  const int col = min(n, N - 1);
+  const int8_t* Wc = W + ((long)e * N + col) * K;
+  uint4 wq[U];
+  auto load = [&](int k) {
+  #pragma unroll
+    for (int u = 0; u < U; u++)
+      wq[u] = *reinterpret_cast<const uint4*>(Wc + k + 16 * u);
+  };
+  int acc[T];
+  #pragma unroll
+  for (int t = 0; t < T; t++) acc[t] = 0;
+  const int ks = kp / NW, kpd = kp / 4;
+  for (int p0 = 0; p0 < K; p0 += kp) {
+    const int kbeg = p0 + wk * ks;
+    load(kbeg);  // in flight while the phase's activations are gathered
+    if (p0 > 0) __syncthreads();
+    for (int i = tid; i < T * (kp / 16); i += THREADS) {
+      const int t = i / (kp / 16), c = i % (kp / 16);
+      int4 v = make_int4(0, 0, 0, 0);
+      if (sid[t] < num_valid)
+        v = *reinterpret_cast<const int4*>(A + (long)(sid[t] / top_k) * lda +
+                                           p0 + c * 16);
+      *reinterpret_cast<int4*>(&sA[t * kpd + c * 4]) = v;
+    }
+    __syncthreads();
+    for (int kb = kbeg; kb < kbeg + ks; kb += KB) {
+      uint4 cur[U];
+  #pragma unroll
+      for (int u = 0; u < U; u++) cur[u] = wq[u];
+      if (kb + KB < kbeg + ks) load(kb + KB);
+  #pragma unroll
+      for (int u = 0; u < U; u++) {
+        const int k = kb + 16 * u;
+  #pragma unroll
+        for (int t = 0; t < T; t++) {
+          const int4 a =
+              *reinterpret_cast<const int4*>(&sA[t * kpd + (k - p0) / 4]);
+          int v = acc[t];
+          v = __builtin_amdgcn_sdot4(a.x, (int)cur[u].x, v, false);
+          v = __builtin_amdgcn_sdot4(a.y, (int)cur[u].y, v, false);
+          v = __builtin_amdgcn_sdot4(a.z, (int)cur[u].z, v, false);
+          v = __builtin_amdgcn_sdot4(a.w, (int)cur[u].w, v, false);
+          acc[t] = v;
+        }
+      }
+    }
+  }
+  if constexpr (NW > 1) {
+    const int lc = wn * 32 + lane;
+    if (wk > 0)
+  #pragma unroll
+      for (int t = 0; t < T; t++) sR[wk - 1][t][lc] = acc[t];
+    __syncthreads();
+    if (wk > 0) return;
+  #pragma unroll
+    for (int s = 0; s < NW - 1; s++)
+  #pragma unroll
+      for (int t = 0; t < T; t++) acc[t] += sR[s][t][lc];
+  }
+  if (n >= N) return;
+  const float ws = WS[(long)e * N + n];
+  #pragma unroll
+  for (int t = 0; t < T; t++) {
+    if (sid[t] >= num_valid) continue;
+    const float sc = AS[sid[t] / top_k] * (MUL_W ? topk_w[sid[t]] : 1.f);
+    C[(long)sid[t] * ldc + n] = __float2half(acc[t] * sc * ws);
+  }
+}
+
 #else  // non-RDNA2 device pass: empty stub for symbol parity.
+
+template <int T, int NW, int U, bool MUL_W>
+__global__ void moe_int8_skinny_rdna2_kernel(
+    const int8_t*, const float*, const int8_t*, const float*, __half*,
+    const int*, const int*, const int*, const float*, const int, const int,
+    const int, const int, const int, const int, const int, const int) {}
 
 template <int RM, int UNR, bool MUL_W, bool W4, bool ZP>
 __global__ void moe_int8_gemm_rdna2_kernel(
@@ -424,4 +534,83 @@ void moe_w4a8_gemm_rdna2(torch::Tensor& output, const torch::Tensor& a,
         expert_ids, num_tokens_post_padded, topk_weights, top_k,
         mul_routed_weight, block_m, N, K, K / groups, E);
   }
+}
+
+// moe_int8_gemm_rdna2 for a few routed rows per expert (block_m 16 alignment):
+// same operands and layout; K % 16 == 0, any N.
+void moe_int8_skinny_rdna2(torch::Tensor& output, const torch::Tensor& a,
+                           const torch::Tensor& a_scale, const torch::Tensor& w,
+                           const torch::Tensor& w_scale,
+                           const torch::Tensor& sorted_ids,
+                           const torch::Tensor& expert_ids,
+                           const torch::Tensor& num_tokens_post_padded,
+                           const torch::Tensor& topk_weights, int64_t top_k,
+                           bool mul_routed_weight, int64_t block_m) {
+  using namespace vllm::moe_int8_gemm_rdna2;
+  TORCH_CHECK(a.dtype() == torch::kInt8 && w.dtype() == torch::kInt8 &&
+                  output.dtype() == torch::kFloat16,
+              "moe_int8_skinny_rdna2 needs int8 activations and weights and an "
+              "fp16 output");
+  check_routing(a_scale, sorted_ids, expert_ids, num_tokens_post_padded,
+                topk_weights);
+  TORCH_CHECK(w.dim() == 3 && w.is_contiguous(),
+              "moe_int8_skinny_rdna2 needs contiguous [E, N, K] weights");
+  const int E = w.size(0), N = w.size(1), K = w.size(2);
+  TORCH_CHECK(
+      w_scale.dtype() == torch::kFloat32 && w_scale.is_contiguous() &&
+          w_scale.numel() == (long)E * N,
+      "moe_int8_skinny_rdna2 needs one contiguous fp32 weight scale per "
+      "output channel");
+  TORCH_CHECK(K % 16 == 0, "moe_int8_skinny_rdna2 needs K % 16 == 0");
+  TORCH_CHECK(a.dim() == 2 && a.size(1) == K && a.stride(1) == 1 &&
+                  a.stride(0) % 16 == 0 &&
+                  reinterpret_cast<uintptr_t>(a.data_ptr()) % 16 == 0 &&
+                  a_scale.numel() == a.size(0),
+              "moe_int8_skinny_rdna2 needs a [rows, K] with 16-byte aligned, "
+              "K-contiguous rows and one scale per row");
+  const int num_valid = topk_weights.numel();
+  TORCH_CHECK(output.is_contiguous() && output.numel() == (long)num_valid * N,
+              "moe_int8_skinny_rdna2 needs a contiguous [num_valid, N] output");
+  TORCH_CHECK(block_m == 16, "moe_int8_skinny_rdna2 supports block_m 16");
+  constexpr int T = 16;
+  // Largest K per phase that divides K, is a multiple of the waves' batch
+  // span and keeps the T x kp int8 tile within the LDS budget; 0 if none.
+  auto phase_k = [&](int step) {
+    for (int kp = K - K % step; kp >= step; kp -= step)
+      if (K % kp == 0 && T * kp <= SKINNY_LDS_BYTES) return kp;
+    return 0;
+  };
+
+  const at::cuda::OptionalCUDAGuard device_guard(device_of(a));
+  const cudaStream_t stream = at::cuda::getCurrentCUDAStream();
+#define VLLM_I8_SKINNY_LAUNCH(NW, U, MW)                                       \
+  {                                                                            \
+    constexpr int nc = (8 / NW) * 32;                                          \
+    const dim3 grid(expert_ids.numel(), (N + nc - 1) / nc);                    \
+    moe_int8_skinny_rdna2_kernel<T, NW, U, MW><<<grid, THREADS, 0, stream>>>(  \
+        a.data_ptr<int8_t>(), a_scale.data_ptr<float>(), w.data_ptr<int8_t>(), \
+        w_scale.data_ptr<float>(), (__half*)output.data_ptr(),                 \
+        sorted_ids.data_ptr<int>(), expert_ids.data_ptr<int>(),                \
+        num_tokens_post_padded.data_ptr<int>(),                                \
+        topk_weights.data_ptr<float>(), num_valid, top_k, N, K, E,             \
+        a.stride(0), N, kp);                                                   \
+  }
+  // Two waves along K, 128-byte batches; single-step batches when K is not a
+  // multiple of their span.
+  int kp = phase_k(2 * 16 * 8);
+  if (kp) {
+    if (mul_routed_weight) {
+      VLLM_I8_SKINNY_LAUNCH(2, 8, true)
+    } else {
+      VLLM_I8_SKINNY_LAUNCH(2, 8, false)
+    }
+  } else {
+    kp = phase_k(16);
+    if (mul_routed_weight) {
+      VLLM_I8_SKINNY_LAUNCH(1, 1, true)
+    } else {
+      VLLM_I8_SKINNY_LAUNCH(1, 1, false)
+    }
+  }
+#undef VLLM_I8_SKINNY_LAUNCH
 }
