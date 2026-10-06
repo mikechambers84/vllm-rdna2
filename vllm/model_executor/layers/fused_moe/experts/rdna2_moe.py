@@ -5,18 +5,18 @@ weights.
 
 W4A16:
 Same weights as ``TritonWNA16Experts`` (``[E, N, K/2]`` uint8, N-first group
-scales, optional N-packed zero points). Batches of int4 experts (group size a
-multiple of 32, symmetric or with zero points) with fp16 activations and SiLU
-run on ``moe_wna16_decode_rdna2`` (gate/up with SiLU fused, then down with the
-top-k sum in registers) while each expert gets at most MAX_DECODE_ROWS_PER_EXPERT
-routed rows (each token re-reads its experts): on a V620 it beats tuned Triton
-5-7x at 1 token and 1.5-2.3x at 2-4 rows per expert (E=8-256, group size 32 or
-128). Larger batches run the two routed GEMMs on ``moe_wna16_gemm_rdna2``,
-which beats Triton at every batch size: 1.2-1.4x up to ~16 rows per expert,
-1.8-2.2x at 1024+ tokens. With VLLM_ROCM_W4A8_PREFILL, prefill batches run
-``moe_w4a8_gemm_rdna2`` instead (per-token int8 activations, experts
-re-quantized to int8 per channel): another 1.2-1.4x up to ~16 rows per
-expert, 1.7-1.8x from 1K tokens.
+scales, optional N-packed zero points), int4 experts with a group size that is
+a multiple of 32, symmetric or with zero points, fp16 activations, SiLU:
+- up to ~2 routed rows per expert: ``moe_wna16_decode_rdna2`` (gate/up with
+  SiLU fused, then down with the top-k sum in registers; each token re-reads
+  its experts), 5-7x tuned Triton at 1 token;
+- up to ~28 rows per expert: both routed GEMMs on ``moe_wna16_skinny_rdna2``
+  (lanes along N, weights streamed once per block of 4-16 rows), 1.4-2.5x the
+  tiled GEMM at 4-24 rows;
+- beyond: ``moe_wna16_gemm_rdna2`` (16 * RM x 256 tiles), 1.8-2.2x Triton at
+  1024+ tokens, or with VLLM_ROCM_W4A8_PREFILL ``moe_w4a8_gemm_rdna2``
+  (per-token int8 activations, experts re-quantized to int8 per channel),
+  another 1.7-1.8x from 1K tokens.
 
 FP8: ``Rdna2Fp8Experts`` (weight-only, fp16 activations) on the same two kinds
 of kernels.
@@ -105,9 +105,17 @@ def _decode_lds_ok(hidden: int, intermediate: int, topk: int) -> bool:
 
 
 class Rdna2WNA16Experts(TritonWNA16Experts):
-    # The decode kernel beats the routed GEMMs up to ~4-5 rows per expert and
+    # The decode kernel beats the tiled GEMM up to ~4-5 rows per expert and
     # loses 20-60% at 6-8 (qwen3.6-35b-a3b, qwen3-30b-a3b, Mixtral shapes).
     MAX_DECODE_ROWS_PER_EXPERT = 4
+    # The skinny GEMM (plus its routing alignment, SiLU and top-k sum) beats
+    # the fused decode kernel from ~2 routed rows per expert in the engine
+    # (Qwen3.6-35B-A3B: equal at 64-token prefills, -26 to -34% at 96-128;
+    # +12% at batch-16 decode) and the tiled GEMM up to ~28 (~16 against the
+    # W4A8 GEMM), E=256 top-8.
+    MIN_SKINNY_ROWS_PER_EXPERT = 2.5
+    MAX_SKINNY_ROWS_PER_EXPERT = 28
+    MAX_SKINNY_ROWS_PER_EXPERT_W4A8 = 16
 
     @staticmethod
     def _supports_current_device() -> bool:
@@ -190,6 +198,23 @@ class Rdna2WNA16Experts(TritonWNA16Experts):
             and w2.size(1) % 8 == 0
         )
 
+    @classmethod
+    def _skinny_block_m(cls, rows_per_expert: float, w4a8: bool) -> int:
+        """Rows per workgroup of moe_wna16_skinny_rdna2, 0 to use the tiled
+        GEMMs instead."""
+        limit = (
+            cls.MAX_SKINNY_ROWS_PER_EXPERT_W4A8
+            if w4a8
+            else cls.MAX_SKINNY_ROWS_PER_EXPERT
+        )
+        if not rdna2_moe_kernel_available("moe_wna16_skinny_rdna2") or not (
+            cls.MIN_SKINNY_ROWS_PER_EXPERT <= rows_per_expert <= limit
+        ):
+            return 0
+        if rows_per_expert <= 3:
+            return 4
+        return 8 if rows_per_expert <= 12 else 16
+
     @staticmethod
     def _prefill_block_m(rows_per_expert: float) -> int:
         # Tile height by routed rows per expert, from a sweep on E=256 top-8.
@@ -226,11 +251,15 @@ class Rdna2WNA16Experts(TritonWNA16Experts):
     ) -> None:
         num_tokens, top_k = topk_ids.shape
         num_experts, n = w1.size(0), w1.size(1)
+        rows_per_expert = num_tokens * top_k / num_experts
         w4a8 = self._use_w4a8(num_tokens, w1, w2)
-        if w4a8:
+        skinny = self._skinny_block_m(rows_per_expert, w4a8)
+        if skinny:
+            w4a8, block_m = False, skinny
+        elif w4a8:
             block_m = 64 if num_tokens * top_k <= 96 * num_experts else 128
         else:
-            block_m = self._prefill_block_m(num_tokens * top_k / num_experts)
+            block_m = self._prefill_block_m(rows_per_expert)
         sorted_ids, expert_ids, num_post_padded = moe_align_block_size(
             topk_ids, block_m, num_experts
         )
@@ -242,7 +271,11 @@ class Rdna2WNA16Experts(TritonWNA16Experts):
         )
 
         def gemm(out, a, w, scale, zp, k, mul):
-            if w4a8:
+            if skinny:
+                ops.moe_wna16_skinny_rdna2(
+                    out, a, w, scale, zp, *align, k, mul, block_m
+                )
+            elif w4a8:
                 a_q, a_s, _ = ops.scaled_int8_quant(a, None, None, True)
                 ops.moe_w4a8_gemm_rdna2(
                     out, a_q, a_s.view(-1), w, scale, zp, *align, k, mul, block_m
@@ -310,6 +343,7 @@ class Rdna2WNA16Experts(TritonWNA16Experts):
                 expert_tokens_meta,
                 apply_router_weight_on_input,
             )
+        prefill_ok = self._use_prefill_kernel(hidden_states, w1, w2, expert_map)
         if not self._use_decode_kernel(
             hidden_states,
             w1,
@@ -318,8 +352,11 @@ class Rdna2WNA16Experts(TritonWNA16Experts):
             activation,
             expert_map,
             apply_router_weight_on_input,
+        ) or (
+            prefill_ok
+            and self._skinny_block_m(topk_ids.numel() / w1.size(0), False) > 0
         ):
-            if self._use_prefill_kernel(hidden_states, w1, w2, expert_map):
+            if prefill_ok:
                 return self._apply_prefill(
                     output,
                     hidden_states,

@@ -5,8 +5,9 @@ Triton paths keep (Qwen3.6-35B-A3B dims, E capped at 16): the decode kernels
 ``moe_wna16_decode_rdna2`` on uint8-packed ``[E, N, K/2]`` int4 weights (group
 size 32 or 128, symmetric or with zero points) and
 ``moe_int8_decode_rdna2`` on ``[E, N, K]`` int8 weights with channel scales,
-the prefill GEMMs ``moe_wna16_gemm_rdna2`` and ``moe_w4a8_gemm_rdna2``, and
-the weight-only FP8 experts (``Rdna2Fp8Experts``) on both kinds of kernels."""
+the prefill GEMMs ``moe_wna16_gemm_rdna2``, ``moe_wna16_skinny_rdna2`` and
+``moe_w4a8_gemm_rdna2``, and the weight-only FP8 experts (``Rdna2Fp8Experts``)
+on both kinds of kernels."""
 
 import pytest
 import torch
@@ -155,6 +156,45 @@ def test_moe_wna16_gemm_rdna2_prefill_matches_reference(block_m, group, zp):
     ops.moe_wna16_gemm_rdna2(gate_up, x, w13, s13, z13, *args, TOPK, False, block_m)
     torch.ops._C.silu_and_mul(act, gate_up)
     ops.moe_wna16_gemm_rdna2(down, act, w2, s2, z2, *args, 1, True, block_m)
+
+    ref = _reference(x, topk_weights, topk_ids.long(), w13_ref, w2_ref)
+    out = down.float().sum(1)
+    assert ((out - ref).norm() / ref.norm()).item() < 2e-3
+
+
+@pytest.mark.parametrize("zp", [False, True])
+@pytest.mark.parametrize("group", [32, 128])
+@pytest.mark.parametrize("block_m", [4, 8, 16])
+@pytest.mark.parametrize("dims", [(H, INTER), (1152, 384)])
+def test_moe_wna16_skinny_rdna2_matches_reference(block_m, group, zp, dims):
+    """The few-rows-per-expert GEMM: both routed GEMMs over
+    moe_align_block_size rows for each block height, symmetric and with zero
+    points; K not a multiple of 256 (1152 / 384) takes the single-step
+    batches."""
+    from vllm import _custom_ops as ops
+    from vllm.model_executor.layers.fused_moe.moe_align_block_size import (
+        moe_align_block_size,
+    )
+
+    hidden, inter = dims
+    torch.manual_seed(0)
+    num_tokens = 24
+    w13, s13, w13_ref, z13 = _experts(2 * inter, hidden, group, zp)
+    w2, s2, w2_ref, z2 = _experts(hidden, inter, group, zp)
+    x = torch.randn(num_tokens, hidden, dtype=torch.float16, device="cuda") * 0.5
+    topk_weights, topk_ids = torch.topk(
+        torch.randn(num_tokens, E, device="cuda").softmax(-1), TOPK, dim=-1
+    )
+    topk_ids = topk_ids.int()
+    sorted_ids, expert_ids, num_post_padded = moe_align_block_size(topk_ids, block_m, E)
+    gate_up = torch.empty(num_tokens * TOPK, 2 * inter, dtype=x.dtype, device="cuda")
+    act = torch.empty(num_tokens * TOPK, inter, dtype=x.dtype, device="cuda")
+    down = torch.empty(num_tokens, TOPK, hidden, dtype=x.dtype, device="cuda")
+    args = (sorted_ids, expert_ids, num_post_padded, topk_weights)
+
+    ops.moe_wna16_skinny_rdna2(gate_up, x, w13, s13, z13, *args, TOPK, False, block_m)
+    torch.ops._C.silu_and_mul(act, gate_up)
+    ops.moe_wna16_skinny_rdna2(down, act, w2, s2, z2, *args, 1, True, block_m)
 
     ref = _reference(x, topk_weights, topk_ids.long(), w13_ref, w2_ref)
     out = down.float().sum(1)
@@ -353,8 +393,8 @@ def test_rdna2_fp8_experts_match_reference(kind, num_tokens):
 @torch.inference_mode()
 def test_rdna2_wna16_experts_run_bf16_in_fp16(num_tokens, monkeypatch):
     """bf16 activations (with the fp16 group scales the weight conversion
-    stores on gfx1030) take the fp16 decode kernel or routed GEMMs instead of
-    the Triton fallback, at bf16 output accuracy."""
+    stores on gfx1030) take the fp16 RDNA2 kernels instead of the Triton
+    fallback, at bf16 output accuracy."""
     from tests.kernels.moe.utils import make_dummy_moe_config
     from vllm import _custom_ops as ops
     from vllm.model_executor.layers.fused_moe.config import (
@@ -380,7 +420,11 @@ def test_rdna2_wna16_experts_run_bf16_in_fp16(num_tokens, monkeypatch):
     )
     out = torch.empty(num_tokens, H, dtype=x.dtype, device="cuda")
     calls = []
-    for name in ("moe_wna16_decode_rdna2", "moe_wna16_gemm_rdna2"):
+    for name in (
+        "moe_wna16_decode_rdna2",
+        "moe_wna16_skinny_rdna2",
+        "moe_wna16_gemm_rdna2",
+    ):
         op = getattr(ops, name)
 
         def spy(*args, _op=op, **kwargs):
