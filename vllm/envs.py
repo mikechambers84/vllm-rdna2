@@ -164,6 +164,7 @@ if TYPE_CHECKING:
     VLLM_ROCM_W8A16_UNQUANTIZED: bool = False
     VLLM_ROCM_RDNA2_ATTENTION: bool = True
     VLLM_ROCM_W8A16_LM_HEAD: bool = False
+    VLLM_ROCM_KMAJOR_UNQUANTIZED: bool = False
     VLLM_ROCM_RDNA2_GEMM_TABLE: str | None = None
     VLLM_ROCM_RDNA2_GEMM_TUNE: bool = False
     VLLM_ROCM_FP8_PADDING: bool = True
@@ -1437,6 +1438,16 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # 27B-35B models). The logits change slightly.
     "VLLM_ROCM_W8A16_LM_HEAD": lambda: (
         os.getenv("VLLM_ROCM_W8A16_LM_HEAD", "0").lower() in ("1", "true")
+    ),
+    # gfx1030: store unquantized fp16 linear weights and an untied fp16 lm_head
+    # K-major for gemm_w8_rdna2 (fp32 accumulation like rocBLAS): 1.6-4x the
+    # GEMV / rocBLAS at 8-64 rows (batched decode, speculative verification),
+    # on par up to ~4K rows, ~5% slower at 8K. Qwen3.6-35B-A3B W4A16 (fp16
+    # dense layers): batch 8-32 decode -17%, throughput +8%, 8K prefill +3%.
+    # Code that reads such a layer's .weight directly fails.
+    # VLLM_ROCM_W8A16_* take precedence.
+    "VLLM_ROCM_KMAJOR_UNQUANTIZED": lambda: (
+        os.getenv("VLLM_ROCM_KMAJOR_UNQUANTIZED", "0").lower() in ("1", "true")
     ),
     # gfx1030: run fp16 causal prefill attention (head 64/128/256; sliding
     # window, softcap and sinks, no ALiBi) in the HIP kernel instead of Triton.

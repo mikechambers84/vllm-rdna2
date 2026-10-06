@@ -75,7 +75,16 @@ static constexpr Config kConfigsI8[] = {
     {16, 4, 1, 64}, {32, 2, 1, 32}, {32, 1, 1, 32}, {16, 1, 2, 32},
     {16, 2, 2, 32},
 };
+// fp16 weights (two k per dword, so a 16-k block is 8 loads per column tile):
+static constexpr Config kConfigsW16[] = {
+    {1, 8, 2, 16},  {1, 16, 1, 16}, {2, 8, 2, 16},  {4, 8, 1, 16},
+    {8, 4, 1, 32},  {8, 8, 1, 16},  {16, 4, 1, 16}, {16, 8, 1, 16},
+    {16, 2, 1, 16}, {16, 1, 1, 16}, {16, 1, 2, 8},  {24, 4, 1, 16},
+    {32, 2, 1, 8},
+};
 static constexpr int kNumConfigs = sizeof(kConfigs) / sizeof(kConfigs[0]);
+static constexpr int kNumConfigsW16 =
+    sizeof(kConfigsW16) / sizeof(kConfigsW16[0]);
 static constexpr int kNumConfigsI8 = sizeof(kConfigsI8) / sizeof(kConfigsI8[0]);
 
 template <typename T>
@@ -155,11 +164,12 @@ __device__ __forceinline__ uint32_t dword(const uint4& v, int c) {
 }
 
 // grid (ceil(M / T), ceil(N / (128 * CT))). T is the activation type (int8_t:
-// W8A8), O the output type. W holds ldw 16-byte column quads per dword row; R
-// (BLOCK) the ratios of k-block k >> bk_shift at R[kb * ldr + n / bn]; SA
-// (W8A8) the activation scale of row t at SA[t * sa_stride].
+// W8A8), O the output type; W16: fp16 weights, two k per dword, no scale. W
+// holds ldw 16-byte column quads per dword row; R (BLOCK) the ratios of
+// k-block k >> bk_shift at R[kb * ldr + n / bn]; SA (W8A8) the activation
+// scale of row t at SA[t * sa_stride].
 template <typename T, typename O, int TT, int NW, int CT, int KBLOCK, bool INT8,
-          bool BLOCK>
+          bool BLOCK, bool W16>
 __global__ void __launch_bounds__(NW* WARP32)
     gemm_w8_rdna2_kernel(const uint4* __restrict__ W,
                          const float* __restrict__ S,
@@ -171,9 +181,11 @@ __global__ void __launch_bounds__(NW* WARP32)
                          const int lda, const int ldc) {
   constexpr bool DOT4 = std::is_same_v<T, int8_t>;
   using Acc = std::conditional_t<DOT4, int, float>;
-  // k per activation load (16 bytes) and the dword rows it covers.
+  // k per weight dword, per activation load (16 bytes) and the dword rows the
+  // latter covers.
+  constexpr int KPD = W16 ? 2 : 4;
   constexpr int STEP = DOT4 ? 16 : 8;
-  constexpr int ROWS = STEP / 4;
+  constexpr int ROWS = STEP / KPD;
   extern __shared__ __align__(16) char smem[];
   Acc* red = reinterpret_cast<Acc*>(smem);
   const int lane = threadIdx.x % WARP32;
@@ -218,6 +230,25 @@ __global__ void __launch_bounds__(NW* WARP32)
             acc[ct][c][i] = s;
           }
       }
+    } else if constexpr (W16) {
+  #pragma unroll
+      for (int i = 0; i < TT; i++) {
+        // Wave-uniform address: a scalar load.
+        const uint4 av = *reinterpret_cast<const uint4*>(
+            A + (long)min(t0 + i, M - 1) * lda + k0);
+  #pragma unroll
+        for (int ct = 0; ct < CT; ct++)
+  #pragma unroll
+          for (int c = 0; c < 4; c++) {
+            half2 h[4];
+  #pragma unroll
+            for (int j = 0; j < 4; j++) {
+              const uint32_t q = dword(w[j][ct], c);
+              h[j] = *reinterpret_cast<const half2*>(&q);
+            }
+            acc[ct][c][i] = dot8<T>(av, h, acc[ct][c][i]);
+          }
+      }
     } else {
       if constexpr (BLOCK) {
         const int kb = k0 >> bk_shift;
@@ -259,12 +290,12 @@ __global__ void __launch_bounds__(NW* WARP32)
   };
 
   for (int b = b_begin; b < b_end; b++) {
-    uint4 w[KBLOCK / 4][CT];
+    uint4 w[KBLOCK / KPD][CT];
   #pragma unroll
-    for (int u = 0; u < KBLOCK / 4; u++)
+    for (int u = 0; u < KBLOCK / KPD; u++)
   #pragma unroll
       for (int ct = 0; ct < CT; ct++)
-        w[u][ct] = W[(long)(b * (KBLOCK / 4) + u) * ldw + col[ct]];
+        w[u][ct] = W[(long)(b * (KBLOCK / KPD) + u) * ldw + col[ct]];
   #pragma unroll
     for (int p = 0; p < KBLOCK / STEP; p++)
       mac(reinterpret_cast<const uint4(&)[ROWS][CT]>(w[ROWS * p]),
@@ -272,14 +303,14 @@ __global__ void __launch_bounds__(NW* WARP32)
   }
   // The k past the last whole block (K % KBLOCK).
   if (wave == NW - 1)
-    for (int kw = blocks * (KBLOCK / 4); kw < K / 4; kw += ROWS) {
+    for (int kw = blocks * (KBLOCK / KPD); kw < K / KPD; kw += ROWS) {
       uint4 w[ROWS][CT];
   #pragma unroll
       for (int u = 0; u < ROWS; u++)
   #pragma unroll
         for (int ct = 0; ct < CT; ct++)
           w[u][ct] = W[(long)(kw + u) * ldw + col[ct]];
-      mac(w, kw * 4);
+      mac(w, kw * KPD);
     }
 
   // Tree reduction of the NW K slices: in each round the upper half of the
@@ -315,10 +346,16 @@ __global__ void __launch_bounds__(NW* WARP32)
     for (int ct = 0; ct < CT; ct++) {
       const int c4 = blockIdx.y * WARP32 * CT + ct * WARP32 + lane;
       if (c4 >= n4) continue;
-      const float4 sv = *reinterpret_cast<const float4*>(S + c4 * 4);
-      // fp8 sums carry the 2^-8 of the in-register widening.
-      const float m = INT8 ? 1.f : 256.f;
-      const float s[4] = {sv.x * m, sv.y * m, sv.z * m, sv.w * m};
+      float s[4] = {1.f, 1.f, 1.f, 1.f};
+      if constexpr (!W16) {
+        const float4 sv = *reinterpret_cast<const float4*>(S + c4 * 4);
+        // fp8 sums carry the 2^-8 of the in-register widening.
+        const float m = INT8 ? 1.f : 256.f;
+        s[0] = sv.x * m;
+        s[1] = sv.y * m;
+        s[2] = sv.z * m;
+        s[3] = sv.w * m;
+      }
       float bv[4] = {0.f, 0.f, 0.f, 0.f};
       if (bias != nullptr)
   #pragma unroll
@@ -352,7 +389,7 @@ __global__ void __launch_bounds__(NW* WARP32)
 #else  // non-RDNA2 device pass: empty stub for symbol parity.
 
 template <typename T, typename O, int TT, int NW, int CT, int KBLOCK, bool INT8,
-          bool BLOCK>
+          bool BLOCK, bool W16>
 __global__ void gemm_w8_rdna2_kernel(const uint4*, const float*, const float*,
                                      const int, const __half*, const T*,
                                      const O*, O*, const int, const int,
@@ -364,7 +401,7 @@ __global__ void gemm_w8_rdna2_kernel(const uint4*, const float*, const float*,
 struct Args {
   const at::Tensor& a;
   const at::Tensor& w;
-  const at::Tensor& scale;
+  const std::optional<at::Tensor>& scale;
   const std::optional<at::Tensor>& block_scale;
   const std::optional<at::Tensor>& bias;
   const std::optional<at::Tensor>& scale_a;
@@ -374,22 +411,24 @@ struct Args {
 };
 
 template <typename T, typename O, int TT, int NW, int CT, int KB, bool INT8,
-          bool BLOCK>
+          bool BLOCK, bool W16 = false>
 void launch(const Args& p, cudaStream_t stream) {
   using Acc = std::conditional_t<std::is_same_v<T, int8_t>, int, float>;
   const int M = p.a.size(0), K = p.a.size(1), N = p.w.size(1);
   const dim3 grid((M + TT - 1) / TT, (N / 4 + WARP32 * CT - 1) / (WARP32 * CT));
   const size_t lds = (size_t)(NW / 2) * CT * 4 * TT * WARP32 * sizeof(Acc);
   const bool sa = p.scale_a.has_value();
-  gemm_w8_rdna2_kernel<T, O, TT, NW, CT, KB, INT8, BLOCK>
+  gemm_w8_rdna2_kernel<T, O, TT, NW, CT, KB, INT8, BLOCK, W16>
       <<<grid, dim3(NW * WARP32), lds, stream>>>(
-          (const uint4*)p.w.data_ptr(), p.scale.data_ptr<float>(),
+          (const uint4*)p.w.data_ptr(),
+          W16 ? nullptr : p.scale->data_ptr<float>(),
           sa ? p.scale_a->data_ptr<float>() : nullptr,
           sa && p.scale_a->numel() > 1 ? 1 : 0,
           BLOCK ? (const __half*)p.block_scale->data_ptr() : nullptr,
           (const T*)p.a.data_ptr(),
           p.bias.has_value() ? (const O*)p.bias->data_ptr() : nullptr,
-          (O*)p.c.data_ptr(), M, N, K, p.w.stride(0) / 16,
+          (O*)p.c.data_ptr(), M, N, K,
+          (int)(p.w.stride(0) * p.w.element_size() / 16),
           BLOCK ? p.block_scale->stride(0) : 0, p.bn, p.bk_shift, p.a.stride(0),
           p.c.stride(0));
 }
@@ -412,6 +451,12 @@ void launch_config(const Args& p, cudaStream_t stream) {
     by_format(__half{});
   else
     by_format(__hip_bfloat16{});
+}
+
+// fp16 weights (and activations).
+template <int TT, int NW, int CT, int KB>
+void launch_config_w16(const Args& p, cudaStream_t stream) {
+  launch<__half, __half, TT, NW, CT, KB, false, false, true>(p, stream);
 }
 
 // int8 activations (W8A8): output type by c's dtype.
@@ -474,6 +519,26 @@ static int default_config_i8(int M, int N, int K) {
   return M <= 512 ? 12 : 11;
 }
 
+// The same for fp16 weights, fitted on the Qwen3.6-35B-A3B fp16 layers (and
+// lm_head) and Llama-3-8B-sized ones (within 0-3% of the best config summed
+// per row count).
+static int default_config_w16(int M, int N, int K) {
+  const bool tiny = N <= 1024, small = N <= 2048, narrow = N <= 4096,
+             wide = N >= 16384;
+  if (M == 1) return wide ? 0 : 3;
+  if (M == 2) return wide ? 2 : 3;
+  if (M <= 4) return small || K <= 2048 ? 3 : 4;
+  if (M <= 8) return small ? 3 : K <= 2048 ? 5 : 4;
+  if (M <= 16) return small ? 3 : narrow ? 5 : 8;
+  if (M <= 24) return tiny ? 3 : small ? 5 : narrow ? 4 : 11;
+  if (M <= 32) return tiny ? 3 : small ? 5 : narrow ? 6 : wide ? 12 : 8;
+  if (M <= 48) return small ? 5 : 11;
+  if (M <= 64) return tiny ? 5 : small ? 6 : N >= 12288 ? 12 : 8;
+  if (M <= 128) return narrow ? 6 : 12;
+  if (M <= 512) return small ? 8 : 11;
+  return 10;
+}
+
 }  // namespace gemm_w8_rdna2
 }  // namespace vllm
 
@@ -487,7 +552,7 @@ static int default_config_i8(int M, int N, int K) {
 // int8 with int8 w, fp32 scale_a of 1 or M elements and an fp16 or bf16
 // out_dtype (W8A8). cfg < 0 picks the default config for M. Returns [M, N].
 torch::Tensor gemm_w8_rdna2(const at::Tensor& a, const at::Tensor& w,
-                            const at::Tensor& scale,
+                            const std::optional<at::Tensor>& scale,
                             const std::optional<at::Tensor>& block_scale,
                             int64_t block_n, int64_t block_k,
                             const std::optional<at::Tensor>& bias, int64_t cfg,
@@ -495,15 +560,18 @@ torch::Tensor gemm_w8_rdna2(const at::Tensor& a, const at::Tensor& w,
                             std::optional<at::ScalarType> out_dtype) {
   using namespace vllm::gemm_w8_rdna2;
   const bool w8a8 = a.dtype() == torch::kInt8;
+  const bool w16 = w.dtype() == torch::kFloat16;
   TORCH_CHECK(
       w8a8 || a.dtype() == torch::kFloat16 || a.dtype() == torch::kBFloat16,
       "gemm_w8_rdna2 needs fp16, bf16 or int8 activations");
-  TORCH_CHECK(
-      w.dtype() == torch::kInt8 || w.dtype() == at::ScalarType::Float8_e4m3fn,
-      "gemm_w8_rdna2 needs int8 or float8_e4m3fn weights");
-  TORCH_CHECK(a.dim() == 2 && w.dim() == 3 && w.size(2) == 4 &&
-                  w.size(0) * 4 == a.size(1),
-              "gemm_w8_rdna2 needs a [M, K] and w [K / 4, N, 4]");
+  TORCH_CHECK(w16 || w.dtype() == torch::kInt8 ||
+                  w.dtype() == at::ScalarType::Float8_e4m3fn,
+              "gemm_w8_rdna2 needs int8, float8_e4m3fn or fp16 weights");
+  const int kpd = w16 ? 2 : 4;
+  TORCH_CHECK(a.dim() == 2 && w.dim() == 3 && w.size(2) == kpd &&
+                  w.size(0) * kpd == a.size(1),
+              "gemm_w8_rdna2 needs a [M, K] and w [K / 4, N, 4] (8-bit) or "
+              "[K / 2, N, 2] (fp16)");
   const int M = a.size(0);
   const int K = a.size(1);
   const int N = w.size(1);
@@ -512,16 +580,23 @@ torch::Tensor gemm_w8_rdna2(const at::Tensor& a, const at::Tensor& w,
                   reinterpret_cast<uintptr_t>(a.data_ptr()) % 16 == 0,
               "gemm_w8_rdna2 needs K % 16 == 0 and 16-byte aligned, "
               "K-contiguous rows of a");
-  TORCH_CHECK(N % 4 == 0 && w.stride(2) == 1 && w.stride(1) == 4 &&
-                  w.stride(0) % 16 == 0 &&
+  TORCH_CHECK(N % 4 == 0 && w.stride(2) == 1 && w.stride(1) == kpd &&
+                  w.stride(0) * w.element_size() % 16 == 0 &&
                   reinterpret_cast<uintptr_t>(w.data_ptr()) % 16 == 0,
               "gemm_w8_rdna2 needs N % 4 == 0 and 16-byte aligned dword rows "
               "of w");
-  TORCH_CHECK(scale.dtype() == torch::kFloat32 && scale.numel() == N &&
-                  scale.is_contiguous() &&
-                  reinterpret_cast<uintptr_t>(scale.data_ptr()) % 16 == 0,
-              "gemm_w8_rdna2 needs a 16-byte aligned, contiguous fp32 scale "
-              "per output channel");
+  if (w16) {
+    TORCH_CHECK(a.dtype() == torch::kFloat16 && !scale.has_value() &&
+                    !block_scale.has_value(),
+                "gemm_w8_rdna2 with fp16 weights needs fp16 activations and "
+                "no scales");
+  } else {
+    TORCH_CHECK(scale.has_value() && scale->dtype() == torch::kFloat32 &&
+                    scale->numel() == N && scale->is_contiguous() &&
+                    reinterpret_cast<uintptr_t>(scale->data_ptr()) % 16 == 0,
+                "gemm_w8_rdna2 needs a 16-byte aligned, contiguous fp32 scale "
+                "per output channel");
+  }
   at::ScalarType c_dtype = a.scalar_type();
   if (w8a8) {
     TORCH_CHECK(w.dtype() == torch::kInt8 && !block_scale.has_value(),
@@ -559,7 +634,9 @@ torch::Tensor gemm_w8_rdna2(const at::Tensor& a, const at::Tensor& w,
         "gemm_w8_rdna2 bias must be a contiguous [N] of the output "
         "dtype");
   }
-  TORCH_CHECK(cfg < (w8a8 ? kNumConfigsI8 : kNumConfigs),
+  TORCH_CHECK(cfg < (w8a8  ? kNumConfigsI8
+                     : w16 ? kNumConfigsW16
+                           : kNumConfigs),
               "gemm_w8_rdna2: cfg out of range");
 
   auto c = torch::empty({M, N}, a.options().dtype(c_dtype));
@@ -593,6 +670,33 @@ torch::Tensor gemm_w8_rdna2(const at::Tensor& a, const at::Tensor& w,
       VLLM_W8A8_RDNA2_CASE(12, 16, 2, 2, 32)
     }
 #undef VLLM_W8A8_RDNA2_CASE
+    return c;
+  }
+
+  if (w16) {
+    const int id = cfg < 0 ? default_config_w16(M, N, K) : (int)cfg;
+#define VLLM_W16_RDNA2_CASE(ID, T, NW, CT, KB)                           \
+  case ID:                                                               \
+    static_assert(kConfigsW16[ID].t == T && kConfigsW16[ID].nw == NW &&  \
+                  kConfigsW16[ID].ct == CT && kConfigsW16[ID].kb == KB); \
+    launch_config_w16<T, NW, CT, KB>(p, stream);                         \
+    break;
+    switch (id) {
+      VLLM_W16_RDNA2_CASE(0, 1, 8, 2, 16)
+      VLLM_W16_RDNA2_CASE(1, 1, 16, 1, 16)
+      VLLM_W16_RDNA2_CASE(2, 2, 8, 2, 16)
+      VLLM_W16_RDNA2_CASE(3, 4, 8, 1, 16)
+      VLLM_W16_RDNA2_CASE(4, 8, 4, 1, 32)
+      VLLM_W16_RDNA2_CASE(5, 8, 8, 1, 16)
+      VLLM_W16_RDNA2_CASE(6, 16, 4, 1, 16)
+      VLLM_W16_RDNA2_CASE(7, 16, 8, 1, 16)
+      VLLM_W16_RDNA2_CASE(8, 16, 2, 1, 16)
+      VLLM_W16_RDNA2_CASE(9, 16, 1, 1, 16)
+      VLLM_W16_RDNA2_CASE(10, 16, 1, 2, 8)
+      VLLM_W16_RDNA2_CASE(11, 24, 4, 1, 16)
+      VLLM_W16_RDNA2_CASE(12, 32, 2, 1, 8)
+    }
+#undef VLLM_W16_RDNA2_CASE
     return c;
   }
 
