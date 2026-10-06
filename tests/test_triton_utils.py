@@ -180,3 +180,51 @@ def test_no_triton_fallback():
                 sys.modules[name] = module
             else:
                 sys.modules.pop(name, None)
+
+
+def test_gfx10_bf16_fdot2_rewrite():
+    """llvm.amdgcn.fdot2.bf16.bf16 (no gfx10 instruction) becomes fp32
+    arithmetic with the same result name, for SSA and constant operands."""
+    from vllm.triton_utils.rocm_gfx10 import rewrite_bf16_fdot2
+
+    llir = (
+        "  %7 = tail call bfloat @llvm.amdgcn.fdot2.bf16.bf16(<2 x bfloat> %5, "
+        "<2 x bfloat> <bfloat 0xR3F80, bfloat 0xR0000>, bfloat 0xR0000), !dbg !4\n"
+        "  %8 = fadd bfloat %7, %7"
+    )
+    out = rewrite_bf16_fdot2(llir)
+    assert "@llvm.amdgcn.fdot2" not in out
+    assert "  %7 = fptrunc float %vllm.fdot2.7.t to bfloat" in out
+    assert "extractelement <2 x bfloat> <bfloat 0xR3F80, bfloat 0xR0000>, i32 1" in out
+    assert out.endswith("  %8 = fadd bfloat %7, %7")
+
+
+def test_gfx10_bf16_triton_kernel_compiles():
+    """bf16 arithmetic in a Triton kernel (lowered to an fdot2 instruction
+    gfx10 lacks) compiles and computes on gfx10, also when it feeds tl.dot."""
+    import pytest
+    import torch
+
+    from vllm.platforms import current_platform
+
+    if not current_platform.is_rocm():
+        pytest.skip("ROCm only")
+    from vllm.platforms.rocm import on_gfx10
+
+    if not on_gfx10():
+        pytest.skip("gfx10 only")
+    from vllm.triton_utils import tl, triton
+
+    @triton.jit
+    def scaled_dot(a_ptr, b_ptr, c_ptr, BLOCK: tl.constexpr):
+        r = tl.arange(0, BLOCK)
+        a = tl.load(a_ptr + r[:, None] * BLOCK + r[None, :])
+        b = tl.load(b_ptr + r[:, None] * BLOCK + r[None, :])
+        tl.store(c_ptr + r[:, None] * BLOCK + r[None, :], tl.dot(a * b, b))
+
+    a = torch.randn(32, 32, device="cuda", dtype=torch.bfloat16)
+    b = torch.randn(32, 32, device="cuda", dtype=torch.bfloat16)
+    c = torch.empty(32, 32, device="cuda", dtype=torch.float32)
+    scaled_dot[(1,)](a, b, c, BLOCK=32)
+    ref = (a * b).float() @ b.float()
+    torch.testing.assert_close(c, ref, rtol=1e-2, atol=1e-2)

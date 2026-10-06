@@ -264,14 +264,18 @@ def test_exllama_gfx1030_gemm_runs_w4a8_above_threshold(m):
 
 
 @gfx1030_only
+@pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
 @pytest.mark.parametrize("w4a8", [False, True], ids=["w4a16", "w4a8"])
 @pytest.mark.parametrize("asymmetric", [False, True], ids=["uint4b8", "uint4_zp"])
 @pytest.mark.parametrize("m", [1, 40, 600])
-def test_exllama_linear_kernel_gfx1030(m, asymmetric, w4a8, dist_init, monkeypatch):
+def test_exllama_linear_kernel_gfx1030(
+    m, asymmetric, w4a8, dtype, dist_init, monkeypatch
+):
     """ExllamaLinearKernel on a compressed-tensors layout layer (symmetric, or
     uint4 with stored zeros as compressed-tensors and converted AWQ
     checkpoints have them): the gfx1030 GEMM up to 512 rows, gptq_gemm
-    above; with VLLM_ROCM_W4A8_PREFILL, W4A8 above 128 rows."""
+    above; with VLLM_ROCM_W4A8_PREFILL, W4A8 above 128 rows. bf16 layers run
+    the same fp16 kernels on converted activations."""
     if w4a8:
         monkeypatch.setenv("VLLM_ROCM_W4A8_PREFILL", "1")
     from vllm.model_executor.kernels.linear.mixed_precision.exllama import (
@@ -292,7 +296,7 @@ def test_exllama_linear_kernel_gfx1030(m, asymmetric, w4a8, dist_init, monkeypat
     torch.manual_seed(0)
     k, n, group_size = 1024, 512, 128
     q = torch.randint(0, 16, (n, k), device="cuda", dtype=torch.int32)
-    scales = (torch.rand(n, k // group_size, device="cuda") * 0.01 + 1e-3).half()
+    scales = (torch.rand(n, k // group_size, device="cuda") * 0.01 + 1e-3).to(dtype)
     z = torch.full((n, k // group_size), 8, device="cuda", dtype=torch.int32)
     if asymmetric:
         z = torch.randint(0, 16, z.shape, device="cuda", dtype=torch.int32)
@@ -324,7 +328,7 @@ def test_exllama_linear_kernel_gfx1030(m, asymmetric, w4a8, dist_init, monkeypat
         full_weight_shape=(k, n),
         partition_weight_shape=(k, n),
         weight_type=weight_type,
-        act_type=torch.float16,
+        act_type=dtype,
         group_size=group_size,
         zero_points=asymmetric,
     )
@@ -336,9 +340,10 @@ def test_exllama_linear_kernel_gfx1030(m, asymmetric, w4a8, dist_init, monkeypat
         w_zp_param_name="w_zp" if asymmetric else None,
     )
     kernel.process_weights_after_loading(layer)
-    x = torch.randn(m, k, device="cuda", dtype=torch.float16)
-    bias = torch.randn(n, device="cuda", dtype=torch.float16)
+    x = torch.randn(m, k, device="cuda", dtype=dtype)
+    bias = torch.randn(n, device="cuda", dtype=dtype)
     out = kernel.apply_weights(layer, x, bias)
+    assert out.dtype == dtype
     ref = x.float() @ w_ref.t() + bias.float()
-    tol = 2e-2 if w4a8 and m > 128 else 2e-3
+    tol = 2e-2 if w4a8 and m > 128 else 2e-3 if dtype == torch.float16 else 8e-3
     assert ((out.float() - ref).norm() / ref.norm()).item() < tol

@@ -25,6 +25,17 @@ else:
 
 from vllm.triton_utils.tensor_descriptor import use_tensor_descriptor
 
+if HAS_TRITON:
+    from vllm.platforms import current_platform
+
+    if current_platform.is_rocm():
+        from vllm.platforms.rocm import on_gfx10
+
+        if on_gfx10():
+            from vllm.triton_utils.rocm_gfx10 import patch_triton_bf16_for_gfx10
+
+            patch_triton_bf16_for_gfx10()
+
 LOG2E = 1.4426950408889634
 LOGE2 = 0.6931471805599453
 

@@ -39,7 +39,7 @@ def use_rdna2_gemm(c: MPLinearLayerConfig) -> bool:
         on_gfx1030()
         and hasattr(torch.ops._rocm_C, "gemm_w4a16_exl_rdna2")
         and c.weight_type in (scalar_types.uint4b8, scalar_types.uint4)
-        and c.act_type == torch.float16
+        and c.act_type in (torch.float16, torch.bfloat16)
         and c.group_size % 32 == 0
     )
 
