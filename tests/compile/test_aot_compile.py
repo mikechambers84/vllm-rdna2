@@ -133,6 +133,22 @@ def test_no_dynamo_cache_entry(monkeypatch: pytest.MonkeyPatch):
             assert torch.allclose(actual, expected)
 
 
+def test_tensor_layout_hash_tracks_weight_layouts():
+    """A weight re-laid out at load time (shape, stride or dtype; also when kept
+    as a plain tensor attribute) changes the AOT cache key, so artifacts traced
+    for another layout are not reused; equal layouts keep the same key."""
+    from vllm.compilation.caching import tensor_layout_hash
+
+    a, b = torch.nn.Linear(8, 16), torch.nn.Linear(8, 16)
+    assert tensor_layout_hash(a) == tensor_layout_hash(b)
+    b.relaid = b.weight.detach().t().contiguous()
+    assert tensor_layout_hash(a) != tensor_layout_hash(b)
+    a.relaid = a.weight.detach().t().contiguous().half()
+    assert tensor_layout_hash(a) != tensor_layout_hash(b)
+    a.relaid = a.weight.detach().t().contiguous()
+    assert tensor_layout_hash(a) == tensor_layout_hash(b)
+
+
 @pytest.mark.skipif(not is_torch_equal_or_newer("2.10.0"), reason="requires torch 2.10")
 def test_force_aot_load(monkeypatch: pytest.MonkeyPatch):
     with tempfile.TemporaryDirectory() as tmpdirname, monkeypatch.context() as m:

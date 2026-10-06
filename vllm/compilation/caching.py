@@ -588,6 +588,28 @@ def aot_compile_hash_factors(vllm_config: VllmConfig) -> list[str]:
     return factors
 
 
+def tensor_layout_hash(module: torch.nn.Module) -> str:
+    """Hash of the shape, stride and dtype of every tensor ``module`` holds
+    (parameters, buffers and plain tensor attributes, e.g. a weight re-laid
+    out for a kernel at load time). Compiled graphs bake these in, and the
+    layout can depend on code outside the traced files and on the platform
+    (the gfx1030 kernels' K-major and int8 weights), so it keys the cache."""
+    h = hashlib.sha256()
+    for prefix, sub in module.named_modules():
+        tensors = dict(sub._parameters)
+        tensors.update(sub._buffers)
+        tensors.update(
+            (k, v) for k, v in vars(sub).items() if isinstance(v, torch.Tensor)
+        )
+        for name, t in sorted(tensors.items()):
+            if t is not None:
+                h.update(
+                    f"{prefix}.{name}:{tuple(t.shape)}:{tuple(t.stride())}:"
+                    f"{t.dtype};".encode()
+                )
+    return h.hexdigest()
+
+
 def _compute_code_hash_with_content(file_contents: dict[str, str]) -> str:
     items = list(sorted(file_contents.items(), key=lambda x: x[0]))
     hash_content = []
