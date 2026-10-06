@@ -31,6 +31,13 @@
 // dequantized for rocBLAS. W8A8: 430-480 GB/s up to 16 rows, 340-380 at 32,
 // 32-36 TOPS at 128 rows and 38-40 from 1024 on (w8a8_gemv_rdna2: 270-350 at
 // 16 rows; w8a8_gemm_rdna2: ~110 at 32, 24-30 TOPS at 128).
+//
+// fp16 weights from 768 rows on run a separate LDS-tiled kernel
+// (gemm_w16_tiled_kernel): 256 threads own 8 x 16 outputs each in a 128 x 256
+// tile, K staged 32 at a time (double buffered) in k2-major LDS; the K-major
+// weight rows are already k2-major, so they go to LDS as coalesced 16-byte
+// loads. ~1.08x rocBLAS at 1K-8K rows on the Qwen3.6-35B dense shapes, where
+// the lanes-along-N tiles reach 0.96-1.05x.
 
 #include <torch/all.h>
 #include <c10/cuda/CUDAGuard.h>
@@ -85,6 +92,9 @@ static constexpr Config kConfigsW16[] = {
 static constexpr int kNumConfigs = sizeof(kConfigs) / sizeof(kConfigs[0]);
 static constexpr int kNumConfigsW16 =
     sizeof(kConfigsW16) / sizeof(kConfigsW16[0]);
+// Config index of the LDS-tiled fp16 kernel (after the lanes-along-N ones).
+static constexpr int kTiledW16 = kNumConfigsW16;
+static constexpr int TILED_THREADS = 256;
 static constexpr int kNumConfigsI8 = sizeof(kConfigsI8) / sizeof(kConfigsI8[0]);
 
 template <typename T>
@@ -386,7 +396,142 @@ __global__ void __launch_bounds__(NW* WARP32)
   }
 }
 
+// Tiled K-major fp16 GEMM (large M): TM x TN outputs per thread in 4 x 4
+// blocks spaced 64 apart, BK k per stage; W is the [K/2][N] dword view of the
+// K-major weights.
+template <int TM, int TN, int BK, int UNR>
+__global__ void __launch_bounds__(TILED_THREADS)
+    gemm_w16_tiled_kernel(const __half* __restrict__ A,
+                          const uint32_t* __restrict__ W,
+                          const __half* __restrict__ bias,
+                          __half* __restrict__ C, const int M, const int N,
+                          const int K, const int lda, const int ldw,
+                          const int ldc) {
+  constexpr int BM = 16 * TM, BN = 16 * TN, K2 = BK / 2;
+  constexpr int A_CH = BK / 8;  // 16-byte chunks per row per stage
+  constexpr int A_LOADS = BM * A_CH / TILED_THREADS;
+  constexpr int W_LOADS = K2 * BN / 4 / TILED_THREADS;
+  constexpr int GROUP_M = 8;
+  __shared__ __align__(16) uint32_t sA[2][K2][BM];
+  __shared__ __align__(16) uint32_t sW[2][K2][BN];
+  // Grouped ordering: GROUP_M row blocks share each weight block in L2.
+  const int pid = blockIdx.x;
+  const int num_m = (M + BM - 1) / BM, num_n = (N + BN - 1) / BN;
+  const int width = GROUP_M * num_n;
+  const int first_m = pid / width * GROUP_M;
+  const int group_rows = min(num_m - first_m, GROUP_M);
+  const int m0 = (first_m + pid % width % group_rows) * BM;
+  const int n0 = pid % width / group_rows * BN;
+  const int tid = threadIdx.x, tx = tid % 16, ty = tid / 16;
+
+  uint4 ra[A_LOADS], rw[W_LOADS];
+  auto load = [&](int k0) {
+  #pragma unroll
+    for (int j = 0; j < A_LOADS; j++) {
+      const int idx = tid + j * TILED_THREADS,
+                row = min(m0 + idx / A_CH, M - 1);
+      ra[j] = *reinterpret_cast<const uint4*>(A + (long)row * lda + k0 +
+                                              idx % A_CH * 8);
+    }
+  #pragma unroll
+    for (int j = 0; j < W_LOADS; j++) {
+      const int idx = tid + j * TILED_THREADS, k2 = idx / (BN / 4);
+      const int col = min(n0 + idx % (BN / 4) * 4, N - 4);
+      rw[j] =
+          *reinterpret_cast<const uint4*>(W + (long)(k0 / 2 + k2) * ldw + col);
+    }
+  };
+  auto store = [&](int buf) {
+  #pragma unroll
+    for (int j = 0; j < A_LOADS; j++) {
+      const int idx = tid + j * TILED_THREADS, r = idx / A_CH, c = idx % A_CH;
+      sA[buf][c * 4 + 0][r] = ra[j].x;
+      sA[buf][c * 4 + 1][r] = ra[j].y;
+      sA[buf][c * 4 + 2][r] = ra[j].z;
+      sA[buf][c * 4 + 3][r] = ra[j].w;
+    }
+  #pragma unroll
+    for (int j = 0; j < W_LOADS; j++) {
+      const int idx = tid + j * TILED_THREADS;
+      *reinterpret_cast<uint4*>(&sW[buf][idx / (BN / 4)][idx % (BN / 4) * 4]) =
+          rw[j];
+    }
+  };
+
+  float acc[TM][TN];
+  #pragma unroll
+  for (int i = 0; i < TM; i++)
+  #pragma unroll
+    for (int j = 0; j < TN; j++) acc[i][j] = 0.f;
+
+  load(0);
+  store(0);
+  __syncthreads();
+  const int stages = K / BK;
+  for (int s = 0; s < stages; s++) {
+    const int buf = s & 1;
+    if (s + 1 < stages) load((s + 1) * BK);
+  #pragma unroll UNR
+    for (int k2 = 0; k2 < K2; k2++) {
+      half2 av[TM], wv[TN];
+  #pragma unroll
+      for (int g = 0; g < TM / 4; g++) {
+        const uint4 v =
+            *reinterpret_cast<const uint4*>(&sA[buf][k2][g * 64 + ty * 4]);
+        av[g * 4] = *reinterpret_cast<const half2*>(&v.x);
+        av[g * 4 + 1] = *reinterpret_cast<const half2*>(&v.y);
+        av[g * 4 + 2] = *reinterpret_cast<const half2*>(&v.z);
+        av[g * 4 + 3] = *reinterpret_cast<const half2*>(&v.w);
+      }
+  #pragma unroll
+      for (int g = 0; g < TN / 4; g++) {
+        const uint4 v =
+            *reinterpret_cast<const uint4*>(&sW[buf][k2][g * 64 + tx * 4]);
+        wv[g * 4] = *reinterpret_cast<const half2*>(&v.x);
+        wv[g * 4 + 1] = *reinterpret_cast<const half2*>(&v.y);
+        wv[g * 4 + 2] = *reinterpret_cast<const half2*>(&v.z);
+        wv[g * 4 + 3] = *reinterpret_cast<const half2*>(&v.w);
+      }
+  #pragma unroll
+      for (int i = 0; i < TM; i++)
+  #pragma unroll
+        for (int j = 0; j < TN; j++)
+          acc[i][j] = __builtin_amdgcn_fdot2(av[i], wv[j], acc[i][j], false);
+    }
+    if (s + 1 < stages) {
+      store(buf ^ 1);
+      __syncthreads();
+    }
+  }
+
+  #pragma unroll
+  for (int i = 0; i < TM; i++) {
+    const int row = m0 + i / 4 * 64 + ty * 4 + i % 4;
+    if (row >= M) continue;
+  #pragma unroll
+    for (int g = 0; g < TN / 4; g++) {
+      const int col = n0 + g * 64 + tx * 4;
+      if (col >= N) continue;
+      __half o[4];
+  #pragma unroll
+      for (int j = 0; j < 4; j++) {
+        // Round, then add the bias in fp16 (as F.linear on fp16 does).
+        o[j] = __float2half(acc[i][g * 4 + j]);
+        if (bias) o[j] = __hadd(o[j], bias[col + j]);
+      }
+      *reinterpret_cast<uint2*>(C + (long)row * ldc + col) =
+          *reinterpret_cast<const uint2*>(o);
+    }
+  }
+}
+
 #else  // non-RDNA2 device pass: empty stub for symbol parity.
+
+template <int TM, int TN, int BK, int UNR>
+__global__ void gemm_w16_tiled_kernel(const __half*, const uint32_t*,
+                                      const __half*, __half*, const int,
+                                      const int, const int, const int,
+                                      const int, const int) {}
 
 template <typename T, typename O, int TT, int NW, int CT, int KBLOCK, bool INT8,
           bool BLOCK, bool W16>
@@ -457,6 +602,18 @@ void launch_config(const Args& p, cudaStream_t stream) {
 template <int TT, int NW, int CT, int KB>
 void launch_config_w16(const Args& p, cudaStream_t stream) {
   launch<__half, __half, TT, NW, CT, KB, false, false, true>(p, stream);
+}
+
+// The tiled fp16 kernel (config kTiledW16): 128 x 256 tiles, K % 32 == 0.
+void launch_tiled_w16(const Args& p, cudaStream_t stream) {
+  constexpr int TM = 8, TN = 16, BK = 32, UNR = 2;
+  const int M = p.a.size(0), K = p.a.size(1), N = p.w.size(1);
+  const int grid =
+      ((M + 16 * TM - 1) / (16 * TM)) * ((N + 16 * TN - 1) / (16 * TN));
+  gemm_w16_tiled_kernel<TM, TN, BK, UNR><<<grid, TILED_THREADS, 0, stream>>>(
+      (const __half*)p.a.data_ptr(), (const uint32_t*)p.w.data_ptr(),
+      p.bias ? (const __half*)p.bias->data_ptr() : nullptr,
+      (__half*)p.c.data_ptr(), M, N, K, p.a.stride(0), p.w.stride(0) / 2, N);
 }
 
 // int8 activations (W8A8): output type by c's dtype.
@@ -536,7 +693,7 @@ static int default_config_w16(int M, int N, int K) {
   if (M <= 64) return tiny ? 5 : small ? 6 : N >= 12288 ? 12 : 8;
   if (M <= 128) return narrow ? 6 : 12;
   if (M <= 512) return small ? 8 : 11;
-  return 10;
+  return M >= 768 && K % 32 == 0 ? kTiledW16 : 10;
 }
 
 }  // namespace gemm_w8_rdna2
@@ -635,9 +792,11 @@ torch::Tensor gemm_w8_rdna2(const at::Tensor& a, const at::Tensor& w,
         "dtype");
   }
   TORCH_CHECK(cfg < (w8a8  ? kNumConfigsI8
-                     : w16 ? kNumConfigsW16
+                     : w16 ? kNumConfigsW16 + 1
                            : kNumConfigs),
               "gemm_w8_rdna2: cfg out of range");
+  TORCH_CHECK(!(w16 && cfg == kTiledW16) || K % 32 == 0,
+              "gemm_w8_rdna2: the tiled fp16 config needs K % 32 == 0");
 
   auto c = torch::empty({M, N}, a.options().dtype(c_dtype));
   if (M == 0 || N == 0) return c;
@@ -675,6 +834,10 @@ torch::Tensor gemm_w8_rdna2(const at::Tensor& a, const at::Tensor& w,
 
   if (w16) {
     const int id = cfg < 0 ? default_config_w16(M, N, K) : (int)cfg;
+    if (id == kTiledW16) {
+      launch_tiled_w16(p, stream);
+      return c;
+    }
 #define VLLM_W16_RDNA2_CASE(ID, T, NW, CT, KB)                           \
   case ID:                                                               \
     static_assert(kConfigsW16[ID].t == T && kConfigsW16[ID].nw == NW &&  \
