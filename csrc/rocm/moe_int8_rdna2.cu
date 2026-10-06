@@ -263,8 +263,10 @@ void moe_w8_decode(const char* name, torch::Tensor& output,
               name, " needs contiguous int32 topk_ids and fp32 topk_weights");
   const int M = x.size(0), H = x.size(1), topk = topk_ids.size(1);
   const int E = w13.size(0), I = w2.size(2);
-  TORCH_CHECK(H % 256 == 0 && I % 256 == 0, name,
-              " needs H and I to be multiples of 256");
+  TORCH_CHECK(
+      H % 16 == 0 && I % 16 == 0 && H <= 32768 && (long)topk * I <= 32768, name,
+      " needs H and I multiples of 16 with H and topk * I at most "
+      "32768 (staged in LDS)");
   TORCH_CHECK(w13.is_contiguous() && w2.is_contiguous() &&
                   w13.size(1) == 2 * I && w13.size(2) == H && w2.size(0) == E &&
                   w2.size(1) == H,
@@ -325,7 +327,8 @@ Scales fp8_scales(const torch::Tensor& w, const torch::Tensor& s,
 // W = int8 weight * per-channel scale. x [M, H] fp16 (rows contiguous),
 // topk_ids [M, topk] int32, topk_weights [M, topk] fp32, w13 [E, 2I, H] and
 // w2 [E, H, I] int8, s13 [E, 2I, 1] and s2 [E, H, 1] fp32, act a
-// [M * topk, I] fp16 workspace. H and I must be multiples of 256.
+// [M * topk, I] fp16 workspace. H and I multiples of 16 with H and topk * I
+// at most 32768.
 void moe_int8_decode_rdna2(torch::Tensor& output, const torch::Tensor& x,
                            const torch::Tensor& topk_ids,
                            const torch::Tensor& topk_weights,

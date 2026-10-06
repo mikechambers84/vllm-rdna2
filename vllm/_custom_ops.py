@@ -2138,41 +2138,56 @@ def gemv_rdna2(
     return torch.ops._rocm_C.gemv_rdna2(a, w, bias)
 
 
-def gemv_w8a16_rdna2(
+def gemm_w8_rdna2(
     a: torch.Tensor,
     w: torch.Tensor,
     scale: torch.Tensor,
+    block_scale: torch.Tensor | None = None,
+    block_n: int = 1,
+    block_k: int = 0,
     bias: torch.Tensor | None = None,
+    cfg: int = -1,
+    scale_a: torch.Tensor | None = None,
+    out_dtype: torch.dtype | None = None,
 ) -> torch.Tensor:
-    """RDNA2 GEMV on int8 weights: ``a @ (w * scale[:, None]).T (+ bias)`` for
-    fp16/bf16 ``a`` of at most 8 rows and per-row fp32 ``scale``."""
-    return torch.ops._rocm_C.gemv_w8a16_rdna2(a, w, scale, bias)
+    """RDNA2 GEMM on int8 or fp8 e4m3fn weights in the K-major layout
+    ``w`` [K / 4, N, 4] (``kmajor_w8``): ``a @ (W * scale).T (+ bias)`` for
+    fp16/bf16 ``a`` and fp32 ``scale`` [N]; fp16 ``block_scale``
+    [ceil(K / block_k), ceil(N / block_n)] further scales each block.
+    For int8 ``a`` (W8A8, int8 ``w``): ``(a @ w.T) * scale_a * scale`` in
+    ``out_dtype`` with fp32 ``scale_a`` of 1 or M elements, the same result as
+    ``triton_scaled_mm``. ``cfg`` selects a tile config (-1: by row count)."""
+    return torch.ops._rocm_C.gemm_w8_rdna2(
+        a, w, scale, block_scale, block_n, block_k, bias, cfg, scale_a, out_dtype
+    )
 
 
-def gemv_fp8_rdna2(
+def quant_int8_exl_rdna2(
+    x: torch.Tensor,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Per-token int8 quantization of fp16/bf16 ``x`` [M, K] for
+    ``gemm_w4a8_exl_rdna2``: (int8 bytes in its order, fp32 [M] scales, int32
+    [M, K / 32] sums of each 32-k block)."""
+    return torch.ops._rocm_C.quant_int8_exl_rdna2(x)
+
+
+def gemm_w4a8_exl_rdna2(
     a: torch.Tensor,
+    scale_a: torch.Tensor,
+    sum_a: torch.Tensor,
     w: torch.Tensor,
-    scale: torch.Tensor,
-    block_n: int,
-    block_k: int,
-    bias: torch.Tensor | None = None,
+    zeros: torch.Tensor,
+    scales: torch.Tensor,
+    symmetric: bool,
+    use_v2_format: bool,
+    out_dtype: torch.dtype,
+    cfg: int = -1,
 ) -> torch.Tensor:
-    """RDNA2 GEMV on fp8 e4m3fn weights ``w`` [N, K] with fp32 ``scale``
-    [ceil(N / block_n), 1] (per block_n rows) or [ceil(N / block_n),
-    ceil(K / block_k)] (2D blocks), for fp16/bf16 ``a`` of at most 8 rows."""
-    return torch.ops._rocm_C.gemv_fp8_rdna2(a, w, scale, block_n, block_k, bias)
-
-
-def dequant_fp8_rdna2(
-    out: torch.Tensor,
-    w: torch.Tensor,
-    scale: torch.Tensor,
-    block_n: int,
-    block_k: int,
-) -> None:
-    """Writes fp8 ``w`` times its scales (as in ``gemv_fp8_rdna2``) to the
-    fp16/bf16 ``out`` of the same shape."""
-    torch.ops._rocm_C.dequant_fp8_rdna2(out, w, scale, block_n, block_k)
+    """RDNA2 W4A8 GEMM: ``quant_int8_exl_rdna2`` output times the 4-bit
+    weights ``gemm_w4a16_exl_rdna2`` takes, with v_dot4 (int8 activations)."""
+    return torch.ops._rocm_C.gemm_w4a8_exl_rdna2(
+        a, scale_a, sum_a, w, zeros, scales, symmetric, use_v2_format, out_dtype, cfg
+    )
 
 
 def gemm_w4a16_exl_rdna2(

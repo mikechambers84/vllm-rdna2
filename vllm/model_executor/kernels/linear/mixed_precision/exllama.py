@@ -28,6 +28,16 @@ def _reserve_dq_workspace(numel: int, dtype: torch.dtype, device: torch.device):
         _dq_workspaces[device] = torch.empty(numel, dtype=dtype, device=device)
 
 
+def _bf16_as_fp16(c: MPLinearLayerConfig) -> bool:
+    """bf16 activations on gfx10, which has no bf16 arithmetic: the fp16
+    kernels run on activations converted to fp16 (exact within its range)."""
+    if not (c.act_type == torch.bfloat16 and current_platform.is_rocm()):
+        return False
+    from vllm.platforms.rocm import on_gfx10
+
+    return on_gfx10()
+
+
 def _asymmetric_uint4(c: MPLinearLayerConfig) -> bool:
     """uint4 with stored zeros (AWQ, compressed-tensors asymmetric) on RDNA2:
     gptq_gemm and the gfx1030 GEMM take the zeros as stored (GPTQv2)."""
@@ -36,20 +46,6 @@ def _asymmetric_uint4(c: MPLinearLayerConfig) -> bool:
     from vllm.platforms.rocm import on_gfx10
 
     return c.zero_points and on_gfx10()
-
-
-def _use_w4a8_prefill(c: MPLinearLayerConfig) -> bool:
-    if not (envs.VLLM_ROCM_W4A8_PREFILL and current_platform.is_rocm()):
-        return False
-    from vllm.platforms.rocm import on_gfx1030
-
-    return (
-        on_gfx1030()
-        and c.weight_type == scalar_types.uint4b8
-        and not c.zero_points
-        and c.group_size > 0
-        and c.group_size % 8 == 0
-    )
 
 
 class ExllamaLinearKernel(MPLinearKernel):
@@ -77,7 +73,7 @@ class ExllamaLinearKernel(MPLinearKernel):
                 "pack the zero points",
             )
 
-        if c.act_type != torch.float16:
+        if c.act_type != torch.float16 and not _bf16_as_fp16(c):
             return False, "Exllama only supports float16 activations"
 
         if c.weight_type not in cls.SUPPORTED_QUANT_TYPES and not _asymmetric_uint4(c):
@@ -107,6 +103,8 @@ class ExllamaLinearKernel(MPLinearKernel):
 
     def process_weights_after_loading(self, layer: torch.nn.Module):
         c = self.config
+        self._bf16_as_fp16 = _bf16_as_fp16(c)
+        compute_dtype = torch.float16 if self._bf16_as_fp16 else c.act_type
 
         # For Exllama, we need to set a zero-point tensor if there is not one
         if not c.zero_points:
@@ -151,7 +149,7 @@ class ExllamaLinearKernel(MPLinearKernel):
             assert isinstance(x, BasevLLMParameter)
             permute_param_layout_(x, input_dim=0, output_dim=1)
             x.data = x.data.contiguous()
-            return x.to(dtype=c.act_type)
+            return x.to(dtype=compute_dtype)
 
         # Repack weights and scales for Machete
         self._transform_param(layer, self.w_q_name, transform_w_q)
@@ -170,15 +168,22 @@ class ExllamaLinearKernel(MPLinearKernel):
                 )
 
         k, n = c.partition_weight_shape
-        _reserve_dq_workspace(k * n, c.act_type, getattr(layer, self.w_q_name).device)
-        if _use_w4a8_prefill(c):
+        _reserve_dq_workspace(
+            k * n, compute_dtype, getattr(layer, self.w_q_name).device
+        )
+        from .exllama_rdna2 import RDNA2_MAX_ROWS, use_rdna2_gemm, use_rdna2_w4a8
+
+        self._rdna2_rows = RDNA2_MAX_ROWS if use_rdna2_gemm(c) else 0
+        self._w4a8_min_rows = (
+            envs.VLLM_ROCM_W4A8_MIN_ROWS
+            if envs.VLLM_ROCM_W4A8_PREFILL and use_rdna2_w4a8(c)
+            else 2**31 - 1
+        )
+        self._gfx1030 = self._rdna2_rows > 0 or self._w4a8_min_rows < 2**31 - 1
+        if self._w4a8_min_rows < 2**31 - 1 and not c.zero_points:
             from .exllama_w4a8 import channel_scales
 
             layer.w4a8_channel_scale = channel_scales(getattr(layer, self.w_s_name))
-        from .exllama_rdna2 import RDNA2_MAX_ROWS, use_rdna2_gemm
-
-        self._rdna2_rows = RDNA2_MAX_ROWS if use_rdna2_gemm(c) else 0
-        self._gfx1030 = self._rdna2_rows > 0 or hasattr(layer, "w4a8_channel_scale")
 
     def apply_weights(
         self,
@@ -190,6 +195,8 @@ class ExllamaLinearKernel(MPLinearKernel):
 
         x_2d = x.reshape(-1, x.shape[-1])
         out_shape = x.shape[:-1] + (c.partition_weight_shape[1],)
+        if self._bf16_as_fp16:
+            x_2d = x_2d.clamp(-65504, 65504).half()
 
         w_q, w_s, w_zp = self._get_weight_params(layer)
         # gptq_gemm supports GPTQv2 format by passing use_v2_format=True.
@@ -200,8 +207,6 @@ class ExllamaLinearKernel(MPLinearKernel):
 
         assert w_zp is not None, "Zero points are required by Exllama"
         if self._gfx1030:
-            from .exllama_rdna2 import W4A8_MIN_ROWS, W4A8_MIN_ROWS_RDNA2
-
             output = torch.ops.vllm.exllama_gfx1030_gemm(
                 x_2d,
                 w_q,
@@ -213,22 +218,20 @@ class ExllamaLinearKernel(MPLinearKernel):
                 not c.zero_points,
                 use_v2_format,
                 self._rdna2_rows,
-                W4A8_MIN_ROWS_RDNA2 if self._rdna2_rows else W4A8_MIN_ROWS,
+                self._w4a8_min_rows,
             )
-            if bias is not None:
-                output.add_(bias)
-            return output.reshape(out_shape)
-        output = ops.gptq_gemm(
-            x_2d,
-            w_q,
-            w_zp,
-            w_s,
-            True,
-            use_v2_format,
-            c.weight_type.size_bits,
-            _dq_workspaces.get(x_2d.device),
-        )
-
+        else:
+            output = ops.gptq_gemm(
+                x_2d,
+                w_q,
+                w_zp,
+                w_s,
+                True,
+                use_v2_format,
+                c.weight_type.size_bits,
+                _dq_workspaces.get(x_2d.device),
+            )
+        output = output.to(x.dtype)
         if bias is not None:
             output.add_(bias)
         return output.reshape(out_shape)

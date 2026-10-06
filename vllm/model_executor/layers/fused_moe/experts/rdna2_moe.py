@@ -44,6 +44,12 @@ def rdna2_moe_kernel_available(op: str = "moe_wna16_decode_rdna2") -> bool:
     return on_gfx1030() and hasattr(torch.ops._rocm_C, op)
 
 
+def _decode_lds_ok(hidden: int, intermediate: int, topk: int) -> bool:
+    """The decode kernels stage a token's activations (H) and its experts'
+    intermediate rows (topk * I) in fp16 in the 64 KB of LDS."""
+    return hidden <= 32768 and topk * intermediate <= 32768
+
+
 class Rdna2WNA16Experts(TritonWNA16Experts):
     # The decode kernel beats the routed GEMMs up to ~4-5 rows per expert and
     # loses 20-60% at 6-8 (qwen3.6-35b-a3b, qwen3-30b-a3b, Mixtral shapes).
@@ -99,8 +105,7 @@ class Rdna2WNA16Experts(TritonWNA16Experts):
             and not apply_router_weight_on_input
             and w1.dtype == torch.uint8
             and w1.size(1) == 2 * intermediate
-            and hidden_states.size(1) % 256 == 0
-            and intermediate % 256 == 0
+            and _decode_lds_ok(hidden_states.size(1), intermediate, topk_ids.size(1))
         )
 
     def _use_prefill_kernel(
@@ -320,8 +325,9 @@ class Rdna2Int8Experts(TritonExperts):
             and not apply_router_weight_on_input
             and w1.dtype == torch.int8
             and w1.size(1) == 2 * w2.size(2)
-            and hidden_states.size(1) % 256 == 0
-            and w2.size(2) % 256 == 0
+            and hidden_states.size(1) % 16 == 0
+            and w2.size(2) % 16 == 0
+            and _decode_lds_ok(hidden_states.size(1), w2.size(2), topk_ids.size(1))
         )
 
     def _use_prefill_kernel(
@@ -553,8 +559,9 @@ class Rdna2Fp8Experts(TritonExperts):
             and activation == MoEActivation.SILU
             and not apply_router_weight_on_input
             and w1.size(1) == 2 * w2.size(2)
-            and hidden_states.size(1) % 256 == 0
-            and w2.size(2) % 256 == 0
+            and hidden_states.size(1) % 16 == 0
+            and w2.size(2) % 16 == 0
+            and _decode_lds_ok(hidden_states.size(1), w2.size(2), topk_ids.size(1))
         )
 
     def apply(

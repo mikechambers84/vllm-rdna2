@@ -215,6 +215,7 @@ from vllm.model_executor.kernels.linear.scaled_mm.pytorch import (
 )
 from vllm.model_executor.kernels.linear.scaled_mm.rdna2 import (
     RDNA2FP8ScaledMMLinearKernel,
+    RDNA2Int8ScaledMMLinearKernel,
 )
 from vllm.model_executor.kernels.linear.scaled_mm.rocm import (
     ROCmFP8ScaledMMLinearKernel,
@@ -415,7 +416,11 @@ _POSSIBLE_INT8_KERNELS: dict[PlatformEnum, list[type[Int8ScaledMMLinearKernel]]]
         TritonInt8ScaledMMLinearKernel,
         HummingInt8ScaledMMLinearKernel,
     ],
-    PlatformEnum.ROCM: [AiterInt8ScaledMMLinearKernel, TritonInt8ScaledMMLinearKernel],
+    PlatformEnum.ROCM: [
+        AiterInt8ScaledMMLinearKernel,
+        RDNA2Int8ScaledMMLinearKernel,
+        TritonInt8ScaledMMLinearKernel,
+    ],
     PlatformEnum.XPU: [TritonInt8ScaledMMLinearKernel],
 }
 

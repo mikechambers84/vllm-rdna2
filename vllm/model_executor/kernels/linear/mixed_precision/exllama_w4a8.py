@@ -1,13 +1,13 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
-"""Opt-in W4A8 prefill for Exllama 4-bit symmetric weights on gfx1030.
+"""Opt-in W4A8 for large batches of Exllama 4-bit symmetric weights on gfx1030
+(exllama_rdna2.W4A8_REQUANT_MIN_ROWS and up).
 
-Prefill GEMMs (above Exllama's fused-kernel row limit) quantize activations to
-int8 per token, re-quantize the int4 group-quantized weight to int8 with one
-scale per output channel, and run the W8A8 int8 GEMM on v_dot4. On a V620 the
-Qwen3.8-27B prefill GEMMs run ~2x faster than dequant + fp16 GEMM, at the cost
-of per-token activation quantization (as in W8A8 checkpoints) and a per-channel
-weight scale.
+Activations are quantized to int8 per token, the int4 group-quantized weight
+is re-quantized to int8 with one scale per output channel, and the W8A8 int8
+GEMM runs on v_dot4. On a V620 the Qwen3.8-27B prefill GEMMs run ~2x faster
+than dequant + fp16 GEMM, at the cost of per-token activation quantization
+(as in W8A8 checkpoints) and a per-channel weight scale.
 """
 
 import torch

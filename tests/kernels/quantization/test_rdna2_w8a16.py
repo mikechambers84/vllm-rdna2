@@ -1,8 +1,8 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
-"""8-bit weight-only linear layers on gfx1030: opt-in int8 storage of
-unquantized layers (VLLM_ROCM_W8A16_UNQUANTIZED, VLLM_ROCM_W8A16_LM_HEAD) and
-FP8 checkpoints (no FP8 instructions on gfx1030)."""
+"""8-bit linear layers on gfx1030: opt-in int8 weight-only storage of
+unquantized layers (VLLM_ROCM_W8A16_UNQUANTIZED, VLLM_ROCM_W8A16_LM_HEAD), FP8
+checkpoints (no FP8 instructions on gfx1030) and W8A8 int8 checkpoints."""
 
 from types import SimpleNamespace
 
@@ -17,13 +17,17 @@ if not current_platform.is_rocm():
 from vllm.platforms.rocm import on_gfx1030  # noqa: E402
 
 
+def _from_kmajor(w: torch.Tensor) -> torch.Tensor:
+    """K-major 8-bit weights [K / 4, N, 4] back to [N, K]."""
+    return w.transpose(0, 1).reshape(w.shape[1], -1)
+
+
 @pytest.mark.skipif(not on_gfx1030(), reason="gfx1030 only")
 @pytest.mark.parametrize("num_tokens", [1, 8, 24, 64])
 def test_unquantized_linear_stores_int8_weights(monkeypatch, num_tokens):
-    """The fp16 weight is replaced by int8 weights with per-channel scales;
-    both the decode GEMV (<= 8 tokens) and the dequantize + GEMM path match
-    the dequantized weight up to fp16 rounding, and the weight-only
-    quantization error stays small."""
+    """The fp16 weight is replaced by K-major int8 weights with per-channel
+    scales; decode and larger batches match the dequantized weight up to fp16
+    rounding, and the weight-only quantization error stays small."""
     from vllm.model_executor.layers.linear import UnquantizedLinearMethod
 
     monkeypatch.setenv("VLLM_ROCM_W8A16_UNQUANTIZED", "1")
@@ -36,9 +40,10 @@ def test_unquantized_linear_stores_int8_weights(monkeypatch, num_tokens):
     method.process_weights_after_loading(layer)
 
     assert layer.w8a16_weight.dtype == torch.int8 and layer.weight.numel() == 0
+    assert layer.w8a16_weight.shape == (256, 2048, 4)
     x = torch.randn(num_tokens, 1024, dtype=torch.float16, device="cuda")
     out = method.apply(layer, x)
-    dequant = layer.w8a16_weight.float() * layer.w8a16_scale[:, None]
+    dequant = _from_kmajor(layer.w8a16_weight).float() * layer.w8a16_scale[:, None]
     ref = torch.nn.functional.linear(x.float(), dequant)
     assert ((out.float() - ref).norm() / ref.norm()).item() < 1e-3
     exact = torch.nn.functional.linear(x.float(), weight.float())
@@ -60,14 +65,11 @@ def _lm_head(vocab: int, hidden: int):
 @pytest.mark.parametrize("num_tokens", [1, 8, 40])
 def test_lm_head_stores_int8_weights(monkeypatch, num_tokens):
     """VLLM_ROCM_W8A16_LM_HEAD: the untied lm_head goes int8; logits match the
-    dequantized weight on the GEMV path and on the chunked dequantize + GEMM
-    path (vocabulary larger than the bounded workspace), also for a vocabulary
-    prefix (MTP draft logits)."""
+    dequantized weight, also for a vocabulary prefix (MTP draft logits) that
+    does not end on a whole dword of 4 channels."""
     from vllm.model_executor.kernels.linear import rdna2_w8a16
 
     monkeypatch.setenv("VLLM_ROCM_W8A16_LM_HEAD", "1")
-    monkeypatch.setattr(rdna2_w8a16, "_MAX_WORKSPACE_NUMEL", 1 << 20)
-    monkeypatch.setattr(rdna2_w8a16, "_dequant_workspaces", {})
     torch.manual_seed(0)
     head = _lm_head(8192, 1024)
     weight = head.weight.data.clone()
@@ -76,8 +78,8 @@ def test_lm_head_stores_int8_weights(monkeypatch, num_tokens):
 
     assert head.w8a16_weight.dtype == torch.int8 and head.weight.numel() == 0
     x = torch.randn(num_tokens, 1024, dtype=torch.float16, device="cuda")
-    dequant = head.w8a16_weight.float() * head.w8a16_scale[:, None]
-    for rows in (None, 3000):
+    dequant = _from_kmajor(head.w8a16_weight).float() * head.w8a16_scale[:, None]
+    for rows in (None, 3001):
         if rows is None:
             out = head.quant_method.apply(head, x)
         else:
@@ -119,9 +121,9 @@ def _fp8_dequant(w, scale, block_n, block_k):
 @pytest.mark.parametrize("num_tokens", [1, 8, 24, 64])
 def test_fp8_linear_is_weight_only(dist_init, default_vllm_config, block, num_tokens):
     """An FP8 checkpoint's fused linear layer (per-shard tensor scales, or
-    128x128 block scales) runs weight-only on gfx1030: the GEMV (<= 32
-    tokens) and the dequantize + GEMM path both match the checkpoint's
-    dequantized weights; per-shard scales are kept, not requantized."""
+    128x128 block scales) runs weight-only on gfx1030 and matches the
+    checkpoint's dequantized weights at every batch size; per-shard scales
+    are kept, not requantized."""
     from vllm.model_executor.kernels.linear.scaled_mm.rdna2 import (
         RDNA2FP8ScaledMMLinearKernel,
     )
@@ -168,21 +170,77 @@ def test_fp8_linear_is_weight_only(dist_init, default_vllm_config, block, num_to
 
 
 @pytest.mark.skipif(not on_gfx1030(), reason="gfx1030 only")
-def test_fp8_linear_dequantizes_in_row_chunks(monkeypatch):
-    """A weight larger than the dequantization workspace is multiplied in row
-    chunks that keep each block's scales (N not a multiple of block_n)."""
-    from vllm.model_executor.kernels.linear.scaled_mm import rdna2
+def test_fp8_linear_partial_scale_blocks():
+    """Block scales whose last row and column blocks are partial (N, K not
+    multiples of 128) keep each weight's own block scale; bias is added."""
+    from vllm.model_executor.kernels.linear.rdna2_w8a16 import (
+        kmajor_w8,
+        rdna2_w8_linear,
+    )
+    from vllm.model_executor.kernels.linear.scaled_mm.rdna2 import (
+        _split_block_scales,
+    )
 
-    monkeypatch.setattr(rdna2, "_MAX_WORKSPACE_NUMEL", 300 * 1024)
     torch.manual_seed(0)
-    n, k = 1000, 1024
+    n, k = 1000, 1040
     w = torch.randn(n, k, device="cuda").to(torch.float8_e4m3fn)
-    scale = torch.rand(-(-n // 128), k // 128, device="cuda") * 0.01 + 1e-3
+    blocks = torch.rand(-(-n // 128), -(-k // 128), device="cuda") * 0.01 + 1e-3
     bias = torch.randn(n, dtype=torch.float16, device="cuda")
     x = torch.randn(40, k, dtype=torch.float16, device="cuda")
-    workspace = torch.empty(300 * k, dtype=torch.float16, device="cuda")
+    scale, ratio = _split_block_scales(blocks, 128, n)
 
-    out = torch.ops.vllm.rdna2_fp8_linear(x, w, scale, 128, 128, bias, workspace)
+    out = rdna2_w8_linear(x, kmajor_w8(w), scale, ratio, 128, 128, bias)
 
-    ref = x.float() @ _fp8_dequant(w, scale, 128, 128).t() + bias.float()
+    ref = x.float() @ _fp8_dequant(w, blocks, 128, 128).t() + bias.float()
     assert ((out.float() - ref).norm() / ref.norm()).item() < 1e-3
+
+
+def _w8a8_layer(n: int, k: int, static: bool):
+    torch.manual_seed(0)
+    layer = torch.nn.Module()
+    weight = torch.randint(-127, 128, (n, k), dtype=torch.int8, device="cuda")
+    layer.weight = torch.nn.Parameter(weight, requires_grad=False)
+    scale = torch.rand(n, 1, device="cuda") * 0.01 + 1e-3
+    layer.weight_scale = torch.nn.Parameter(scale, requires_grad=False)
+    input_scale = torch.tensor([0.02], device="cuda")
+    layer.input_scale = (
+        torch.nn.Parameter(input_scale, requires_grad=False) if static else None
+    )
+    layer.input_zero_point = None
+    layer.azp_adj = None
+    layer.logical_widths = [n]
+    return layer
+
+
+@pytest.mark.skipif(not on_gfx1030(), reason="gfx1030 only")
+@pytest.mark.parametrize("n", [1024, 1030])
+@pytest.mark.parametrize("static", [False, True])
+@pytest.mark.parametrize("num_tokens", [1, 40])
+def test_w8a8_linear_matches_triton(n, static, num_tokens):
+    """A symmetric W8A8 layer gives the Triton kernel's results exactly; one
+    whose output size is not a multiple of 4 keeps the Triton layout."""
+    from vllm.model_executor.kernels.linear import (
+        RDNA2Int8ScaledMMLinearKernel,
+        TritonInt8ScaledMMLinearKernel,
+    )
+    from vllm.model_executor.kernels.linear.scaled_mm.ScaledMMLinearKernel import (
+        Int8ScaledMMLinearLayerConfig,
+    )
+
+    config = Int8ScaledMMLinearLayerConfig(
+        is_channelwise=True, is_static_input_scheme=static, input_symmetric=True
+    )
+    names = ["weight", "weight_scale", "input_scale", "input_zero_point", "azp_adj"]
+    rdna2 = RDNA2Int8ScaledMMLinearKernel(config, layer_param_names=names)
+    triton = TritonInt8ScaledMMLinearKernel(config, layer_param_names=names)
+    layer, ref_layer = _w8a8_layer(n, 512, static), _w8a8_layer(n, 512, static)
+    bias = torch.randn(n, dtype=torch.float16, device="cuda")
+
+    rdna2.process_weights_after_loading(layer)
+    triton.process_weights_after_loading(ref_layer)
+
+    assert layer.weight.dim() == (3 if n % 4 == 0 else 2)
+    x = torch.randn(num_tokens, 512, dtype=torch.float16, device="cuda")
+    out = rdna2.apply_weights(layer, x, bias)
+    ref = triton.apply_weights(ref_layer, x, bias)
+    torch.testing.assert_close(out, ref, atol=0, rtol=0)

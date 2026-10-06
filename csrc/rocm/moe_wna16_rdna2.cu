@@ -223,8 +223,8 @@ __global__ void down_sum_kernel(const __half*, const int32_t*, const float*,
 // [M, topk] fp32, w13 [E, 2I, H/2] and w2 [E, H, I/2] uint8 (packed int4 q,
 // low nibble = even k), s13 [E, 2I, H/G] and s2 [E, H, I/G] fp16 (G a multiple
 // of 32), optional zero points z13 [E, I, H/G] and z2 [E, H/2, I/G] uint8
-// (two columns per byte; absent = 8), act a [M * topk, I] fp16 workspace. H
-// and I must be multiples of 256.
+// (two columns per byte; absent = 8), act a [M * topk, I] fp16 workspace.
+// The activations are staged in LDS: H and topk * I at most 32768.
 void moe_wna16_decode_rdna2(torch::Tensor& output, const torch::Tensor& x,
                             const torch::Tensor& topk_ids,
                             const torch::Tensor& topk_weights,
@@ -248,8 +248,9 @@ void moe_wna16_decode_rdna2(torch::Tensor& output, const torch::Tensor& x,
               "topk_weights");
   const int M = x.size(0), H = x.size(1), topk = topk_ids.size(1);
   const int E = w13.size(0), I = w2.size(2) * 2;
-  TORCH_CHECK(H % 256 == 0 && I % 256 == 0,
-              "moe_wna16_decode_rdna2 needs H and I to be multiples of 256");
+  TORCH_CHECK(H <= 32768 && (long)topk * I <= 32768,
+              "moe_wna16_decode_rdna2 stages H and topk * I fp16 values in "
+              "LDS: both must be at most 32768");
   TORCH_CHECK(w13.is_contiguous() && w2.is_contiguous() &&
                   s13.is_contiguous() && s2.is_contiguous() &&
                   w13.size(1) == 2 * I && w13.size(2) == H / 2 &&

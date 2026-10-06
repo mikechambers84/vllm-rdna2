@@ -159,6 +159,7 @@ if TYPE_CHECKING:
     VLLM_ROCM_USE_SKINNY_GEMM: bool = True
     VLLM_MTP_DRAFT_VOCAB_SIZE: int = 0
     VLLM_ROCM_W4A8_PREFILL: bool = False
+    VLLM_ROCM_W4A8_MIN_ROWS: int = 128
     VLLM_UVA_INPUT_EMBEDDINGS: bool = False
     VLLM_ROCM_W8A16_UNQUANTIZED: bool = False
     VLLM_ROCM_RDNA2_ATTENTION: bool = True
@@ -1409,12 +1410,16 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "VLLM_MTP_DRAFT_VOCAB_SIZE": lambda: int(
         os.getenv("VLLM_MTP_DRAFT_VOCAB_SIZE", "0")
     ),
-    # gfx1030: run prefill GEMMs of 4-bit symmetric Exllama layers as int8 GEMMs
-    # (per-token int8 activations, per-channel int8 weights). ~1.7x faster
-    # prefill GEMMs at some accuracy cost; decode keeps the W4A16 kernels.
+    # gfx1030: run the GEMMs of 4-bit Exllama layers with more than
+    # VLLM_ROCM_W4A8_MIN_ROWS rows (prefill) as W4A8 (per-token int8
+    # activations, v_dot4): ~2x faster prefill GEMMs at some accuracy cost
+    # (Qwen3.8-27B NLL +1-3%); smaller batches (decode) keep W4A16.
     "VLLM_ROCM_W4A8_PREFILL": lambda: (
         os.getenv("VLLM_ROCM_W4A8_PREFILL", "0").lower() in ("1", "true")
     ),
+    # Row threshold for VLLM_ROCM_W4A8_PREFILL (W4A8 is 1.25x at 8 rows and
+    # 1.4-1.9x at 16-128 rows; lower it to run decode batches as W4A8 too).
+    "VLLM_ROCM_W4A8_MIN_ROWS": lambda: int(os.getenv("VLLM_ROCM_W4A8_MIN_ROWS", "128")),
     # Keep untied input embedding tables in pinned host memory, read by the GPU
     # over PCIe (UVA): frees a vocabulary-sized table of device memory for the
     # KV cache (or a spec-decode drafter) at a few microseconds per decode step.
