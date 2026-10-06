@@ -82,6 +82,33 @@ def test_unquantized_linear_stores_kmajor_fp16_weights(monkeypatch, num_tokens):
 
 
 @pytest.mark.skipif(not on_gfx1030(), reason="gfx1030 only")
+@pytest.mark.parametrize("num_tokens", [1, 40, 900])
+def test_unquantized_linear_stores_kmajor_bf16_weights_as_fp16(monkeypatch, num_tokens):
+    """VLLM_ROCM_KMAJOR_UNQUANTIZED with a bf16 layer: the weight is stored
+    K-major in fp16 (exact in fp16's range) and bf16 activations run in fp16,
+    so no batch size converts the weight per call; the output stays bf16."""
+    from vllm.model_executor.layers.linear import UnquantizedLinearMethod
+
+    monkeypatch.setenv("VLLM_ROCM_KMAJOR_UNQUANTIZED", "1")
+    torch.manual_seed(0)
+    method = UnquantizedLinearMethod()
+    layer = torch.nn.Module()
+    weight = (torch.randn(2048, 1024, device="cuda") * 0.02).bfloat16()
+    layer.weight = torch.nn.Parameter(weight.clone(), requires_grad=False)
+
+    method.process_weights_after_loading(layer)
+
+    assert layer.kmajor_weight.dtype == torch.float16
+    assert torch.equal(_from_kmajor(layer.kmajor_weight), weight.half())
+    x = torch.randn(num_tokens, 1024, device="cuda").bfloat16()
+    bias = torch.randn(2048, device="cuda").bfloat16()
+    out = method.apply(layer, x, bias)
+    assert out.dtype == torch.bfloat16
+    ref = torch.nn.functional.linear(x.float(), weight.float(), bias.float())
+    assert ((out.float() - ref).norm() / ref.norm()).item() < 1e-2
+
+
+@pytest.mark.skipif(not on_gfx1030(), reason="gfx1030 only")
 @pytest.mark.parametrize(
     "env", ["VLLM_ROCM_KMAJOR_UNQUANTIZED", "VLLM_ROCM_W8A16_UNQUANTIZED"]
 )

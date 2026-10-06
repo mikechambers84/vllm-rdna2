@@ -59,11 +59,9 @@ def use_rdna2_w8a16_lm_head(weight: torch.Tensor) -> bool:
 def use_rdna2_kmajor_fp16(weight: torch.Tensor, lm_head: bool = False) -> bool:
     if not (envs.VLLM_ROCM_KMAJOR_UNQUANTIZED and current_platform.is_rocm()):
         return False
-    return (
-        _supported(weight)
-        and weight.dtype == torch.float16
-        and (lm_head or weight.numel() >= _MIN_NUMEL)
-    )
+    # bf16 weights are stored as fp16 (and run in fp16, as gfx1030 has no
+    # bf16 dot instruction).
+    return _supported(weight) and (lm_head or weight.numel() >= _MIN_NUMEL)
 
 
 def kmajor_w8(weight: torch.Tensor) -> torch.Tensor:
@@ -90,9 +88,13 @@ def _drop_weight(layer: torch.nn.Module, weight: torch.Tensor) -> None:
 
 
 def relayout_weight(layer: torch.nn.Module) -> None:
-    """Replace layer.weight with its K-major fp16 copy."""
+    """Replace layer.weight with its K-major fp16 copy (bf16 saturated to
+    fp16's range)."""
     weight = layer.weight.data
-    layer.kmajor_weight = kmajor_w16(weight)
+    weight16 = weight
+    if weight.dtype == torch.bfloat16:
+        weight16 = weight.clamp(-65504.0, 65504.0).half()
+    layer.kmajor_weight = kmajor_w16(weight16)
     layer.kmajor_scale = None
     _drop_weight(layer, weight)
 
@@ -204,6 +206,15 @@ def apply_rdna2_kmajor(
     """Layer's K-major weight (its first ``rows`` output rows if given)
     applied to x."""
     weight, scale = layer.kmajor_weight, layer.kmajor_scale
+    if weight.dtype == torch.float16 and x.dtype == torch.bfloat16:
+        # bf16 layers stored as fp16 run in fp16.
+        out = apply_rdna2_kmajor(
+            layer,
+            x.clamp(-65504.0, 65504.0).half(),
+            None if bias is None else bias.half(),
+            rows,
+        )
+        return out.to(torch.bfloat16)
     if rows is None:
         return rdna2_w8_linear(x, weight, scale, bias=bias)
     # The kernel takes whole dwords of 4 output channels.
