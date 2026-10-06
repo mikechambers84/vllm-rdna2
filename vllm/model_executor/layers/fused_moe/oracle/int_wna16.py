@@ -1759,6 +1759,15 @@ def convert_to_wna16_moe_kernel_format(
         w13_uint8 = w13.contiguous().view(torch.uint8)
         w2_uint8 = w2.contiguous().view(torch.uint8)
 
+        # gfx1030's int4 MoE kernels (Rdna2WNA16Experts) run bf16 activations
+        # in fp16 and take fp16 group scales.
+        from vllm.model_executor.layers.fused_moe.experts.rdna2_moe import (
+            rdna2_moe_kernel_available,
+        )
+
+        if w13_scale.dtype == torch.bfloat16 and rdna2_moe_kernel_available():
+            w13_scale, w2_scale = w13_scale.half(), w2_scale.half()
+
         # Repack N-first int32 zero-points to uint8:
         # [E, N//pf, K//gs] int32 → [E, N*4//pf, K//gs] uint8
         if w13_qzeros is not None and w13_qzeros.dtype == torch.int32:

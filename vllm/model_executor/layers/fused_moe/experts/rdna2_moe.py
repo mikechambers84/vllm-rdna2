@@ -20,6 +20,10 @@ expert, 1.7-1.8x from 1K tokens.
 
 FP8: ``Rdna2Fp8Experts`` (weight-only, fp16 activations) on the same two kinds
 of kernels.
+
+bf16 activations run through the same fp16 kernels (gfx1030 has no bf16 dot
+instruction): converted on the way in and out, int4 group scales converted to
+fp16 at load (``convert_to_wna16_moe_kernel_format``).
 """
 
 import torch
@@ -46,6 +50,52 @@ def rdna2_moe_kernel_available(op: str = "moe_wna16_decode_rdna2") -> bool:
     from vllm.platforms.rocm import on_gfx1030
 
     return on_gfx1030() and hasattr(torch.ops._rocm_C, op)
+
+
+def _apply_bf16_as_fp16(
+    apply, output: torch.Tensor, hidden_states: torch.Tensor, *args
+):
+    """Run an experts ``apply`` on bf16 activations in fp16: hidden states
+    saturated to fp16's range, fp16 views of the bf16 workspaces, the result
+    copied back into the bf16 output."""
+    (
+        w1,
+        w2,
+        topk_weights,
+        topk_ids,
+        activation,
+        global_num_experts,
+        expert_map,
+        a1q_scale,
+        a2_scale,
+        workspace13,
+        workspace2,
+        expert_tokens_meta,
+        apply_router_weight_on_input,
+    ) = args
+
+    def fp16_view(ws: torch.Tensor) -> torch.Tensor:
+        return ws.view(torch.float16) if ws.dtype == torch.bfloat16 else ws
+
+    out16 = torch.empty(output.shape, dtype=torch.float16, device=output.device)
+    apply(
+        out16,
+        hidden_states.clamp(-65504.0, 65504.0).to(torch.float16),
+        w1,
+        w2,
+        topk_weights,
+        topk_ids,
+        activation,
+        global_num_experts,
+        expert_map,
+        a1q_scale,
+        a2_scale,
+        fp16_view(workspace13),
+        fp16_view(workspace2),
+        expert_tokens_meta,
+        apply_router_weight_on_input,
+    )
+    output.copy_(out16)
 
 
 def _decode_lds_ok(hidden: int, intermediate: int, topk: int) -> bool:
@@ -237,6 +287,29 @@ class Rdna2WNA16Experts(TritonWNA16Experts):
         expert_tokens_meta: mk.ExpertTokensMetadata | None,
         apply_router_weight_on_input: bool,
     ):
+        if (
+            hidden_states.dtype == torch.bfloat16
+            and self.w1_scale is not None
+            and self.w1_scale.dtype == torch.float16
+        ):
+            return _apply_bf16_as_fp16(
+                self.apply,
+                output,
+                hidden_states,
+                w1,
+                w2,
+                topk_weights,
+                topk_ids,
+                activation,
+                global_num_experts,
+                expert_map,
+                a1q_scale,
+                a2_scale,
+                workspace13,
+                workspace2,
+                expert_tokens_meta,
+                apply_router_weight_on_input,
+            )
         if not self._use_decode_kernel(
             hidden_states,
             w1,
@@ -456,6 +529,25 @@ class Rdna2Int8Experts(TritonExperts):
         expert_tokens_meta: mk.ExpertTokensMetadata | None,
         apply_router_weight_on_input: bool,
     ):
+        if hidden_states.dtype == torch.bfloat16:
+            return _apply_bf16_as_fp16(
+                self.apply,
+                output,
+                hidden_states,
+                w1,
+                w2,
+                topk_weights,
+                topk_ids,
+                activation,
+                global_num_experts,
+                expert_map,
+                a1q_scale,
+                a2_scale,
+                workspace13,
+                workspace2,
+                expert_tokens_meta,
+                apply_router_weight_on_input,
+            )
         if not self._use_decode_kernel(
             hidden_states,
             w1,

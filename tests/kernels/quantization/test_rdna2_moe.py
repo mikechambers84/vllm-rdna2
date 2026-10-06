@@ -349,6 +349,69 @@ def test_rdna2_fp8_experts_match_reference(kind, num_tokens):
     assert ((out.float() - ref).norm() / ref.norm()).item() < 2e-3
 
 
+@pytest.mark.parametrize("num_tokens", [3, 96])
+@torch.inference_mode()
+def test_rdna2_wna16_experts_run_bf16_in_fp16(num_tokens, monkeypatch):
+    """bf16 activations (with the fp16 group scales the weight conversion
+    stores on gfx1030) take the fp16 decode kernel or routed GEMMs instead of
+    the Triton fallback, at bf16 output accuracy."""
+    from tests.kernels.moe.utils import make_dummy_moe_config
+    from vllm import _custom_ops as ops
+    from vllm.model_executor.layers.fused_moe.config import (
+        int4_w4a16_moe_quant_config,
+    )
+    from vllm.model_executor.layers.fused_moe.experts.rdna2_moe import (
+        Rdna2WNA16Experts,
+    )
+
+    torch.manual_seed(0)
+    w13, s13, w13_ref, _ = _experts(2 * INTER, H)
+    w2, s2, w2_ref, _ = _experts(H, INTER)
+    experts = Rdna2WNA16Experts(
+        make_dummy_moe_config(),
+        int4_w4a16_moe_quant_config(s13, s2, block_shape=[0, GROUP]),
+    )
+    x = (torch.randn(num_tokens, H, device="cuda") * 0.5).bfloat16()
+    topk_weights, topk_ids = torch.topk(
+        torch.randn(num_tokens, E, device="cuda").softmax(-1), TOPK, dim=-1
+    )
+    ws = torch.empty(
+        num_tokens * TOPK * max(2 * INTER, H), dtype=x.dtype, device="cuda"
+    )
+    out = torch.empty(num_tokens, H, dtype=x.dtype, device="cuda")
+    calls = []
+    for name in ("moe_wna16_decode_rdna2", "moe_wna16_gemm_rdna2"):
+        op = getattr(ops, name)
+
+        def spy(*args, _op=op, **kwargs):
+            calls.append(args)
+            _op(*args, **kwargs)
+
+        monkeypatch.setattr(ops, name, spy)
+
+    experts.apply(
+        out,
+        x,
+        w13,
+        w2,
+        topk_weights,
+        topk_ids,
+        MoEActivation.SILU,
+        E,
+        None,
+        None,
+        None,
+        ws,
+        ws.clone(),
+        None,
+        False,
+    )
+
+    assert calls
+    ref = _reference(x, topk_weights, topk_ids, w13_ref, w2_ref)
+    assert ((out.float() - ref).norm() / ref.norm()).item() < 1e-2
+
+
 def test_fp8_moe_selects_rdna2_backend():
     """Block-scaled FP8 MoE layers pick the weight-only gfx1030 experts."""
     from tests.kernels.moe.utils import make_dummy_moe_config
