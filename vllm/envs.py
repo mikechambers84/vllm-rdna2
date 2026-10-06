@@ -1414,7 +1414,8 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # gfx1030: run the GEMMs of 4-bit Exllama layers with more than
     # VLLM_ROCM_W4A8_MIN_ROWS rows (prefill) as W4A8 (per-token int8
     # activations, v_dot4): ~2x faster prefill GEMMs at some accuracy cost
-    # (Qwen3.8-27B NLL +1-3%); smaller batches (decode) keep W4A16.
+    # (Qwen3.8-27B NLL +1-3%); smaller batches (decode) keep W4A16. int4 MoE
+    # experts likewise in their prefill GEMMs (1.2-1.8x).
     "VLLM_ROCM_W4A8_PREFILL": lambda: (
         os.getenv("VLLM_ROCM_W4A8_PREFILL", "0").lower() in ("1", "true")
     ),

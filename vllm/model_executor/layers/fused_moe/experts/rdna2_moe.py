@@ -13,7 +13,10 @@ routed rows (each token re-reads its experts): on a V620 it beats tuned Triton
 5-7x at 1 token and 1.5-2.3x at 2-4 rows per expert (E=8-256, group size 32 or
 128). Larger batches run the two routed GEMMs on ``moe_wna16_gemm_rdna2``,
 which beats Triton at every batch size: 1.2-1.4x up to ~16 rows per expert,
-1.8-2.2x at 1024+ tokens.
+1.8-2.2x at 1024+ tokens. With VLLM_ROCM_W4A8_PREFILL, prefill batches run
+``moe_w4a8_gemm_rdna2`` instead (per-token int8 activations, experts
+re-quantized to int8 per channel): another 1.2-1.4x up to ~16 rows per
+expert, 1.7-1.8x from 1K tokens.
 
 FP8: ``Rdna2Fp8Experts`` (weight-only, fp16 activations) on the same two kinds
 of kernels.
@@ -22,6 +25,7 @@ of kernels.
 import torch
 
 import vllm._custom_ops as ops
+import vllm.envs as envs
 import vllm.model_executor.layers.fused_moe.modular_kernel as mk
 from vllm.model_executor.layers.fused_moe.activation import MoEActivation
 from vllm.model_executor.layers.fused_moe.experts.triton_moe import (
@@ -147,6 +151,16 @@ class Rdna2WNA16Experts(TritonWNA16Experts):
             return 64
         return 128
 
+    @staticmethod
+    def _use_w4a8(num_tokens: int, w1: torch.Tensor, w2: torch.Tensor) -> bool:
+        return (
+            envs.VLLM_ROCM_W4A8_PREFILL
+            and num_tokens >= envs.VLLM_ROCM_W4A8_MIN_ROWS
+            and w1.size(2) % 32 == 0
+            and w2.size(2) % 32 == 0
+            and rdna2_moe_kernel_available("moe_w4a8_gemm_rdna2")
+        )
+
     def _apply_prefill(
         self,
         output: torch.Tensor,
@@ -162,45 +176,46 @@ class Rdna2WNA16Experts(TritonWNA16Experts):
     ) -> None:
         num_tokens, top_k = topk_ids.shape
         num_experts, n = w1.size(0), w1.size(1)
-        block_m = self._prefill_block_m(num_tokens * top_k / num_experts)
+        w4a8 = self._use_w4a8(num_tokens, w1, w2)
+        if w4a8:
+            block_m = 64 if num_tokens * top_k <= 96 * num_experts else 128
+        else:
+            block_m = self._prefill_block_m(num_tokens * top_k / num_experts)
         sorted_ids, expert_ids, num_post_padded = moe_align_block_size(
             topk_ids, block_m, num_experts
         )
-        weights = topk_weights.to(torch.float32).contiguous()
-        cache1 = _resize_cache(workspace2, (num_tokens, top_k, n))
-        ops.moe_wna16_gemm_rdna2(
-            cache1,
-            hidden_states,
-            w1,
-            self.w1_scale,
-            self.w1_zp,
+        align = (
             sorted_ids,
             expert_ids,
             num_post_padded,
-            weights,
-            top_k,
-            False,
-            block_m,
+            topk_weights.to(torch.float32).contiguous(),
         )
+
+        def gemm(out, a, w, scale, zp, k, mul):
+            if w4a8:
+                a_q, a_s, _ = ops.scaled_int8_quant(a, None, None, True)
+                ops.moe_w4a8_gemm_rdna2(
+                    out, a_q, a_s.view(-1), w, scale, zp, *align, k, mul, block_m
+                )
+            else:
+                ops.moe_wna16_gemm_rdna2(out, a, w, scale, zp, *align, k, mul, block_m)
+
+        cache1 = _resize_cache(workspace2, (num_tokens, top_k, n))
+        gemm(cache1, hidden_states, w1, self.w1_scale, self.w1_zp, top_k, False)
         cache2 = _resize_cache(
             workspace13,
             (num_tokens * top_k, self.adjust_N_for_activation(n, activation)),
         )
         self.activation(activation, cache2, cache1.view(-1, n))
         cache3 = _resize_cache(workspace2, (num_tokens, top_k, hidden_states.size(1)))
-        ops.moe_wna16_gemm_rdna2(
+        gemm(
             cache3,
             cache2,
             w2,
             self.w2_scale,
             self.w2_zp,
-            sorted_ids,
-            expert_ids,
-            num_post_padded,
-            weights,
             1,
             not apply_router_weight_on_input,
-            block_m,
         )
         self.moe_sum(cache3, output)
 

@@ -5,8 +5,8 @@ Triton paths keep (Qwen3.6-35B-A3B dims, E capped at 16): the decode kernels
 ``moe_wna16_decode_rdna2`` on uint8-packed ``[E, N, K/2]`` int4 weights (group
 size 32 or 128, symmetric or with zero points) and
 ``moe_int8_decode_rdna2`` on ``[E, N, K]`` int8 weights with channel scales,
-the prefill GEMM ``moe_wna16_gemm_rdna2``, and the weight-only FP8 experts
-(``Rdna2Fp8Experts``) on both kinds of kernels."""
+the prefill GEMMs ``moe_wna16_gemm_rdna2`` and ``moe_w4a8_gemm_rdna2``, and
+the weight-only FP8 experts (``Rdna2Fp8Experts``) on both kinds of kernels."""
 
 import pytest
 import torch
@@ -25,9 +25,10 @@ pytestmark = pytest.mark.skipif(
 E, H, INTER, TOPK, GROUP = 16, 2048, 512, 8, 32
 
 
-def _experts(n, k, group=GROUP, zp=False):
+def _experts(n, k, group=GROUP, zp=False, requant=False):
     """int4 weights in the Triton WNA16 layout; with zp, zero points packed two
-    columns per byte ([E, N/2, K/G]), else None (8)."""
+    columns per byte ([E, N/2, K/G]), else None (8). With requant, the
+    reference is the per-channel int8 re-quantization of the W4A8 GEMM."""
     q = torch.randint(0, 16, (E, n, k), dtype=torch.uint8, device="cuda")
     packed = (q[..., 0::2] | (q[..., 1::2] << 4)).contiguous()
     scales = (torch.rand(E, n, k // group, device="cuda") * 0.004 + 1e-4).half()
@@ -42,6 +43,11 @@ def _experts(n, k, group=GROUP, zp=False):
         scales.float().repeat_interleave(group, -1),
     )
     ref = (q.float() - z) * scale
+    if requant:
+        zg, sg = z[..., ::group], scales.float()
+        mx = (sg * torch.maximum(zg, 15 - zg)).amax(-1, keepdim=True)
+        r = (sg * (127 / mx)).half().float().repeat_interleave(group, -1)
+        ref = torch.round((q.float() - z) * r) * (mx / 127)
     return packed, scales, ref, zeros
 
 
@@ -229,6 +235,50 @@ def test_moe_int8_gemm_rdna2_prefill_matches_triton(block_m):
             out, a, a_s.view(-1), w, w_s, *align, topk_weights, top_k, mul, block_m
         )
         torch.testing.assert_close(out, ref, rtol=2e-3, atol=1e-3)
+
+
+@pytest.mark.parametrize("zp", [False, True])
+@pytest.mark.parametrize("group", [32, 128])
+@pytest.mark.parametrize("block_m", [64, 128])
+def test_moe_w4a8_gemm_rdna2_matches_requantized_reference(block_m, group, zp):
+    """The W4A8 opt-in's routed GEMMs: int8 activation rows against the experts
+    re-quantized to int8 per output channel in the kernel, exact in int32, so
+    both GEMMs match that reference to fp16 output rounding."""
+    from vllm import _custom_ops as ops
+    from vllm.model_executor.layers.fused_moe.moe_align_block_size import (
+        moe_align_block_size,
+    )
+
+    torch.manual_seed(0)
+    num_tokens = 96
+    w13, s13, w13_ref, z13 = _experts(2 * INTER, H, group, zp, requant=True)
+    w2, s2, w2_ref, z2 = _experts(H, INTER, group, zp, requant=True)
+    x = torch.randn(num_tokens, H, dtype=torch.float16, device="cuda") * 0.5
+    act = torch.randn(num_tokens * TOPK, INTER, dtype=x.dtype, device="cuda") * 0.5
+    topk_weights, topk_ids = torch.topk(
+        torch.randn(num_tokens, E, device="cuda").softmax(-1), TOPK, dim=-1
+    )
+    topk_ids = topk_ids.int()
+    align = moe_align_block_size(topk_ids, block_m, E)
+    ids = topk_ids.view(-1)
+    rows = torch.arange(num_tokens * TOPK, device="cuda")
+    for a, w, s, z, ref_w, top_k, mul in (
+        (x, w13, s13, z13, w13_ref, TOPK, False),
+        (act, w2, s2, z2, w2_ref, 1, True),
+    ):
+        a_q, a_s, _ = ops.scaled_int8_quant(a, None, None, True)
+        out = torch.empty(num_tokens * TOPK, w.size(1), dtype=x.dtype, device="cuda")
+        ops.moe_w4a8_gemm_rdna2(
+            out, a_q, a_s.view(-1), w, s, z, *align, topk_weights, top_k, mul, block_m
+        )
+        a_f = (a_q.float() * a_s)[rows // top_k]
+        ref = torch.empty(out.shape, device="cuda")
+        for e in range(E):
+            r = (ids == e).nonzero().view(-1)
+            ref[r] = a_f[r] @ ref_w[e].t()
+        if mul:
+            ref *= topk_weights.view(-1, 1)
+        assert ((out.float() - ref).norm() / ref.norm()).item() < 2e-3
 
 
 def _fp8_experts(n, k, kind):

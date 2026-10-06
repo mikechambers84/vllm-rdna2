@@ -2393,6 +2393,41 @@ def moe_int8_gemm_rdna2(
     )
 
 
+def moe_w4a8_gemm_rdna2(
+    output: torch.Tensor,
+    a: torch.Tensor,
+    a_scale: torch.Tensor,
+    w: torch.Tensor,
+    scales: torch.Tensor,
+    zeros: torch.Tensor | None,
+    sorted_ids: torch.Tensor,
+    expert_ids: torch.Tensor,
+    num_tokens_post_padded: torch.Tensor,
+    topk_weights: torch.Tensor,
+    top_k: int,
+    mul_routed_weight: bool,
+    block_m: int,
+) -> None:
+    """``moe_int8_gemm_rdna2`` on the int4 tensors of ``moe_wna16_gemm_rdna2``
+    (W4A8 opt-in): the experts are re-quantized to int8 with one scale per
+    output channel as they are staged."""
+    torch.ops._rocm_C.moe_w4a8_gemm_rdna2(
+        output,
+        a,
+        a_scale,
+        w,
+        scales,
+        zeros,
+        sorted_ids,
+        expert_ids,
+        num_tokens_post_padded,
+        topk_weights,
+        top_k,
+        mul_routed_weight,
+        block_m,
+    )
+
+
 def unified_attention_rdna2(
     out: torch.Tensor,
     q: torch.Tensor,

@@ -124,6 +124,16 @@ void moe_int8_gemm_rdna2(torch::Tensor& output, const torch::Tensor& a,
                          const torch::Tensor& topk_weights, int64_t top_k,
                          bool mul_routed_weight, int64_t block_m);
 
+void moe_w4a8_gemm_rdna2(torch::Tensor& output, const torch::Tensor& a,
+                         const torch::Tensor& a_scale, const torch::Tensor& w,
+                         const torch::Tensor& scales,
+                         const std::optional<torch::Tensor>& zeros,
+                         const torch::Tensor& sorted_ids,
+                         const torch::Tensor& expert_ids,
+                         const torch::Tensor& num_tokens_post_padded,
+                         const torch::Tensor& topk_weights, int64_t top_k,
+                         bool mul_routed_weight, int64_t block_m);
+
 void unified_attention_rdna2(torch::Tensor& out, const torch::Tensor& q,
                              const torch::Tensor& k_cache,
                              const torch::Tensor& v_cache,
