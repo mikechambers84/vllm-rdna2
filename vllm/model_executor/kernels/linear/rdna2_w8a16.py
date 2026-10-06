@@ -97,6 +97,17 @@ def relayout_weight(layer: torch.nn.Module) -> None:
     _drop_weight(layer, weight)
 
 
+def weight_from_kmajor(layer: torch.nn.Module) -> torch.Tensor:
+    """The [N, K] weight of a layer stored K-major (relayout_weight: exact;
+    quantize_weight: the dequantized int8 weights it computes with)."""
+    w = layer.kmajor_weight
+    n = w.size(1)
+    weight = w.permute(1, 0, 2).reshape(n, -1)
+    if layer.kmajor_scale is None:
+        return weight
+    return weight.view(torch.int8).float() * layer.kmajor_scale.view(n, 1)
+
+
 def quantize_weight(layer: torch.nn.Module) -> None:
     """Replace layer.weight with K-major int8 weights and per-channel fp32
     scales."""
