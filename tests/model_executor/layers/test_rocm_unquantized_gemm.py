@@ -267,6 +267,35 @@ def test_rocm_unquantized_gemm_gfx950_wvsplitkrc_path(monkeypatch):
 
 
 @pytest.mark.skipif(not current_platform.is_rocm(), reason="ROCm-only kernel test")
+def test_rocm_unquantized_gemm_gfx1030_bf16_runs_in_fp16(monkeypatch):
+    """gfx1030 has no bf16 dot instruction, so bf16 GEMMs past the GEMV row
+    counts run rocBLAS on fp16 copies of the operands and return bf16."""
+    from vllm.model_executor.kernels.linear import rdna2_gemm
+
+    if not rdna2_gemm.available():
+        pytest.skip("gfx1030 with gemm_rocblas_rdna2")
+    monkeypatch.setattr(rdna2_gemm, "_table", lambda: {})
+    linear = torch.nn.functional.linear
+    dtypes = []
+
+    def spy(x, w, b=None):
+        dtypes.append((x.dtype, w.dtype))
+        return linear(x, w, b)
+
+    monkeypatch.setattr(torch.nn.functional, "linear", spy)
+    torch.manual_seed(0)
+    x = torch.randn(100, 2048, device="cuda", dtype=torch.bfloat16)
+    weight = torch.randn(3072, 2048, device="cuda", dtype=torch.bfloat16) * 0.02
+
+    out = utils.rocm_unquantized_gemm_impl(x, weight, None)
+
+    assert out.dtype == torch.bfloat16
+    assert dtypes == [(torch.float16, torch.float16)]
+    ref = linear(x.float(), weight.float())
+    assert ((out.float() - ref).norm() / ref.norm()).item() < 1e-2
+
+
+@pytest.mark.skipif(not current_platform.is_rocm(), reason="ROCm-only kernel test")
 @pytest.mark.parametrize("valid", [True, False])
 def test_rocm_unquantized_gemm_gfx1030_tuned_rocblas_solution(monkeypatch, valid):
     """On gfx1030 a weight shape in the tuned table runs rocBLAS with the

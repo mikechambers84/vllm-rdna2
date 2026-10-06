@@ -96,7 +96,18 @@ def solution(n: int, k: int, m: int, dtype: torch.dtype, w_kn: bool = False) -> 
 def linear(
     x: torch.Tensor, weight: torch.Tensor, bias: torch.Tensor | None = None
 ) -> torch.Tensor:
-    """F.linear(x, weight, bias) with the tuned rocBLAS solution, if any."""
+    """F.linear(x, weight, bias) with the tuned rocBLAS solution, if any.
+
+    bf16 runs in fp16 (x saturated at fp16's range): gfx1030 has no bf16 dot
+    instruction, and rocBLAS's bf16 GEMMs take 3-8x as long as fp16 ones with
+    both operands converted (16-8192 rows)."""
+    if x.dtype == weight.dtype == torch.bfloat16:
+        out = linear(
+            x.clamp(-65504.0, 65504.0).half(),
+            weight.half(),
+            None if bias is None else bias.half(),
+        )
+        return out.to(torch.bfloat16)
     n, k = weight.shape
     x_2d = x.reshape(-1, k)
     sol = solution(n, k, x_2d.shape[0], x.dtype)
@@ -123,6 +134,9 @@ def register(
         return
     if dtype not in (torch.float16, torch.bfloat16):
         return
+    if dtype == torch.bfloat16:  # runs in fp16 (see linear)
+        dtype = torch.float16
+        weight = None if weight is None else weight.half()
     key = _key(n, k, dtype, False)
     if key in _table():
         return
