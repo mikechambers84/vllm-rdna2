@@ -36,18 +36,26 @@ def recurrent_reference(q, k, v, g, beta, scale, h0, cu_seqlens):
 
 @pytest.mark.parametrize("lens", [[100], [1, 64, 130, 7]])
 @pytest.mark.parametrize("heads", [(2, 4), (4, 4)])
-@pytest.mark.parametrize("state_dtype", [torch.float32, torch.float16])
+@pytest.mark.parametrize(
+    "dtype,state_dtype",
+    [
+        (torch.float16, torch.float32),
+        (torch.float16, torch.float16),
+        (torch.bfloat16, torch.float32),
+        (torch.bfloat16, torch.bfloat16),
+    ],
+)
 @torch.inference_mode()
-def test_chunk_gated_delta_rule_varlen(lens, heads, state_dtype, monkeypatch):
-    """fp16 varlen prefill matches the recurrence; on gfx1030 the pipeline runs
-    in the HIP kernels."""
+def test_chunk_gated_delta_rule_varlen(lens, heads, dtype, state_dtype, monkeypatch):
+    """fp16 and bf16 varlen prefill match the recurrence; on gfx1030 the
+    pipeline runs in the (fp16) HIP kernels."""
     torch.manual_seed(0)
     Hg, H = heads
     K = V = 128
     T = sum(lens)
-    q = F.normalize(torch.randn(1, T, Hg, K, device="cuda"), dim=-1).half()
-    k = F.normalize(torch.randn(1, T, Hg, K, device="cuda"), dim=-1).half()
-    v = torch.randn(1, T, H, V, device="cuda").half()
+    q = F.normalize(torch.randn(1, T, Hg, K, device="cuda"), dim=-1).to(dtype)
+    k = F.normalize(torch.randn(1, T, Hg, K, device="cuda"), dim=-1).to(dtype)
+    v = torch.randn(1, T, H, V, device="cuda").to(dtype)
     g = -torch.rand(1, T, H, device="cuda") * 0.3
     beta = torch.rand(1, T, H, device="cuda")
     h0 = (torch.randn(len(lens), H, V, K, device="cuda") * 0.1).to(state_dtype)
@@ -78,5 +86,6 @@ def test_chunk_gated_delta_rule_varlen(lens, heads, state_dtype, monkeypatch):
     )
     ref_o, ref_state = recurrent_reference(q, k, v, g, beta, K**-0.5, h0, cu_seqlens)
     assert len(calls) == (1 if chunk._rdna2_gdn_available() else 0)
+    assert o.dtype == dtype
     torch.testing.assert_close(o.float(), ref_o, atol=2e-2, rtol=2e-2)
     torch.testing.assert_close(final_state.float(), ref_state, atol=2e-2, rtol=2e-2)

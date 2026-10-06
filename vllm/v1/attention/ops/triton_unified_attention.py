@@ -60,14 +60,24 @@ def _rdna2_attention_available() -> bool:
 RDNA2_DECODE_TILE = 64
 
 
-def _rdna2_attention_operands_ok(*tensors: torch.Tensor) -> bool:
+def _rdna2_attention_operands_ok(
+    *tensors: torch.Tensor, dtype: torch.dtype = torch.float16
+) -> bool:
     return all(
-        t.dtype == torch.float16
+        t.dtype == dtype
         and t.stride(-1) == 1
         and t.data_ptr() % 16 == 0
         and all(st % 8 == 0 for st in t.stride()[:-1])
         for t in tensors
     )
+
+
+def _rdna2_fp16(t: torch.Tensor) -> torch.Tensor:
+    """bf16 operands run through the fp16 kernels (saturating at fp16's range,
+    as the kernels do for bf16 caches)."""
+    if t.dtype == torch.float16:
+        return t
+    return t.clamp(-65504.0, 65504.0).to(torch.float16)
 
 
 def _rdna2_kv_ok(
@@ -76,9 +86,12 @@ def _rdna2_kv_ok(
     v: torch.Tensor,
     kv_quant_mode: KVQuantMode,
 ) -> bool:
-    """fp16 caches, or fp8 e4m3fn caches with per-tensor scales (fp16 q)."""
+    """fp16 caches, bf16 caches (bf16 q, run in fp16), or fp8 e4m3fn caches
+    with per-tensor scales (fp16 q)."""
     if kv_quant_mode == KVQuantMode.NONE:
-        return _rdna2_attention_operands_ok(q, k, v)
+        return _rdna2_attention_operands_ok(q, k, v) or _rdna2_attention_operands_ok(
+            q, k, v, dtype=torch.bfloat16
+        )
     return (
         kv_quant_mode == KVQuantMode.FP8_PER_TENSOR
         and k.dtype == v.dtype == torch.float8_e4m3fn
@@ -1028,16 +1041,21 @@ def unified_attention(
         and not use_td
         and not is_batch_invariant
         and _rdna2_attention_available()
-        and _rdna2_attention_operands_ok(out)
+        and _rdna2_attention_operands_ok(out, dtype=q.dtype)
         and _rdna2_kv_ok(q, k, v, kv_quant_mode)
         and block_table.dtype == torch.int32
         and block_table.stride(1) == 1
     ):
         from vllm import _custom_ops as ops
 
+        out16 = (
+            out
+            if out.dtype == torch.float16
+            else torch.empty(out.shape, dtype=torch.float16, device=out.device)
+        )
         ops.unified_attention_rdna2(
-            out,
-            q,
+            out16,
+            _rdna2_fp16(q),
             k,
             v,
             cu_seqlens_q,
@@ -1047,9 +1065,11 @@ def unified_attention(
             window=1 + window_size[0] if window_size[0] >= 0 else 0,
             softcap=softcap or 0.0,
             sinks=None if sinks is None else sinks.float().contiguous(),
-            k_scale=k_descale if k.dtype != torch.float16 else None,
-            v_scale=v_descale if k.dtype != torch.float16 else None,
+            k_scale=k_descale if k.dtype == torch.float8_e4m3fn else None,
+            v_scale=v_descale if k.dtype == torch.float8_e4m3fn else None,
         )
+        if out16 is not out:
+            out.copy_(out16)
         return
 
     BLOCK_M = (
@@ -1241,7 +1261,7 @@ def unified_attention(
         from vllm import _custom_ops as ops
 
         ops.decode_attention_rdna2(
-            q,
+            _rdna2_fp16(q),
             k,
             v,
             softmax_segm_output,
@@ -1253,8 +1273,8 @@ def unified_attention(
             RDNA2_DECODE_TILE,
             max_seqlen_q,
             softmax_scale,
-            k_scale=k_descale if k.dtype != torch.float16 else None,
-            v_scale=v_descale if k.dtype != torch.float16 else None,
+            k_scale=k_descale if k.dtype == torch.float8_e4m3fn else None,
+            v_scale=v_descale if k.dtype == torch.float8_e4m3fn else None,
             window=1 + window_size[0] if window_size[0] >= 0 else 0,
             softcap=softcap or 0.0,
             sinks=None if sinks is None else sinks.float().contiguous(),
