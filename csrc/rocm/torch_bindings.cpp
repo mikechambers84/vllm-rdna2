@@ -97,6 +97,15 @@ TORCH_LIBRARY_EXPAND(TORCH_EXTENSION_NAME, rocm_ops) {
       "gemm_w4a16_exl_rdna2(Tensor a, Tensor w, Tensor zeros, Tensor scales, "
       "bool symmetric, bool use_v2_format, int cfg) -> Tensor");
   rocm_ops.impl("gemm_w4a16_exl_rdna2", torch::kCUDA, &gemm_w4a16_exl_rdna2);
+  // W4A8 on the same tensors: per-token int8 activations in the GEMM's byte
+  // order, then v_dot4 on the 4-bit weights.
+  rocm_ops.def("quant_int8_exl_rdna2(Tensor x) -> (Tensor, Tensor, Tensor)");
+  rocm_ops.impl("quant_int8_exl_rdna2", torch::kCUDA, &quant_int8_exl_rdna2);
+  rocm_ops.def(
+      "gemm_w4a8_exl_rdna2(Tensor a, Tensor scale_a, Tensor sum_a, Tensor w, "
+      "Tensor zeros, Tensor scales, bool symmetric, bool use_v2_format, "
+      "ScalarType out_dtype, int cfg) -> Tensor");
+  rocm_ops.impl("gemm_w4a8_exl_rdna2", torch::kCUDA, &gemm_w4a8_exl_rdna2);
   // int8-weight fused-MoE decode (few tokens) on the Triton int8 layout.
   rocm_ops.def(
       "moe_int8_decode_rdna2(Tensor! output, Tensor x, Tensor topk_ids, "

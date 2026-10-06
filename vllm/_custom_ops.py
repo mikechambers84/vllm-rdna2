@@ -2162,6 +2162,34 @@ def gemm_w8_rdna2(
     )
 
 
+def quant_int8_exl_rdna2(
+    x: torch.Tensor,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Per-token int8 quantization of fp16/bf16 ``x`` [M, K] for
+    ``gemm_w4a8_exl_rdna2``: (int8 bytes in its order, fp32 [M] scales, int32
+    [M, K / 32] sums of each 32-k block)."""
+    return torch.ops._rocm_C.quant_int8_exl_rdna2(x)
+
+
+def gemm_w4a8_exl_rdna2(
+    a: torch.Tensor,
+    scale_a: torch.Tensor,
+    sum_a: torch.Tensor,
+    w: torch.Tensor,
+    zeros: torch.Tensor,
+    scales: torch.Tensor,
+    symmetric: bool,
+    use_v2_format: bool,
+    out_dtype: torch.dtype,
+    cfg: int = -1,
+) -> torch.Tensor:
+    """RDNA2 W4A8 GEMM: ``quant_int8_exl_rdna2`` output times the 4-bit
+    weights ``gemm_w4a16_exl_rdna2`` takes, with v_dot4 (int8 activations)."""
+    return torch.ops._rocm_C.gemm_w4a8_exl_rdna2(
+        a, scale_a, sum_a, w, zeros, scales, symmetric, use_v2_format, out_dtype, cfg
+    )
+
+
 def gemm_w4a16_exl_rdna2(
     a: torch.Tensor,
     w: torch.Tensor,

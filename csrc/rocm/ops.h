@@ -61,6 +61,14 @@ std::vector<int64_t> gemm_rocblas_solutions_rdna2(const at::Tensor& a,
 
 std::string rocblas_version_rdna2();
 
+std::tuple<torch::Tensor, torch::Tensor, torch::Tensor> quant_int8_exl_rdna2(
+    const at::Tensor& x);
+
+torch::Tensor gemm_w4a8_exl_rdna2(
+    const at::Tensor& a, const at::Tensor& scale_a, const at::Tensor& sum_a,
+    const at::Tensor& w, const at::Tensor& zeros, const at::Tensor& scales,
+    bool symmetric, bool use_v2_format, at::ScalarType out_dtype, int64_t cfg);
+
 torch::Tensor gemm_w4a16_exl_rdna2(const at::Tensor& a, const at::Tensor& w,
                                    const at::Tensor& zeros,
                                    const at::Tensor& scales, bool symmetric,
