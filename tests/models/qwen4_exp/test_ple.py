@@ -1903,6 +1903,92 @@ def test_fused_conv_correctness(
         )
 
 
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="fused conv needs a GPU")
+@pytest.mark.parametrize("state_layout", ["SD", "DS"])
+@pytest.mark.parametrize(
+    "case",
+    [
+        pytest.param(_ConvBatchCase(prefill_query_lens=(5, 300, 2)), id="prefill"),
+        pytest.param(
+            _ConvBatchCase(num_decodes=2, prefill_query_lens=(7, 0, 40)),
+            id="decode+prefill",
+        ),
+        pytest.param(
+            _ConvBatchCase(
+                spec_query_lens=(3, 4),
+                num_accepted=(2, 4),
+                num_decodes=1,
+                prefill_query_lens=(5, 12),
+                spec_query_len=4,
+            ),
+            id="spec+prefill",
+        ),
+        pytest.param(
+            _ConvBatchCase(
+                prefill_query_lens=(1, 9, 3),
+                channels=640,
+                kernel_size=3,
+                dilation=2,
+            ),
+            id="varied",
+        ),
+    ],
+)
+def test_amd_short_conv_matches_reference(
+    case: _ConvBatchCase,
+    state_layout: str,
+) -> None:
+    """The AMD layer's prefill short conv (one fused Triton pass instead of
+    packing and transposing the activations) must match the reference: the
+    outputs up to fp32-vs-bf16 accumulation, the written states exactly."""
+    device = torch.device("cuda")
+    metadata, num_real_tokens = _make_conv_metadata(case, device)
+    module = Qwen4ExpPLELayerAMD.__new__(Qwen4ExpPLELayerAMD)
+    nn.Module.__init__(module)
+    module.conv_state_len = (case.kernel_size - 1) * case.dilation
+    module.short_conv_dilation = case.dilation
+
+    rng, state_reference, conv_state, weights = _make_conv_case(
+        device,
+        seed=num_real_tokens + case.channels,
+        channels=case.channels,
+        kernel_size=case.kernel_size,
+        dilation=case.dilation,
+        state_layout=state_layout,
+        spec_query_len=case.spec_query_len,
+    )
+    inputs = torch.randn(
+        metadata.num_actual_tokens,
+        case.channels,
+        device=device,
+        dtype=torch.bfloat16,
+        generator=rng,
+    )
+    output = module._short_conv_dilated_dispatch(
+        inputs=inputs,
+        metadata=metadata,
+        conv_state=conv_state,
+        conv_weights=weights,
+    )
+    expected = torch.zeros_like(inputs)
+    _short_conv_dilated_dispatch_pytorch(
+        inputs=inputs,
+        residual=expected,
+        metadata=metadata,
+        conv_state=state_reference,
+        conv_weights=weights,
+        conv_state_len=module.conv_state_len,
+        dilation=module.short_conv_dilation,
+    )
+    torch.testing.assert_close(
+        output[:num_real_tokens].float(),
+        expected[:num_real_tokens].float(),
+        rtol=2e-2,
+        atol=2e-2,
+    )
+    assert torch.equal(conv_state, state_reference)
+
+
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="fused gate needs CUDA")
 @pytest.mark.parametrize(("num_tokens", "strided_kv"), [(1, False), (64, True)])
 def test_fused_gate_correctness(num_tokens: int, strided_kv: bool) -> None:
