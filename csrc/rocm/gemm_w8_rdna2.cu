@@ -74,6 +74,7 @@ static constexpr Config kConfigs[] = {
     {1, 8, 2, 32},  {2, 8, 2, 32},  {4, 4, 1, 32},  {6, 4, 1, 32},
     {8, 4, 1, 32},  {12, 4, 1, 32}, {16, 4, 1, 32}, {24, 4, 1, 32},
     {16, 8, 1, 32}, {16, 2, 1, 32}, {16, 1, 1, 32}, {16, 1, 2, 16},
+    {1, 4, 1, 32},  {1, 16, 1, 16}, {4, 8, 1, 32},
 };
 // int8 activations, which need no widening and so take longer weight blocks
 // and token tiles:
@@ -739,20 +740,23 @@ void launch_config_i8(const Args& p, cudaStream_t stream) {
 
 // Default config, fitted on the linear layers of Qwen3.8-27B and
 // Qwen3.6-35B-A3B at steady clocks (within 1-3% of the best config summed per
-// row count): a token tile that wastes few rows; on narrow layers (few column
+// row count; up to 4 rows timed inside HIP graphs, with Qwen3.8-Flash-Next's
+// layers): a token tile that wastes few rows; on narrow layers (few column
 // tiles) smaller tiles or more waves per workgroup to fill the GPU; on wide
-// ones, two column tiles per wave from 33 rows on.
+// ones, two column tiles per wave at 2 rows and from 33 rows on.
 static int default_config(int M, int N, int K) {
-  // Few columns, long rows (split K): eight waves per workgroup.
-  if (M <= 2 && N <= 1024 && K >= 4096) return 0;
+  // At most 10 column tiles: 16 waves per workgroup split K (8 on long rows,
+  // which also split K over workgroups).
+  if (M <= 4 && N <= 1280) return K <= 4096 ? 13 : 14;
+  const bool wide = N >= 32768;
+  if (M == 1) return wide ? 0 : 12;
+  if (M == 2 && wide) return 1;
   if (N <= 4096) {
     if (M <= 16) return 2;
     if (M <= 64) return 4;
     return M <= 1024 ? 7 : 11;
   }
-  const bool narrow = N <= (M <= 24 ? 10240 : 6144), wide = N >= 32768;
-  if (M == 1) return 0;
-  if (M == 2) return 1;
+  const bool narrow = N <= (M <= 24 ? 10240 : 6144);
   if (M <= 4) return 2;
   if (M <= 6) return 3;
   if (M <= 8) return 4;
@@ -997,6 +1001,9 @@ torch::Tensor gemm_w8_rdna2(const at::Tensor& a, const at::Tensor& w,
     VLLM_W8_RDNA2_CASE(9, 16, 2, 1, 32)
     VLLM_W8_RDNA2_CASE(10, 16, 1, 1, 32)
     VLLM_W8_RDNA2_CASE(11, 16, 1, 2, 16)
+    VLLM_W8_RDNA2_CASE(12, 1, 4, 1, 32)
+    VLLM_W8_RDNA2_CASE(13, 1, 16, 1, 16)
+    VLLM_W8_RDNA2_CASE(14, 4, 8, 1, 32)
   }
 #undef VLLM_W8_RDNA2_CASE
   return c;
