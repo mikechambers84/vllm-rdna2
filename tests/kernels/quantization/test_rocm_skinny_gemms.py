@@ -547,6 +547,27 @@ def test_rocm_gemm_w8_rdna2_fp16_weights(n, cfg):
     assert ((out.float() - ref).norm() / ref.norm()).item() < 1e-3
 
 
+@pytest.mark.parametrize("cfg", [-1, 13])
+@pytest.mark.parametrize("n", [300, 800, 1029])
+@pytest.mark.skipif(not on_gfx1030(), reason="RDNA2 (gfx1030) kernel")
+def test_rocm_gemm_w8_rdna2_fp16_weights_tiled(n, cfg):
+    """The LDS-tiled fp16 config (13, the default from 768 rows when
+    K % 32 == 0) gives F.linear's result up to output rounding, with a bias,
+    partial 128-row and 256-column tiles."""
+    from vllm.model_executor.kernels.linear.rdna2_w8a16 import kmajor_w16
+
+    torch.manual_seed(0)
+    k, m = 1056, 516
+    A = torch.randn(n, k, dtype=torch.float16, device="cuda")
+    W = torch.randn(m, k, dtype=torch.float16, device="cuda") * 0.05
+    bias = torch.randn(m, dtype=torch.float16, device="cuda")
+
+    out = ops.gemm_w8_rdna2(A, kmajor_w16(W), None, bias=bias, cfg=cfg)
+
+    ref = torch.nn.functional.linear(A.float(), W.float(), bias.float())
+    assert ((out.float() - ref).norm() / ref.norm()).item() < 1e-3
+
+
 @pytest.mark.parametrize("cfg", range(12))
 @pytest.mark.skipif(not on_gfx1030(), reason="RDNA2 (gfx1030) kernel")
 def test_rocm_gemm_w8_rdna2_configs(cfg):

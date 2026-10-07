@@ -524,6 +524,15 @@ def get_and_maybe_dequant_weights(
     while hasattr(layer, "base_layer") and hasattr(layer.base_layer, "quant_method"):
         layer = layer.base_layer
 
+    # gfx1030 K-major opt-ins (VLLM_ROCM_KMAJOR_UNQUANTIZED / _W8A16_*) keep
+    # the weights K-major only.
+    if hasattr(layer, "kmajor_weight"):
+        from vllm.model_executor.kernels.linear.rdna2_w8a16 import (
+            weight_from_kmajor,
+        )
+
+        return weight_from_kmajor(layer).to(out_dtype)
+
     weight = get_attribute_fallback(layer, ["weight", "qweight", "weight_packed"])
 
     # Unquantized layer: just return base weights
