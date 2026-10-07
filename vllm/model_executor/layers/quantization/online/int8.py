@@ -132,3 +132,23 @@ class Int8OnlineMoEMethod(OnlineMoEMethodBase):
             w2_bias=getattr(layer, "w2_bias", None),
             layer=layer,
         )
+
+
+class Rdna2Int8OnlineMoEMethod(Int8OnlineMoEMethod):
+    """Online per-channel int8 experts for unquantized MoE layers on gfx1030
+    (VLLM_ROCM_W8A16_UNQUANTIZED): with dynamic per-token int8 activations
+    they run on Rdna2Int8Experts, whose decode kernel keeps the fp16
+    activations and whose prefill GEMMs use v_dot4."""
+
+    def get_fused_moe_quant_config(
+        self, layer: torch.nn.Module
+    ) -> "FusedMoEQuantConfig | None":
+        return make_int8_moe_quant_config(
+            int8_backend=self.int8_backend,
+            w1_scale=getattr(layer, "w13_scale", None),
+            w2_scale=getattr(layer, "w2_scale", None),
+            w1_bias=getattr(layer, "w13_bias", None),
+            w2_bias=getattr(layer, "w2_bias", None),
+            per_act_token_quant=True,
+            layer=layer,
+        )

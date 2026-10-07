@@ -1430,7 +1430,10 @@ environment_variables: dict[str, Callable[[], Any]] = {
     ),
     # gfx1030: store unquantized fp16/bf16 linear weights (e.g. the layers a
     # partially quantized checkpoint leaves in 16 bits) as int8 with per-channel
-    # scales, weight-only: halves their decode bandwidth and memory.
+    # scales, weight-only: halves their decode bandwidth and memory. Unquantized
+    # MoE experts (e.g. an MTP drafter's) become int8 too, on Rdna2Int8Experts
+    # (decode keeps fp16 activations; prefill GEMMs quantize them per token).
+    # MoE routers stay in 16 bits.
     "VLLM_ROCM_W8A16_UNQUANTIZED": lambda: (
         os.getenv("VLLM_ROCM_W8A16_UNQUANTIZED", "0").lower() in ("1", "true")
     ),

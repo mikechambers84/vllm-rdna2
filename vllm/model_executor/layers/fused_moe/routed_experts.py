@@ -39,6 +39,18 @@ if TYPE_CHECKING:
 logger = init_logger(__name__)
 
 
+def _rdna2_int8_experts() -> bool:
+    """gfx1030 opt-in: unquantized experts become online int8 experts."""
+    import vllm.envs as envs
+    from vllm.platforms import current_platform
+
+    if not (envs.VLLM_ROCM_W8A16_UNQUANTIZED and current_platform.is_rocm()):
+        return False
+    from vllm.platforms.rocm import on_gfx1030
+
+    return on_gfx1030()
+
+
 def _index_expert_mapping(
     mapping: list[tuple[str, str, int, str]],
 ) -> dict[str, list[tuple[str, str, int, str]]]:
@@ -223,6 +235,12 @@ class RoutedExperts(PluggableLayer):
             quant_method = resolve_quant_method(quant_config, self, prefix)
         if quant_method is None:
             quant_method = UnquantizedFusedMoEMethod(moe_config)
+        if type(quant_method) is UnquantizedFusedMoEMethod and _rdna2_int8_experts():
+            from vllm.model_executor.layers.quantization.online.int8 import (
+                Rdna2Int8OnlineMoEMethod,
+            )
+
+            quant_method = Rdna2Int8OnlineMoEMethod(moe=moe_config)
         assert isinstance(quant_method, FusedMoEMethodBase)
         return quant_method
 
