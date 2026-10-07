@@ -52,6 +52,38 @@ def test_unquantized_linear_stores_int8_weights(monkeypatch, num_tokens):
 
 
 @pytest.mark.skipif(not on_gfx1030(), reason="gfx1030 only")
+@pytest.mark.parametrize("num_tokens", [8, 127, 128, 600])
+def test_int8_layers_run_prefill_as_w8a8(monkeypatch, num_tokens):
+    """With VLLM_ROCM_W4A8_PREFILL, int8-stored layers quantize the activations
+    of batches from VLLM_ROCM_W4A8_MIN_ROWS rows on per token (W8A8); smaller
+    batches stay weight-only."""
+    from vllm import _custom_ops as ops
+    from vllm.model_executor.layers.linear import UnquantizedLinearMethod
+
+    monkeypatch.setenv("VLLM_ROCM_W8A16_UNQUANTIZED", "1")
+    monkeypatch.setenv("VLLM_ROCM_W4A8_PREFILL", "1")
+    monkeypatch.setenv("VLLM_ROCM_W4A8_MIN_ROWS", "128")
+    torch.manual_seed(0)
+    layer = torch.nn.Module()
+    weight = torch.randn(2048, 1024, dtype=torch.float16, device="cuda") * 0.02
+    layer.weight = torch.nn.Parameter(weight.clone(), requires_grad=False)
+    method = UnquantizedLinearMethod()
+    method.process_weights_after_loading(layer)
+    x = torch.randn(num_tokens, 1024, dtype=torch.float16, device="cuda")
+
+    out = method.apply(layer, x)
+
+    dequant = _from_kmajor(layer.kmajor_weight).float() * layer.kmajor_scale[:, None]
+    if num_tokens >= 128:
+        x_q, x_s, _ = ops.scaled_int8_quant(x)
+        x_ref = x_q.float() * x_s
+    else:
+        x_ref = x.float()
+    ref = torch.nn.functional.linear(x_ref, dequant)
+    assert ((out.float() - ref).norm() / ref.norm()).item() < 1e-3
+
+
+@pytest.mark.skipif(not on_gfx1030(), reason="gfx1030 only")
 @pytest.mark.parametrize("num_tokens", [1, 8, 24, 64, 600])
 def test_unquantized_linear_stores_kmajor_fp16_weights(monkeypatch, num_tokens):
     """VLLM_ROCM_KMAJOR_UNQUANTIZED: the fp16 weight is stored K-major
