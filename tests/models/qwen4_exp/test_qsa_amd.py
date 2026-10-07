@@ -394,3 +394,88 @@ def test_qsa_sparse_attention_rdna2_matches_reference(
         head_dim**-0.5,
     )
     torch.testing.assert_close(actual, expected, rtol=2e-2, atol=2e-2)
+
+
+@requires_qsa_kernels
+@pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16])
+def test_qsa_fp8_kv_matches_reference(dtype: torch.dtype) -> None:
+    """FP8 (e4m3) main KV caches: both the Triton kernel (decode) and the
+    gfx1030 union-tile path (prefill) must equal attention over the cache
+    dequantized with its per-tensor scales."""
+    torch.manual_seed(5)
+    head_dim, page_size, num_requests, rows_per_request = 256, 64, 2, 40
+    num_query_heads, num_kv_heads, budget, ratio, context = 24, 2, 2048, 4, 12_000
+    num_pages = math.ceil(context / page_size)
+    fp8 = current_platform.fp8_dtype()
+    q = torch.randn(
+        num_requests * rows_per_request,
+        num_query_heads,
+        head_dim,
+        device="cuda",
+        dtype=dtype,
+    )
+    k_scale = torch.tensor(0.02, device="cuda")
+    v_scale = torch.tensor(0.03, device="cuda")
+    kv = torch.randn(
+        num_requests * num_pages, page_size, num_kv_heads, 2 * head_dim, device="cuda"
+    )
+    kv8 = torch.cat(
+        (
+            (kv[..., :head_dim] / k_scale).to(fp8),
+            (kv[..., head_dim:] / v_scale).to(fp8),
+        ),
+        dim=-1,
+    )
+    k8, v8 = kv8.split(head_dim, dim=-1)
+    k_ref = (k8.float() * k_scale).to(dtype)
+    v_ref = (v8.float() * v_scale).to(dtype)
+    block_table = (
+        torch.randperm(num_requests * num_pages, device="cuda")
+        .reshape(num_requests, num_pages)
+        .to(torch.int32)
+    )
+    seq_lens = torch.full((num_requests,), context, device="cuda", dtype=torch.int32)
+    query_start_loc = torch.arange(
+        0, (num_requests + 1) * rows_per_request, rows_per_request, device="cuda"
+    ).to(torch.int32)
+    rows = torch.arange(q.shape[0], device="cuda")
+    token_to_req = (rows // rows_per_request).to(torch.int32)
+    positions = (context - rows_per_request + rows % rows_per_request).to(torch.int64)
+    visible = (positions + 1) // ratio
+    base = torch.randperm(int(visible.min()), device="cuda")[: budget // ratio]
+    block_indices = ((base.unsqueeze(0) + rows.unsqueeze(1)) % visible.unsqueeze(1)).to(
+        torch.int32
+    )
+    logical_indices = qsa_ops.expand_qsa_block_indices_cuda(
+        block_indices, positions, seq_lens, token_to_req, ratio, budget
+    )
+    expected = _qsa_sparse_paged_attention_reference(
+        q, k_ref, v_ref, logical_indices, block_table, token_to_req, head_dim**-0.5
+    )
+
+    triton_out = qsa_ops.qsa_sparse_paged_attention(
+        q,
+        k8,
+        v8,
+        logical_indices,
+        block_table,
+        token_to_req,
+        k_scale=k_scale,
+        v_scale=v_scale,
+    )
+    torch.testing.assert_close(triton_out, expected, rtol=2e-2, atol=2e-2)
+    if _on_gfx10():
+        rdna2_out = qsa_ops.qsa_sparse_attention_rdna2(
+            q,
+            k8,
+            v8,
+            logical_indices,
+            block_table,
+            query_start_loc,
+            seq_lens,
+            ratio,
+            torch.empty_like(q),
+            k_scale,
+            v_scale,
+        )
+        torch.testing.assert_close(rdna2_out, expected, rtol=2e-2, atol=2e-2)

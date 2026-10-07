@@ -63,6 +63,7 @@ from .indexer_qsa import QSAIndexer
 # (2.6-4.7x faster than Triton from 64 rows); decode and spec-verify stay on
 # Triton.
 _RDNA2_QSA_MIN_QUERY_LEN = 16
+_QSA_KV_CACHE_DTYPES = ("auto", "bfloat16", "float16", "fp8", "fp8_e4m3")
 _RDNA2_QSA_MIN_TOKENS = 32
 
 
@@ -96,6 +97,8 @@ class Qwen4ExpQSAFlashAttentionBackend(FlashAttentionBackend):
         "auto",
         "bfloat16",
         "float16",
+        "fp8",
+        "fp8_e4m3",
     ]
 
     @staticmethod
@@ -130,8 +133,32 @@ class Qwen4ExpQSAFlashAttentionImpl(FlashAttentionImpl):
     supports_dcp: bool = False
     supports_pcp: bool = False
 
-    def __init__(self, *args, **kwargs) -> None:
-        super().__init__(*args, **kwargs)
+    def __init__(
+        self,
+        num_heads: int,
+        head_size: int,
+        scale: float,
+        num_kv_heads: int,
+        alibi_slopes: list[float] | None,
+        sliding_window: int | None,
+        kv_cache_dtype: str,
+        *args,
+        **kwargs,
+    ) -> None:
+        # FlashAttentionImpl checks FP8 caches against FA's kernels, which QSA
+        # does not run; its own kernels take the caches' per-tensor scales.
+        super().__init__(
+            num_heads,
+            head_size,
+            scale,
+            num_kv_heads,
+            alibi_slopes,
+            sliding_window,
+            "auto" if kv_cache_dtype.startswith("fp8") else kv_cache_dtype,
+            *args,
+            **kwargs,
+        )
+        self.kv_cache_dtype = kv_cache_dtype
         # QSA only borrows FlashAttention's metadata; its attention runs in the
         # Triton kernels of ops/qsa.py, so ROCm needs no flash-attn package.
         if not (is_flash_attn_varlen_func_available() or current_platform.is_rocm()):
@@ -140,8 +167,10 @@ class Qwen4ExpQSAFlashAttentionImpl(FlashAttentionImpl):
             raise NotImplementedError(
                 "Qwen4Exp QSA does not support decode context parallelism"
             )
-        if self.kv_cache_dtype not in ("auto", "bfloat16", "float16"):
-            raise NotImplementedError("Qwen4Exp QSA requires a 16-bit main KV cache")
+        if self.kv_cache_dtype not in _QSA_KV_CACHE_DTYPES:
+            raise NotImplementedError(
+                "Qwen4Exp QSA supports 16-bit or FP8 (e4m3) main KV caches"
+            )
         self.supports_quant_query_input = False
 
     def do_kv_cache_update(
@@ -200,11 +229,16 @@ class Qwen4ExpQSAFlashAttentionImpl(FlashAttentionImpl):
         key_cache, value_cache = kv_cache.transpose(1, 2).split(self.head_size, dim=-1)
         key_cache = canonicalize_singleton_dim_strides(key_cache)
         value_cache = canonicalize_singleton_dim_strides(value_cache)
-        if key_cache.dtype != query.dtype or query.dtype not in (
-            torch.bfloat16,
-            torch.float16,
+        fp8_kv = self.kv_cache_dtype.startswith("fp8")
+        if fp8_kv:
+            key_cache = key_cache.view(current_platform.fp8_dtype())
+            value_cache = value_cache.view(current_platform.fp8_dtype())
+        if query.dtype not in (torch.bfloat16, torch.float16) or (
+            not fp8_kv and key_cache.dtype != query.dtype
         ):
-            raise NotImplementedError("Qwen4Exp QSA requires matching 16-bit Q/K/V")
+            raise NotImplementedError("Qwen4Exp QSA requires 16-bit Q/K/V")
+        k_scale = layer._k_scale if fp8_kv else None
+        v_scale = layer._v_scale if fp8_kv else None
 
         if _use_rdna2_qsa(query[:num_tokens], key_cache, attn_metadata.max_query_len):
             from .ops.qsa import qsa_sparse_attention_rdna2
@@ -219,6 +253,8 @@ class Qwen4ExpQSAFlashAttentionImpl(FlashAttentionImpl):
                 attn_metadata.seq_lens,
                 layer.indexer.compress_ratio,
                 output[:num_tokens],
+                k_scale,
+                v_scale,
             )
             return output
 
@@ -232,6 +268,8 @@ class Qwen4ExpQSAFlashAttentionImpl(FlashAttentionImpl):
             attn_metadata.block_table,
             token_to_req,
             output[:num_tokens],
+            k_scale,
+            v_scale,
         )
         return output
 
@@ -258,8 +296,10 @@ class Qwen4ExpQSAAttention(Qwen3NextAttention, AttentionLayerBase):
             raise ValueError("Qwen4Exp QSA requires a paged KV cache")
         if model_config.dtype not in (torch.bfloat16, torch.float16):
             raise NotImplementedError("Qwen4Exp QSA requires BF16 or FP16")
-        if cache_config.cache_dtype not in ("auto", "bfloat16", "float16"):
-            raise NotImplementedError("Qwen4Exp QSA requires a 16-bit main KV cache")
+        if cache_config.cache_dtype not in _QSA_KV_CACHE_DTYPES:
+            raise NotImplementedError(
+                "Qwen4Exp QSA supports 16-bit or FP8 (e4m3) main KV caches"
+            )
         if getattr(quant_config, "kv_cache_scheme", None) is not None:
             raise NotImplementedError("Qwen4Exp QSA does not support KV quantization")
         parallel_config = vllm_config.parallel_config
@@ -340,7 +380,10 @@ class Qwen4ExpQSAAttention(Qwen3NextAttention, AttentionLayerBase):
         self.kv_cache_torch_dtype = kv_cache_dtype_str_to_dtype(
             self.kv_cache_dtype, model_config
         )
-        if self.kv_cache_torch_dtype != model_config.dtype:
+        if (
+            not self.kv_cache_dtype.startswith("fp8")
+            and self.kv_cache_torch_dtype != model_config.dtype
+        ):
             raise NotImplementedError(
                 "Qwen4Exp QSA requires cache storage in the model dtype"
             )

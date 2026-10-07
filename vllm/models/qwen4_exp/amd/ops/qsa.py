@@ -229,6 +229,9 @@ def _qsa_sparse_paged_gqa_splitk_kernel(
     BLOCK_M: tl.constexpr,
     BLOCK_N: tl.constexpr,
     DOT_FP16: tl.constexpr,
+    FP8_KV: tl.constexpr,
+    k_scale_ptr,
+    v_scale_ptr,
 ) -> None:
     row = tl.program_id(0)
     kv_head = tl.program_id(1)
@@ -304,7 +307,10 @@ def _qsa_sparse_paged_gqa_splitk_kernel(
             mask=valid[:, None],
             other=0.0,
         )
-        if DOT_FP16:
+        if FP8_KV:
+            keys = (keys.to(tl.float32) * tl.load(k_scale_ptr)).to(query.dtype)
+            values = (values.to(tl.float32) * tl.load(v_scale_ptr)).to(query.dtype)
+        elif DOT_FP16:
             keys = tl.clamp(keys.to(tl.float32), -65504.0, 65504.0).to(tl.float16)
             values = tl.clamp(values.to(tl.float32), -65504.0, 65504.0).to(tl.float16)
         scores = tl.dot(query, keys)
@@ -839,8 +845,11 @@ def qsa_sparse_paged_attention(
     block_table: torch.Tensor,
     token_to_req: torch.Tensor,
     out: torch.Tensor | None = None,
+    k_scale: torch.Tensor | None = None,
+    v_scale: torch.Tensor | None = None,
 ) -> torch.Tensor:
-    """Run sparse GQA directly over paged BF16 or FP16 K/V caches."""
+    """Run sparse GQA directly over paged BF16 or FP16 K/V caches, or FP8 ones
+    dequantized with the per-tensor ``k_scale`` / ``v_scale``."""
     if not q.is_cuda or not HAS_TRITON:
         raise RuntimeError("paged QSA sparse attention requires a GPU and Triton")
     if q.ndim != 3 or k_cache.ndim != 4 or v_cache.shape != k_cache.shape:
@@ -857,8 +866,10 @@ def qsa_sparse_paged_attention(
         raise ValueError("QSA sparse attention requires valid grouped-query heads")
     head_dim = q.shape[2]
     assert head_dim >= 16 and (head_dim & (head_dim - 1)) == 0
-    assert q.dtype == k_cache.dtype == v_cache.dtype
+    fp8_kv = k_cache.dtype == current_platform.fp8_dtype()
+    assert k_cache.dtype == v_cache.dtype and (fp8_kv or q.dtype == k_cache.dtype)
     assert q.dtype in (torch.bfloat16, torch.float16)
+    assert not fp8_kv or (k_scale is not None and v_scale is not None)
     assert logical_indices.dtype == block_table.dtype == torch.int32
     assert token_to_req.dtype == torch.int32
     assert q.device == k_cache.device == v_cache.device
@@ -955,6 +966,9 @@ def qsa_sparse_paged_attention(
         BLOCK_M=block_m,
         BLOCK_N=block_n,
         DOT_FP16=q.dtype == torch.bfloat16 and _on_gfx10(),
+        FP8_KV=fp8_kv,
+        k_scale_ptr=k_scale if fp8_kv else q,
+        v_scale_ptr=v_scale if fp8_kv else q,
         num_warps=partial_warps,
         num_stages=partial_stages,
     )
@@ -988,10 +1002,13 @@ def qsa_sparse_attention_rdna2(
     seq_lens: torch.Tensor,
     compress_ratio: int,
     out: torch.Tensor,
+    k_scale: torch.Tensor | None = None,
+    v_scale: torch.Tensor | None = None,
 ) -> torch.Tensor:
     """QSA prefill on gfx1030: tiles of consecutive query tokens attend over
     the union of their selections (each row masked to its own) with the RDNA2
-    prefill attention tiles; BF16 runs through FP16 (no bf16 dot)."""
+    prefill attention tiles; BF16 runs through FP16 (no bf16 dot), FP8 caches
+    take their per-tensor scales."""
     rows, num_heads, head_dim = q.shape
     group = num_heads // k_cache.shape[2]
     tile_tokens = min(16, 64 // group)
@@ -1031,6 +1048,8 @@ def qsa_sparse_attention_rdna2(
         tile_tokens,
         compress_ratio,
         head_dim**-0.5,
+        k_scale,
+        v_scale,
     )
     if out16 is not out:
         out.copy_(out16)
