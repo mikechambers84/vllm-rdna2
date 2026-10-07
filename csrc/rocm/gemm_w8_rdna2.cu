@@ -47,6 +47,7 @@
 #include <hip/hip_fp16.h>
 #include <hip/hip_bf16.h>
 
+#include <algorithm>
 #include <type_traits>
 
 #include "rdna2_fp8.cuh"
@@ -96,6 +97,8 @@ static constexpr int kNumConfigsW16 =
 static constexpr int kTiledW16 = kNumConfigsW16;
 static constexpr int TILED_THREADS = 256;
 static constexpr int kNumConfigsI8 = sizeof(kConfigsI8) / sizeof(kConfigsI8[0]);
+// Workgroups a split-K launch aims for (2 per CU on a 72-CU V620).
+static constexpr int kSplitKTarget = 144;
 
 template <typename T>
 __device__ __forceinline__ T from_float(float v);
@@ -173,13 +176,17 @@ __device__ __forceinline__ uint32_t dword(const uint4& v, int c) {
   return c == 0 ? v.x : c == 1 ? v.y : c == 2 ? v.z : v.w;
 }
 
-// grid (ceil(M / T), ceil(N / (128 * CT))). T is the activation type (int8_t:
-// W8A8), O the output type; W16: fp16 weights, two k per dword, no scale. W
+// grid (ceil(M / T), ceil(N / (128 * CT)), KS). T is the activation type
+// (int8_t: W8A8), O the output type; W16: fp16 weights, two k per dword, no
+// scale. SPLIT (float sums only): the NW waves of the KS workgroups of a tile
+// take consecutive K slices and write raw sums to P [KS, M, N] for
+// splitk_epilogue_kernel (a separate instantiation, so unsplit launches keep
+// their code generation: a runtime slice count slowed them up to 3x). W
 // holds ldw 16-byte column quads per dword row; R (BLOCK) the ratios of
 // k-block k >> bk_shift at R[kb * ldr + n / bn]; SA (W8A8) the activation
 // scale of row t at SA[t * sa_stride].
 template <typename T, typename O, int TT, int NW, int CT, int KBLOCK, bool INT8,
-          bool BLOCK, bool W16>
+          bool BLOCK, bool W16, bool SPLIT>
 __global__ void __launch_bounds__(NW* WARP32)
     gemm_w8_rdna2_kernel(const uint4* __restrict__ W,
                          const float* __restrict__ S,
@@ -188,8 +195,9 @@ __global__ void __launch_bounds__(NW* WARP32)
                          const O* __restrict__ bias, O* __restrict__ C,
                          const int M, const int N, const int K, const int ldw,
                          const int ldr, const int bn, const int bk_shift,
-                         const int lda, const int ldc) {
+                         const int lda, const int ldc, float* __restrict__ P) {
   constexpr bool DOT4 = std::is_same_v<T, int8_t>;
+  static_assert(!(SPLIT && DOT4), "split K sums floats");
   using Acc = std::conditional_t<DOT4, int, float>;
   // k per weight dword, per activation load (16 bytes) and the dword rows the
   // latter covers.
@@ -202,7 +210,18 @@ __global__ void __launch_bounds__(NW* WARP32)
   const int wave = __builtin_amdgcn_readfirstlane(threadIdx.x / WARP32);
   const int t0 = blockIdx.x * TT;
   const int blocks = K / KBLOCK;
-  const int b_begin = blocks * wave / NW, b_end = blocks * (wave + 1) / NW;
+  int b_begin, b_end;
+  bool tail;  // the k past the last whole block (K % KBLOCK)
+  if constexpr (SPLIT) {
+    const int vw = blockIdx.z * NW + wave, vws = gridDim.z * NW;
+    b_begin = blocks * vw / vws;
+    b_end = blocks * (vw + 1) / vws;
+    tail = vw == vws - 1;
+  } else {
+    b_begin = blocks * wave / NW;
+    b_end = blocks * (wave + 1) / NW;
+    tail = wave == NW - 1;
+  }
   const int n4 = N / 4;
   int col[CT];
   #pragma unroll
@@ -311,8 +330,7 @@ __global__ void __launch_bounds__(NW* WARP32)
       mac(reinterpret_cast<const uint4(&)[ROWS][CT]>(w[ROWS * p]),
           b * KBLOCK + p * STEP);
   }
-  // The k past the last whole block (K % KBLOCK).
-  if (wave == NW - 1)
+  if (tail)
     for (int kw = blocks * (KBLOCK / KPD); kw < K / KPD; kw += ROWS) {
       uint4 w[ROWS][CT];
   #pragma unroll
@@ -349,6 +367,23 @@ __global__ void __launch_bounds__(NW* WARP32)
             acc[ct][c][i] +=
                 red[wave * PER_WAVE + ((ct * 4 + c) * TT + i) * WARP32 + lane];
     __syncthreads();
+  }
+
+  if constexpr (SPLIT) {
+    if (wave == 0)
+  #pragma unroll
+      for (int ct = 0; ct < CT; ct++) {
+        const int c4 = blockIdx.y * WARP32 * CT + ct * WARP32 + lane;
+        if (c4 >= n4) continue;
+  #pragma unroll
+        for (int i = 0; i < TT; i++)
+          if (t0 + i < M)
+            *reinterpret_cast<float4*>(P + ((long)blockIdx.z * M + t0 + i) * N +
+                                       c4 * 4) =
+                make_float4(acc[ct][0][i], acc[ct][1][i], acc[ct][2][i],
+                            acc[ct][3][i]);
+      }
+    return;
   }
 
   if (wave == 0) {
@@ -394,6 +429,48 @@ __global__ void __launch_bounds__(NW* WARP32)
       }
     }
   }
+}
+
+// Split-K epilogue: C = the sum over the KS slices of P (in slice order: the
+// result is deterministic) times the column scale (x 256 for fp8, none for
+// fp16 weights) plus bias; one thread per 4 columns of one row.
+template <typename O, bool INT8, bool W16>
+__global__ void splitk_epilogue_kernel(const float* __restrict__ P,
+                                       const float* __restrict__ S,
+                                       const O* __restrict__ bias,
+                                       O* __restrict__ C, const int M,
+                                       const int N, const int KS,
+                                       const int ldc) {
+  const int n4 = N / 4;
+  const long idx = (long)blockIdx.x * blockDim.x + threadIdx.x;
+  if (idx >= (long)M * n4) return;
+  const int t = idx / n4, c4 = idx % n4;
+  float acc[4] = {0.f, 0.f, 0.f, 0.f};
+  for (int z = 0; z < KS; z++) {
+    const float4 v =
+        *reinterpret_cast<const float4*>(P + ((long)z * M + t) * N + c4 * 4);
+    acc[0] += v.x;
+    acc[1] += v.y;
+    acc[2] += v.z;
+    acc[3] += v.w;
+  }
+  float s[4] = {1.f, 1.f, 1.f, 1.f};
+  if constexpr (!W16) {
+    const float4 sv = *reinterpret_cast<const float4*>(S + c4 * 4);
+    const float m = INT8 ? 1.f : 256.f;
+    s[0] = sv.x * m;
+    s[1] = sv.y * m;
+    s[2] = sv.z * m;
+    s[3] = sv.w * m;
+  }
+  __align__(8) O o[4];
+  #pragma unroll
+  for (int c = 0; c < 4; c++) {
+    const float b = bias != nullptr ? to_float<O>(bias[c4 * 4 + c]) : 0.f;
+    o[c] = from_float<O>(fmaf(acc[c], s[c], b));
+  }
+  *reinterpret_cast<uint2*>(C + (long)t * ldc + c4 * 4) =
+      *reinterpret_cast<const uint2*>(o);
 }
 
 // Tiled K-major fp16 GEMM (large M): TM x TN outputs per thread in 4 x 4
@@ -534,12 +611,17 @@ __global__ void gemm_w16_tiled_kernel(const __half*, const uint32_t*,
                                       const int, const int) {}
 
 template <typename T, typename O, int TT, int NW, int CT, int KBLOCK, bool INT8,
-          bool BLOCK, bool W16>
+          bool BLOCK, bool W16, bool SPLIT>
 __global__ void gemm_w8_rdna2_kernel(const uint4*, const float*, const float*,
                                      const int, const __half*, const T*,
                                      const O*, O*, const int, const int,
                                      const int, const int, const int, const int,
-                                     const int, const int, const int) {}
+                                     const int, const int, const int, float*) {}
+
+template <typename O, bool INT8, bool W16>
+__global__ void splitk_epilogue_kernel(const float*, const float*, const O*, O*,
+                                       const int, const int, const int,
+                                       const int) {}
 
 #endif  // __HIP__RDNA2__ || !__HIP_DEVICE_COMPILE__
 
@@ -558,24 +640,54 @@ struct Args {
 template <typename T, typename O, int TT, int NW, int CT, int KB, bool INT8,
           bool BLOCK, bool W16 = false>
 void launch(const Args& p, cudaStream_t stream) {
-  using Acc = std::conditional_t<std::is_same_v<T, int8_t>, int, float>;
+  constexpr bool DOT4 = std::is_same_v<T, int8_t>;
+  using Acc = std::conditional_t<DOT4, int, float>;
   const int M = p.a.size(0), K = p.a.size(1), N = p.w.size(1);
-  const dim3 grid((M + TT - 1) / TT, (N / 4 + WARP32 * CT - 1) / (WARP32 * CT));
+  const int col_tiles = (N / 4 + WARP32 * CT - 1) / (WARP32 * CT);
+  const int tiles = ((M + TT - 1) / TT) * col_tiles;
+  // Narrow layers with long rows (e.g. a 10240 -> 336 projection: 3 column
+  // tiles) leave most CUs idle: small token tiles split K over more
+  // workgroups (fp32 partials + an epilogue kernel), ~2 per CU, >= 4 weight
+  // blocks per wave. With >= 64 waves or short rows the epilogue costs more.
+  int ksplit = 1;
+  if constexpr (!DOT4 && TT <= 4)
+    if (tiles * NW < 64 && K >= 4096)
+      ksplit = std::max(
+          1, std::min((kSplitKTarget + tiles - 1) / tiles, K / (KB * NW * 4)));
+  const dim3 grid((M + TT - 1) / TT, col_tiles, ksplit);
   const size_t lds = (size_t)(NW / 2) * CT * 4 * TT * WARP32 * sizeof(Acc);
   const bool sa = p.scale_a.has_value();
-  gemm_w8_rdna2_kernel<T, O, TT, NW, CT, KB, INT8, BLOCK, W16>
-      <<<grid, dim3(NW * WARP32), lds, stream>>>(
-          (const uint4*)p.w.data_ptr(),
-          W16 ? nullptr : p.scale->data_ptr<float>(),
-          sa ? p.scale_a->data_ptr<float>() : nullptr,
-          sa && p.scale_a->numel() > 1 ? 1 : 0,
-          BLOCK ? (const __half*)p.block_scale->data_ptr() : nullptr,
-          (const T*)p.a.data_ptr(),
-          p.bias.has_value() ? (const O*)p.bias->data_ptr() : nullptr,
-          (O*)p.c.data_ptr(), M, N, K,
-          (int)(p.w.stride(0) * p.w.element_size() / 16),
-          BLOCK ? p.block_scale->stride(0) : 0, p.bn, p.bk_shift, p.a.stride(0),
-          p.c.stride(0));
+  at::Tensor partials;
+  if (ksplit > 1)
+    partials = torch::empty({ksplit, M, N}, p.a.options().dtype(torch::kFloat));
+  auto run = [&](auto kernel) {
+    kernel<<<grid, dim3(NW * WARP32), lds, stream>>>(
+        (const uint4*)p.w.data_ptr(),
+        W16 ? nullptr : p.scale->data_ptr<float>(),
+        sa ? p.scale_a->data_ptr<float>() : nullptr,
+        sa && p.scale_a->numel() > 1 ? 1 : 0,
+        BLOCK ? (const __half*)p.block_scale->data_ptr() : nullptr,
+        (const T*)p.a.data_ptr(),
+        p.bias.has_value() ? (const O*)p.bias->data_ptr() : nullptr,
+        (O*)p.c.data_ptr(), M, N, K,
+        (int)(p.w.stride(0) * p.w.element_size() / 16),
+        BLOCK ? p.block_scale->stride(0) : 0, p.bn, p.bk_shift, p.a.stride(0),
+        p.c.stride(0), ksplit > 1 ? partials.data_ptr<float>() : nullptr);
+  };
+  if constexpr (!DOT4 && TT <= 4) {
+    if (ksplit > 1) {
+      run(gemm_w8_rdna2_kernel<T, O, TT, NW, CT, KB, INT8, BLOCK, W16, true>);
+      const long items = (long)M * (N / 4);
+      splitk_epilogue_kernel<O, INT8, W16>
+          <<<(items + 255) / 256, 256, 0, stream>>>(
+              partials.data_ptr<float>(),
+              W16 ? nullptr : p.scale->data_ptr<float>(),
+              p.bias.has_value() ? (const O*)p.bias->data_ptr() : nullptr,
+              (O*)p.c.data_ptr(), M, N, ksplit, p.c.stride(0));
+      return;
+    }
+  }
+  run(gemm_w8_rdna2_kernel<T, O, TT, NW, CT, KB, INT8, BLOCK, W16, false>);
 }
 
 // fp16/bf16 activations: weight format by w's dtype and block scales.
@@ -630,7 +742,9 @@ void launch_config_i8(const Args& p, cudaStream_t stream) {
 // row count): a token tile that wastes few rows; on narrow layers (few column
 // tiles) smaller tiles or more waves per workgroup to fill the GPU; on wide
 // ones, two column tiles per wave from 33 rows on.
-static int default_config(int M, int N) {
+static int default_config(int M, int N, int K) {
+  // Few columns, long rows (split K): eight waves per workgroup.
+  if (M <= 2 && N <= 1024 && K >= 4096) return 0;
   if (N <= 4096) {
     if (M <= 16) return 2;
     if (M <= 64) return 4;
@@ -863,7 +977,7 @@ torch::Tensor gemm_w8_rdna2(const at::Tensor& a, const at::Tensor& w,
     return c;
   }
 
-  const int id = cfg < 0 ? default_config(M, N) : (int)cfg;
+  const int id = cfg < 0 ? default_config(M, N, K) : (int)cfg;
 #define VLLM_W8_RDNA2_CASE(ID, T, NW, CT, KB)                      \
   case ID:                                                         \
     static_assert(kConfigs[ID].t == T && kConfigs[ID].nw == NW &&  \

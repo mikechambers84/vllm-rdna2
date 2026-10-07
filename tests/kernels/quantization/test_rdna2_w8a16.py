@@ -360,3 +360,41 @@ def test_w8a8_linear_matches_triton(n, static, num_tokens):
     out = rdna2.apply_weights(layer, x, bias)
     ref = triton.apply_weights(ref_layer, x, bias)
     torch.testing.assert_close(out, ref, atol=0, rtol=0)
+
+
+@pytest.mark.skipif(not on_gfx1030(), reason="gfx1030 only")
+@pytest.mark.parametrize("weights", ["int8", "fp8", "fp16"])
+@pytest.mark.parametrize("act_dtype", [torch.float16, torch.bfloat16])
+@pytest.mark.parametrize("num_tokens", [1, 2, 4])
+def test_narrow_long_k_layers_split_k(weights, act_dtype, num_tokens):
+    """Few columns with long rows (Flash-Next's 10240 -> 336 hyper-connection
+    projection) split K over extra workgroups; the split sums and their
+    epilogue (scale, bias) must match the reference."""
+    from vllm import _custom_ops as ops
+    from vllm.model_executor.kernels.linear.rdna2_w8a16 import (
+        kmajor_w8,
+        kmajor_w16,
+    )
+
+    if weights == "fp16" and act_dtype == torch.bfloat16:
+        pytest.skip("fp16 weights take fp16 activations")
+    torch.manual_seed(0)
+    n, k = 336, 10240
+    x = torch.randn(num_tokens, k, device="cuda", dtype=act_dtype)
+    w = torch.randn(n, k, device="cuda") * 0.05
+    bias = torch.randn(n, device="cuda", dtype=act_dtype)
+    if weights == "fp16":
+        ref_w, scale = w.half().float(), None
+        weight = kmajor_w16(w.half())
+        bias = None
+    elif weights == "int8":
+        scale = w.abs().amax(1) / 127
+        q = torch.round(w / scale[:, None]).to(torch.int8)
+        ref_w, weight = q.float() * scale[:, None], kmajor_w8(q)
+    else:
+        scale = w.abs().amax(1) / 448
+        q = (w / scale[:, None]).to(torch.float8_e4m3fn)
+        ref_w, weight = q.float() * scale[:, None], kmajor_w8(q)
+    out = ops.gemm_w8_rdna2(x, weight, scale, None, 1, 0, bias, -1)
+    ref = x.float() @ ref_w.t() + (0 if bias is None else bias.float())
+    torch.testing.assert_close(out.float(), ref, rtol=2e-2, atol=2e-2)
