@@ -16,6 +16,14 @@ _LOGITS_WORKSPACE_BYTES = 128 * 1024 * 1024
 _TOPK_WORKSPACE_BYTES = 1024 * 1024
 
 
+def _on_gfx10() -> bool:
+    if not current_platform.is_rocm():
+        return False
+    from vllm.platforms.rocm import on_gfx10
+
+    return on_gfx10()
+
+
 @triton.jit
 def _qsa_mqa_paged_kernel(
     q_ptr,
@@ -220,6 +228,7 @@ def _qsa_sparse_paged_gqa_splitk_kernel(
     NUM_TILES: tl.constexpr,
     BLOCK_M: tl.constexpr,
     BLOCK_N: tl.constexpr,
+    DOT_FP16: tl.constexpr,
 ) -> None:
     row = tl.program_id(0)
     kv_head = tl.program_id(1)
@@ -239,6 +248,9 @@ def _qsa_sparse_paged_gqa_splitk_kernel(
         mask=head_offsets[:, None] < GROUP_SIZE,
         other=0.0,
     )
+    if DOT_FP16:
+        # gfx1030 has no bf16 dot: run BF16 operands as (saturated) FP16.
+        query = tl.clamp(query.to(tl.float32), -65504.0, 65504.0).to(tl.float16)
 
     max_value = tl.full((BLOCK_M,), -1.0e20, dtype=tl.float32)
     normalizer = tl.zeros((BLOCK_M,), dtype=tl.float32)
@@ -292,6 +304,9 @@ def _qsa_sparse_paged_gqa_splitk_kernel(
             mask=valid[:, None],
             other=0.0,
         )
+        if DOT_FP16:
+            keys = tl.clamp(keys.to(tl.float32), -65504.0, 65504.0).to(tl.float16)
+            values = tl.clamp(values.to(tl.float32), -65504.0, 65504.0).to(tl.float16)
         scores = tl.dot(query, keys)
         # Scaling scores avoids re-quantizing a scaled query to BF16.
         scores *= softmax_scale_log2
@@ -825,7 +840,7 @@ def qsa_sparse_paged_attention(
     token_to_req: torch.Tensor,
     out: torch.Tensor | None = None,
 ) -> torch.Tensor:
-    """Run sparse GQA directly over paged BF16 K/V caches."""
+    """Run sparse GQA directly over paged BF16 or FP16 K/V caches."""
     if not q.is_cuda or not HAS_TRITON:
         raise RuntimeError("paged QSA sparse attention requires a GPU and Triton")
     if q.ndim != 3 or k_cache.ndim != 4 or v_cache.shape != k_cache.shape:
@@ -842,7 +857,8 @@ def qsa_sparse_paged_attention(
         raise ValueError("QSA sparse attention requires valid grouped-query heads")
     head_dim = q.shape[2]
     assert head_dim >= 16 and (head_dim & (head_dim - 1)) == 0
-    assert q.dtype == k_cache.dtype == v_cache.dtype == torch.bfloat16
+    assert q.dtype == k_cache.dtype == v_cache.dtype
+    assert q.dtype in (torch.bfloat16, torch.float16)
     assert logical_indices.dtype == block_table.dtype == torch.int32
     assert token_to_req.dtype == torch.int32
     assert q.device == k_cache.device == v_cache.device
@@ -938,6 +954,7 @@ def qsa_sparse_paged_attention(
         NUM_TILES=num_tiles,
         BLOCK_M=block_m,
         BLOCK_N=block_n,
+        DOT_FP16=q.dtype == torch.bfloat16 and _on_gfx10(),
         num_warps=partial_warps,
         num_stages=partial_stages,
     )

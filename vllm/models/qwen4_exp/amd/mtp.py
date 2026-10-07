@@ -241,7 +241,7 @@ class Qwen4ExpMultiTokenPredictor(nn.Module):
         hc_config = HyperConnectionConfig(
             hc_count=config.hc_count,
             hidden_size=config.hidden_size,
-            params_dtype=torch.bfloat16,
+            params_dtype=vllm_config.model_config.dtype,
             hc_lowrank=config.hc_lowrank,
             rms_norm_eps=config.rms_norm_eps,
             hc_per_branch_norm=True,
@@ -293,7 +293,9 @@ class Qwen4ExpMultiTokenPredictor(nn.Module):
         hc_count = self.hc_count
         hidden_size = self.hidden_size
 
-        if get_pp_group().is_first_rank:
+        # Branch on the inputs, not the rank: the drafter is built entirely on
+        # the last PP stage, where `is_first_rank` is False.
+        if intermediate_tensors is None:
             assert hidden_states is not None
             if inputs_embeds is None:
                 assert input_ids is not None
@@ -317,7 +319,6 @@ class Qwen4ExpMultiTokenPredictor(nn.Module):
             hidden_states = inputs_embeds.unsqueeze(-2) + hidden_states
             hidden_states = hidden_states.flatten(-2)
         else:
-            assert intermediate_tensors is not None
             hidden_states = intermediate_tensors["hidden_states"]
 
         current_step_idx = spec_step_idx % self.num_mtp_layers

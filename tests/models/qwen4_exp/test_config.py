@@ -140,14 +140,34 @@ def test_qwen4_exp_mtp_override_sets_draft_config(
     assert draft_config.n_predict == 1
 
 
-@pytest.mark.parametrize("ple_layer_ids", [[1], []])
-def test_qwen4_exp_rejects_pipeline_parallel_only_with_ple(ple_layer_ids) -> None:
-    """PLE needs raw input_ids, which non-first pipeline ranks never see. The
-    rest of the architecture is PP-capable, so the refusal must be conditional
-    -- and must land before the engine spends time loading weights."""
+@pytest.mark.parametrize(
+    ("ple_layer_ids", "is_rocm", "rejected"),
+    [
+        ([], False, False),
+        ([1], False, True),
+        # Decoder layer i hosts PLE layer id i + 1; with four layers and PP=2,
+        # layers 0-1 form the first stage and layers 2-3 the second.
+        ([1], True, False),
+        ([3], True, True),
+    ],
+)
+def test_qwen4_exp_pipeline_parallel_needs_ple_on_first_stage(
+    ple_layer_ids, is_rocm, rejected
+) -> None:
+    """PLE needs raw input_ids, which only the first pipeline rank sees, so PP
+    works only with every PLE layer on that rank and a model state that skips
+    the n-gram context elsewhere (the AMD one). The rest of the architecture is
+    PP-capable, so the refusal must be conditional -- and must land before the
+    engine spends time loading weights."""
+    from vllm.platforms import current_platform
+
     vllm_config = SimpleNamespace(
         model_config=SimpleNamespace(
-            hf_text_config=_text_config(ple_layer_ids=ple_layer_ids),
+            hf_text_config=_text_config(
+                num_hidden_layers=4,
+                layer_types=["linear_attention"] * 3 + ["full_attention"],
+                ple_layer_ids=ple_layer_ids,
+            ),
             multimodal_config=None,
         ),
         parallel_config=SimpleNamespace(
@@ -155,11 +175,12 @@ def test_qwen4_exp_rejects_pipeline_parallel_only_with_ple(ple_layer_ids) -> Non
         ),
         speculative_config=None,
     )
-    with patch.object(
-        Qwen3_5ForConditionalGenerationConfig, "verify_and_update_config"
+    with (
+        patch.object(Qwen3_5ForConditionalGenerationConfig, "verify_and_update_config"),
+        patch.object(current_platform, "is_rocm", lambda: is_rocm),
     ):
-        if ple_layer_ids:
-            with pytest.raises(NotImplementedError, match="pipeline_parallel_size=1"):
+        if rejected:
+            with pytest.raises(NotImplementedError, match="pipeline_parallel_size"):
                 Qwen4ExpForConditionalGenerationConfig.verify_and_update_config(
                     vllm_config
                 )
