@@ -2493,6 +2493,66 @@ def moe_w4a8_gemm_rdna2(
     )
 
 
+def qsa_union_rdna2(
+    indices: torch.Tensor,
+    cu_seqlens_q: torch.Tensor,
+    seq_lens: torch.Tensor,
+    tile_tokens: int,
+    ratio: int,
+    ublk: torch.Tensor,
+    umask: torch.Tensor,
+    ucount: torch.Tensor,
+) -> None:
+    """Qwen4Exp QSA prefill on RDNA2, step 1: for tiles of ``tile_tokens``
+    consecutive query tokens, the ascending union of the ``ratio``-token blocks
+    in their selections (``indices`` [tokens, width] int32, -1 padded) into
+    ``ublk`` [tiles, cap] with the selecting-token masks in ``umask`` (int16)
+    and counts in ``ucount``."""
+    torch.ops._rocm_C.qsa_union_rdna2(
+        indices, cu_seqlens_q, seq_lens, tile_tokens, ratio, ublk, umask, ucount
+    )
+
+
+def qsa_attention_rdna2(
+    out: torch.Tensor,
+    q: torch.Tensor,
+    k_cache: torch.Tensor,
+    v_cache: torch.Tensor,
+    cu_seqlens_q: torch.Tensor,
+    seq_lens: torch.Tensor,
+    block_table: torch.Tensor,
+    ublk: torch.Tensor,
+    umask: torch.Tensor,
+    ucount: torch.Tensor,
+    tile_tokens: int,
+    ratio: int,
+    scale: float,
+    k_scale: torch.Tensor | None = None,
+    v_scale: torch.Tensor | None = None,
+) -> None:
+    """Qwen4Exp QSA prefill on RDNA2, step 2: fp16 ``q`` [tokens, heads, D]
+    attends over the ``qsa_union_rdna2`` tiles, each row to its own selected
+    blocks up to its position, into ``out``; caches as for
+    ``unified_attention_rdna2``."""
+    torch.ops._rocm_C.qsa_attention_rdna2(
+        out,
+        q,
+        k_cache,
+        v_cache,
+        cu_seqlens_q,
+        seq_lens,
+        block_table,
+        ublk,
+        umask,
+        ucount,
+        tile_tokens,
+        ratio,
+        scale,
+        k_scale,
+        v_scale,
+    )
+
+
 def unified_attention_rdna2(
     out: torch.Tensor,
     q: torch.Tensor,

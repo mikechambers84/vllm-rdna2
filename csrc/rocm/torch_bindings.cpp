@@ -190,6 +190,20 @@ TORCH_LIBRARY_EXPAND(TORCH_EXTENSION_NAME, rocm_ops) {
       "Tensor? sinks=None) -> ()");
   rocm_ops.impl("decode_attention_rdna2", torch::kCUDA,
                 &decode_attention_rdna2);
+  // Qwen4Exp QSA prefill: per-tile union of the token selections, then the
+  // prefill attention tiles over it.
+  rocm_ops.def(
+      "qsa_union_rdna2(Tensor indices, Tensor cu_seqlens_q, Tensor seq_lens, "
+      "int tile_tokens, int ratio, Tensor! ublk, Tensor! umask, "
+      "Tensor! ucount) -> ()");
+  rocm_ops.impl("qsa_union_rdna2", torch::kCUDA, &qsa_union_rdna2);
+  rocm_ops.def(
+      "qsa_attention_rdna2(Tensor! out, Tensor q, Tensor k_cache, "
+      "Tensor v_cache, Tensor cu_seqlens_q, Tensor seq_lens, "
+      "Tensor block_table, Tensor ublk, Tensor umask, Tensor ucount, "
+      "int tile_tokens, int ratio, float scale, Tensor? k_scale=None, "
+      "Tensor? v_scale=None) -> ()");
+  rocm_ops.impl("qsa_attention_rdna2", torch::kCUDA, &qsa_attention_rdna2);
   // Gated DeltaNet prefill: post-conv1d q/k/v split, l2 norm and gating.
   rocm_ops.def(
       "gdn_post_conv_rdna2(Tensor conv_output, Tensor a, Tensor b, "

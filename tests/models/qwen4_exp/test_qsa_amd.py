@@ -295,3 +295,102 @@ def test_qsa_sparse_paged_attention_matches_reference(
     )
 
     torch.testing.assert_close(actual, expected, rtol=2e-2, atol=2e-2)
+
+
+def _on_gfx10() -> bool:
+    if not current_platform.is_rocm():
+        return False
+    from vllm.platforms.rocm import on_gfx10
+
+    return on_gfx10()
+
+
+@pytest.mark.skipif(not _on_gfx10(), reason="RDNA2 QSA kernels need gfx10")
+@pytest.mark.parametrize(
+    ("rows_per_request", "num_query_heads", "num_kv_heads", "context"),
+    [
+        pytest.param(37, 24, 2, 90_000, id="sparse_g12"),
+        pytest.param(130, 24, 2, 1_500, id="dense_g12"),
+        pytest.param(21, 16, 2, 9_000, id="sparse_g8"),
+    ],
+)
+@pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16])
+def test_qsa_sparse_attention_rdna2_matches_reference(
+    rows_per_request: int,
+    num_query_heads: int,
+    num_kv_heads: int,
+    context: int,
+    dtype: torch.dtype,
+) -> None:
+    """The gfx1030 path (tiles over the union of consecutive rows'
+    selections) must give each row attention over exactly its own selection:
+    long contexts (every row sparse, selections overlapping) and short ones
+    (every visible block selected, i.e. causal)."""
+    torch.manual_seed(3)
+    head_dim, page_size, num_requests = 256, 64, 2
+    budget, ratio = 2048, 4
+    num_pages = math.ceil(context / page_size)
+    num_cache_blocks = num_requests * num_pages
+    q = torch.randn(
+        num_requests * rows_per_request,
+        num_query_heads,
+        head_dim,
+        device="cuda",
+        dtype=dtype,
+    )
+    kv_cache = torch.randn(
+        num_cache_blocks,
+        page_size,
+        num_kv_heads,
+        2 * head_dim,
+        device="cuda",
+        dtype=dtype,
+    )
+    k_cache, v_cache = kv_cache.split(head_dim, dim=-1)
+    block_table = (
+        torch.randperm(num_cache_blocks, device="cuda")
+        .reshape(num_requests, num_pages)
+        .to(torch.int32)
+    )
+    seq_lens = torch.tensor([context, context - 7], device="cuda", dtype=torch.int32)
+    query_start_loc = torch.arange(
+        0, (num_requests + 1) * rows_per_request, rows_per_request, device="cuda"
+    ).to(torch.int32)
+    rows = torch.arange(q.shape[0], device="cuda")
+    token_to_req = (rows // rows_per_request).to(torch.int32)
+    positions = (
+        seq_lens[token_to_req.long()] - rows_per_request + rows % rows_per_request
+    ).to(torch.int64)
+    # Each row picks budget / ratio blocks: a shared random set with a
+    # row-dependent shift, so consecutive rows overlap without being equal.
+    visible = (positions + 1) // ratio
+    base = torch.randperm(int(visible.min()), device="cuda")[: budget // ratio]
+    if base.numel() < budget // ratio:
+        base = torch.arange(budget // ratio, device="cuda")
+    shift = (rows // 3).unsqueeze(1)
+    block_indices = ((base.unsqueeze(0) + shift) % visible.unsqueeze(1)).to(torch.int32)
+    logical_indices = qsa_ops.expand_qsa_block_indices_cuda(
+        block_indices, positions, seq_lens, token_to_req, ratio, budget
+    )
+
+    actual = qsa_ops.qsa_sparse_attention_rdna2(
+        q,
+        k_cache,
+        v_cache,
+        logical_indices,
+        block_table,
+        query_start_loc,
+        seq_lens,
+        ratio,
+        torch.empty_like(q),
+    )
+    expected = _qsa_sparse_paged_attention_reference(
+        q,
+        k_cache,
+        v_cache,
+        logical_indices,
+        block_table,
+        token_to_req,
+        head_dim**-0.5,
+    )
+    torch.testing.assert_close(actual, expected, rtol=2e-2, atol=2e-2)

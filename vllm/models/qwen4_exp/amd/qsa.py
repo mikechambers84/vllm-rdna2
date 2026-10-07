@@ -58,6 +58,29 @@ from ..common.qsa_cache import QSAForwardMetadata
 from . import model
 from .indexer_qsa import QSAIndexer
 
+# gfx1030 prefill path (ops.qsa.qsa_sparse_attention_rdna2): it runs tiles of
+# consecutive query tokens, so it wins once requests bring >= ~16 query rows
+# (2.6-4.7x faster than Triton from 64 rows); decode and spec-verify stay on
+# Triton.
+_RDNA2_QSA_MIN_QUERY_LEN = 16
+_RDNA2_QSA_MIN_TOKENS = 32
+
+
+def _use_rdna2_qsa(
+    query: torch.Tensor, key_cache: torch.Tensor, max_query_len: int
+) -> bool:
+    if not current_platform.is_rocm():
+        return False
+    from vllm.platforms.rocm import on_gfx10
+
+    return (
+        on_gfx10()
+        and max_query_len >= _RDNA2_QSA_MIN_QUERY_LEN
+        and query.shape[0] >= _RDNA2_QSA_MIN_TOKENS
+        and query.shape[2] in (128, 256)
+        and query.shape[1] // key_cache.shape[2] <= 64
+    )
+
 
 class Qwen4ExpQSAMetadataBuilder(FlashAttentionMetadataBuilder):
     """Flash metadata supporting uniform decode and target-verify graphs."""
@@ -182,6 +205,22 @@ class Qwen4ExpQSAFlashAttentionImpl(FlashAttentionImpl):
             torch.float16,
         ):
             raise NotImplementedError("Qwen4Exp QSA requires matching 16-bit Q/K/V")
+
+        if _use_rdna2_qsa(query[:num_tokens], key_cache, attn_metadata.max_query_len):
+            from .ops.qsa import qsa_sparse_attention_rdna2
+
+            qsa_sparse_attention_rdna2(
+                query[:num_tokens],
+                key_cache,
+                value_cache,
+                logical_indices,
+                attn_metadata.block_table,
+                attn_metadata.query_start_loc,
+                attn_metadata.seq_lens,
+                layer.indexer.compress_ratio,
+                output[:num_tokens],
+            )
+            return output
 
         from .ops.qsa import qsa_sparse_paged_attention
 

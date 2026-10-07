@@ -978,6 +978,65 @@ def qsa_sparse_paged_attention(
     return out
 
 
+def qsa_sparse_attention_rdna2(
+    q: torch.Tensor,
+    k_cache: torch.Tensor,
+    v_cache: torch.Tensor,
+    logical_indices: torch.Tensor,
+    block_table: torch.Tensor,
+    query_start_loc: torch.Tensor,
+    seq_lens: torch.Tensor,
+    compress_ratio: int,
+    out: torch.Tensor,
+) -> torch.Tensor:
+    """QSA prefill on gfx1030: tiles of consecutive query tokens attend over
+    the union of their selections (each row masked to its own) with the RDNA2
+    prefill attention tiles; BF16 runs through FP16 (no bf16 dot)."""
+    rows, num_heads, head_dim = q.shape
+    group = num_heads // k_cache.shape[2]
+    tile_tokens = min(16, 64 // group)
+    num_seqs = query_start_loc.shape[0] - 1
+    tiles = rows // tile_tokens + num_seqs
+    # One selection touches at most width / ratio complete blocks + the tail's.
+    cap = tile_tokens * (logical_indices.shape[1] // compress_ratio + 2)
+    ublk = torch.empty((tiles, cap), dtype=torch.int32, device=q.device)
+    umask = torch.empty((tiles, cap), dtype=torch.int16, device=q.device)
+    ucount = torch.empty(tiles, dtype=torch.int32, device=q.device)
+    ops.qsa_union_rdna2(
+        logical_indices,
+        query_start_loc,
+        seq_lens,
+        tile_tokens,
+        compress_ratio,
+        ublk,
+        umask,
+        ucount,
+    )
+    if q.dtype == torch.float16:
+        q16, out16 = q, out
+    else:
+        q16 = q.clamp(-65504.0, 65504.0).to(torch.float16)
+        out16 = torch.empty_like(q16)
+    ops.qsa_attention_rdna2(
+        out16,
+        q16,
+        k_cache,
+        v_cache,
+        query_start_loc,
+        seq_lens,
+        block_table,
+        ublk,
+        umask,
+        ucount,
+        tile_tokens,
+        compress_ratio,
+        head_dim**-0.5,
+    )
+    if out16 is not out:
+        out.copy_(out16)
+    return out
+
+
 def qsa_store_cache_rows(
     cache: torch.Tensor,
     slot_mapping: torch.Tensor,
@@ -1131,6 +1190,7 @@ def qsa_compress_groups_with_ratio(
 
 __all__ = [
     "expand_qsa_block_indices_cuda",
+    "qsa_sparse_attention_rdna2",
     "qsa_compress_groups_with_ratio",
     "qsa_mqa_paged",
     "qsa_select_paged_tokens",
