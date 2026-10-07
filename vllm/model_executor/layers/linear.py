@@ -223,9 +223,10 @@ class UnquantizedLinearMethod(LinearMethodBase):
                 use_rdna2_w8a16,
             )
 
-            if use_rdna2_w8a16(layer.weight):
+            keep = getattr(layer, "keep_unquantized_weight", False)
+            if not keep and use_rdna2_w8a16(layer.weight):
                 quantize_weight(layer)
-            elif use_rdna2_kmajor_fp16(layer.weight):
+            elif not keep and use_rdna2_kmajor_fp16(layer.weight):
                 relayout_weight(layer)
             elif layer.weight.dim() == 2:
                 n, k = layer.weight.shape
