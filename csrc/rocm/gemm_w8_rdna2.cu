@@ -474,6 +474,104 @@ __global__ void splitk_epilogue_kernel(const float* __restrict__ P,
       *reinterpret_cast<const uint2*>(o);
 }
 
+// Qwen4Exp hyper-connection gate (GatedResidual) for a few tokens, three ops
+// in one: y = silu(lora / HC) (rounded to T as the unfused op stores it),
+// g = y @ W^T * scale (int8 K-major W [R / 4, HC * HS, 4]; rounded to T) and
+// out[t, h] = sum_s sigmoid(g[t, s * HS + h]) * xn[t, s * HS + h] / HC.
+// HC = 4: lane l owns stream l / 8 and columns 4 * (l % 8) .. + 3 of a
+// 32-column tile, so the stream sum is two shuffles. grid (HS / 32,
+// ceil(M / TT)); the NW waves split R. Faster than the three ops up to 4
+// rows (at 8 the GEMM's tiles win).
+static constexpr int kHcStreams = 4;
+static constexpr int kHcMaxRank = 512;
+
+template <typename T, int TT, int NW>
+__global__ void __launch_bounds__(NW* WARP32)
+    hc_up_mix_kernel(const uint4* __restrict__ W, const float* __restrict__ S,
+                     const T* __restrict__ lora, const int ldl,
+                     const T* __restrict__ xn, const int ldx,
+                     T* __restrict__ out, const int ldo, const int M,
+                     const int HS, const int R, const int ldw,
+                     const float inv_hc) {
+  __shared__ __align__(16) T sy[TT * kHcMaxRank];
+  __shared__ float red[NW - 1][4][TT][WARP32];
+  const int lane = threadIdx.x % WARP32;
+  const int wave = __builtin_amdgcn_readfirstlane(threadIdx.x / WARP32);
+  const int t0 = blockIdx.y * TT;
+  for (int idx = threadIdx.x; idx < TT * R; idx += NW * WARP32) {
+    const int i = idx / R, k = idx % R;
+    const float v =
+        to_float<T>(lora[(long)min(t0 + i, M - 1) * ldl + k]) * inv_hc;
+    sy[i * R + k] = from_float<T>(v / (1.f + __expf(-v)));
+  }
+  __syncthreads();
+
+  const int s = lane / 8, h = blockIdx.x * 32 + lane % 8 * 4;
+  const int col = (s * HS + h) / 4;
+  float acc[4][TT];
+  #pragma unroll
+  for (int c = 0; c < 4; c++)
+  #pragma unroll
+    for (int i = 0; i < TT; i++) acc[c][i] = 0.f;
+  const int steps = R / 8;
+  for (int st = steps * wave / NW; st < steps * (wave + 1) / NW; st++) {
+    const uint4 w0 = W[(long)(2 * st) * ldw + col];
+    const uint4 w1 = W[(long)(2 * st + 1) * ldw + col];
+    half2 hw[4][4];
+  #pragma unroll
+    for (int c = 0; c < 4; c++) {
+      widen4<true>(dword(w0, c), hw[c][0], hw[c][1]);
+      widen4<true>(dword(w1, c), hw[c][2], hw[c][3]);
+    }
+  #pragma unroll
+    for (int i = 0; i < TT; i++) {
+      const uint4 av = *reinterpret_cast<const uint4*>(sy + i * R + st * 8);
+  #pragma unroll
+      for (int c = 0; c < 4; c++) acc[c][i] = dot8<T>(av, hw[c], acc[c][i]);
+    }
+  }
+
+  if (wave > 0)
+  #pragma unroll
+    for (int c = 0; c < 4; c++)
+  #pragma unroll
+      for (int i = 0; i < TT; i++) red[wave - 1][c][i][lane] = acc[c][i];
+  __syncthreads();
+  if (wave > 0) return;
+  #pragma unroll
+  for (int w = 0; w < NW - 1; w++)
+  #pragma unroll
+    for (int c = 0; c < 4; c++)
+  #pragma unroll
+      for (int i = 0; i < TT; i++) acc[c][i] += red[w][c][i][lane];
+
+  const float4 sv = *reinterpret_cast<const float4*>(S + s * HS + h);
+  const float sc[4] = {sv.x, sv.y, sv.z, sv.w};
+  #pragma unroll
+  for (int i = 0; i < TT; i++) {
+    const int t = t0 + i;
+    if (t >= M) break;  // wave-uniform: the shuffles below see every lane
+    __align__(8) T x[4];
+    *reinterpret_cast<uint2*>(x) =
+        *reinterpret_cast<const uint2*>(xn + (long)t * ldx + s * HS + h);
+    float v[4];
+  #pragma unroll
+    for (int c = 0; c < 4; c++) {
+      const float g = to_float<T>(from_float<T>(acc[c][i] * sc[c]));
+      v[c] = to_float<T>(x[c]) / (1.f + __expf(-g));
+      v[c] += __shfl_xor(v[c], 8);
+      v[c] += __shfl_xor(v[c], 16);
+    }
+    if (lane < 8) {
+      __align__(8) T o[4];
+  #pragma unroll
+      for (int c = 0; c < 4; c++) o[c] = from_float<T>(v[c] * inv_hc);
+      *reinterpret_cast<uint2*>(out + (long)t * ldo + h) =
+          *reinterpret_cast<const uint2*>(o);
+    }
+  }
+}
+
 // Tiled K-major fp16 GEMM (large M): TM x TN outputs per thread in 4 x 4
 // blocks spaced 64 apart, BK k per stage; W is the [K/2][N] dword view of the
 // K-major weights.
@@ -623,6 +721,15 @@ template <typename O, bool INT8, bool W16>
 __global__ void splitk_epilogue_kernel(const float*, const float*, const O*, O*,
                                        const int, const int, const int,
                                        const int) {}
+
+static constexpr int kHcStreams = 4;
+static constexpr int kHcMaxRank = 512;
+
+template <typename T, int TT, int NW>
+__global__ void hc_up_mix_kernel(const uint4*, const float*, const T*,
+                                 const int, const T*, const int, T*, const int,
+                                 const int, const int, const int, const int,
+                                 const float) {}
 
 #endif  // __HIP__RDNA2__ || !__HIP_DEVICE_COMPILE__
 
@@ -1007,4 +1114,63 @@ torch::Tensor gemm_w8_rdna2(const at::Tensor& a, const at::Tensor& w,
   }
 #undef VLLM_W8_RDNA2_CASE
   return c;
+}
+
+// out [M, HS] (xn's dtype): the hyper-connection gate of hc_up_mix_kernel.
+// lora [M, R] fp16 or bf16 with K-contiguous rows, w [R / 4, 4 * HS, 4] int8
+// (kmajor_w8), scale [4 * HS] fp32, xn [M, 4 * HS] of lora's dtype with
+// contiguous rows; hc_count 4, HS % 32 == 0, R % 8 == 0 and R <= 512.
+torch::Tensor hc_up_mix_rdna2(const at::Tensor& lora, const at::Tensor& w,
+                              const at::Tensor& scale, const at::Tensor& xn,
+                              int64_t hc_count) {
+  using namespace vllm::gemm_w8_rdna2;
+  TORCH_CHECK(hc_count == kHcStreams, "hc_up_mix_rdna2 needs 4 streams");
+  TORCH_CHECK(
+      (lora.dtype() == torch::kFloat16 || lora.dtype() == torch::kBFloat16) &&
+          xn.dtype() == lora.dtype(),
+      "hc_up_mix_rdna2 needs fp16 or bf16 lora and xn of one dtype");
+  TORCH_CHECK(lora.dim() == 2 && lora.stride(1) == 1 && xn.dim() == 2 &&
+                  xn.stride(1) == 1 && xn.size(0) == lora.size(0) &&
+                  xn.stride(0) % 4 == 0 &&
+                  reinterpret_cast<uintptr_t>(xn.data_ptr()) % 8 == 0,
+              "hc_up_mix_rdna2 needs lora [M, R] and xn [M, 4 * HS] with "
+              "contiguous, 8-byte aligned rows of xn");
+  const int M = lora.size(0), R = lora.size(1), N = xn.size(1);
+  TORCH_CHECK(R % 8 == 0 && R <= kHcMaxRank && N % (32 * kHcStreams) == 0,
+              "hc_up_mix_rdna2 needs R % 8 == 0, R <= 512 and HS % 32 == 0");
+  TORCH_CHECK(w.dtype() == torch::kInt8 && w.dim() == 3 && w.size(0) * 4 == R &&
+                  w.size(1) == N && w.size(2) == 4 && w.is_contiguous(),
+              "hc_up_mix_rdna2 needs contiguous int8 w [R / 4, 4 * HS, 4]");
+  TORCH_CHECK(scale.dtype() == torch::kFloat32 && scale.numel() == N &&
+                  scale.is_contiguous(),
+              "hc_up_mix_rdna2 needs a contiguous fp32 scale [4 * HS]");
+  const int HS = N / kHcStreams;
+  auto out = torch::empty({M, HS}, xn.options());
+  if (M == 0) return out;
+  const at::cuda::OptionalCUDAGuard device_guard(device_of(xn));
+  const cudaStream_t stream = at::cuda::getCurrentCUDAStream();
+  constexpr int NW = 8;
+  auto run = [&](auto t, auto tt) {
+    using T = decltype(t);
+    constexpr int TT = decltype(tt)::value;
+    hc_up_mix_kernel<T, TT, NW>
+        <<<dim3(HS / 32, (M + TT - 1) / TT), NW * WARP32, 0, stream>>>(
+            (const uint4*)w.data_ptr(), scale.data_ptr<float>(),
+            (const T*)lora.data_ptr(), lora.stride(0), (const T*)xn.data_ptr(),
+            xn.stride(0), (T*)out.data_ptr(), out.stride(0), M, HS, R, N / 4,
+            1.f / kHcStreams);
+  };
+  auto by_rows = [&](auto t) {
+    if (M == 1)
+      run(t, std::integral_constant<int, 1>{});
+    else if (M == 2)
+      run(t, std::integral_constant<int, 2>{});
+    else
+      run(t, std::integral_constant<int, 4>{});
+  };
+  if (lora.dtype() == torch::kFloat16)
+    by_rows(__half{});
+  else
+    by_rows(__hip_bfloat16{});
+  return out;
 }

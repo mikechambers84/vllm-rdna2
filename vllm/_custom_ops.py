@@ -2163,6 +2163,20 @@ def gemm_w8_rdna2(
     )
 
 
+def hc_up_mix_rdna2(
+    lora: torch.Tensor,
+    w: torch.Tensor,
+    scale: torch.Tensor,
+    xn: torch.Tensor,
+    hc_count: int,
+) -> torch.Tensor:
+    """Qwen4Exp hyper-connection gate for a few tokens in one RDNA2 kernel:
+    ``g = silu(lora / hc_count) @ (w * scale).T`` (int8 K-major ``w``
+    [R / 4, hc_count * HS, 4]), then the mean over the streams of
+    ``sigmoid(g) * xn``; returns [M, HS]. hc_count must be 4."""
+    return torch.ops._rocm_C.hc_up_mix_rdna2(lora, w, scale, xn, hc_count)
+
+
 def quant_int8_exl_rdna2(
     x: torch.Tensor,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:

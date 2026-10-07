@@ -52,6 +52,10 @@ torch::Tensor gemm_w8_rdna2(const at::Tensor& a, const at::Tensor& w,
                             const std::optional<at::Tensor>& scale_a,
                             std::optional<at::ScalarType> out_dtype);
 
+torch::Tensor hc_up_mix_rdna2(const at::Tensor& lora, const at::Tensor& w,
+                              const at::Tensor& scale, const at::Tensor& xn,
+                              int64_t hc_count);
+
 torch::Tensor gemm_rocblas_rdna2(const at::Tensor& a, const at::Tensor& w,
                                  int64_t solution, bool w_kn);
 
