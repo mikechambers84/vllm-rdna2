@@ -192,6 +192,14 @@ void qsa_attention_rdna2(
     double scale, const std::optional<torch::Tensor>& k_scale,
     const std::optional<torch::Tensor>& v_scale);
 
+void qsa_decode_rdna2(torch::Tensor& out, const torch::Tensor& q,
+                      const torch::Tensor& k_cache,
+                      const torch::Tensor& v_cache, const torch::Tensor& sel,
+                      const torch::Tensor& tok2req,
+                      const torch::Tensor& block_table, double scale,
+                      const std::optional<torch::Tensor>& k_scale,
+                      const std::optional<torch::Tensor>& v_scale);
+
 void gdn_post_conv_rdna2(const torch::Tensor& conv_output,
                          const torch::Tensor& a, const torch::Tensor& b,
                          const torch::Tensor& A_log,

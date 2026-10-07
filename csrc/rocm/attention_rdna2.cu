@@ -36,6 +36,7 @@
 #include <hip/hip_runtime.h>
 #include <hip/hip_fp16.h>
 
+#include <algorithm>
 #include <type_traits>
 
 #include "rdna2_fp8.cuh"
@@ -718,6 +719,273 @@ __global__ void __launch_bounds__(THREADS) decode_attention_rdna2_kernel(
   }
 }
 
+// QSA (Qwen4Exp sparse attention) decode / spec-verify, head 256: every query
+// token attends to its own selection, so a workgroup takes one token's G <= 16
+// heads of one kv head over 32-entry tiles of the selection. Latency first:
+// 32 threads resolve a tile's selection -> block table -> cache offsets and
+// every thread issues all of its K and V loads at once (a wave reads whole
+// rows). While a tile is computed, the next tile's K / V, the block table
+// entries of the one after and the selection entries of the third are in
+// flight, issued earliest-needed first (loads complete in order).
+// S = Q K^T: the two halves of the workgroup take the two halves of the head
+// dims, a thread one key (lane) and HS = ceil(G / 4) heads (wave % 4), K in
+// LDS as swizzled [dims / 8][key] 16-byte words; then one wave per head sums
+// the halves and runs the online softmax in-wave. P V: a thread owns 2 dims
+// of 2 * HS heads, so each V read serves them all. Q rows past G are zero
+// (the loops have no head bounds). Workgroup
+// (t, kvh, seg) runs tiles [seg * tps, (seg + 1) * tps) and writes the
+// segment partials of decode_attention_rdna2 (unnormalized out, natural-log
+// max, sum).
+static constexpr int QD_TK = 32;    // selection entries per tile
+static constexpr int QD_HMAX = 16;  // q heads per kv head
+static constexpr int QD_MAXSEG = 256;
+
+template <int KV, int HS>
+__global__ void __launch_bounds__(THREADS) qsa_decode_rdna2_kernel(
+    const __half* __restrict__ Q, const void* __restrict__ Kc,
+    const void* __restrict__ Vc, float* __restrict__ segm_out,
+    float* __restrict__ segm_max, float* __restrict__ segm_sum,
+    const int* __restrict__ sel, const long sel_st, const int W,
+    const int* __restrict__ tok2req, const int* __restrict__ block_table,
+    const long bt_stride, const int bt_w, const int G, const int HQ,
+    const int block_size, const long q_st, const long q_sh, const long k_sb,
+    const long k_st, const long k_sh, const long v_sb, const long v_st,
+    const long v_sh, const int nseg, const int tps, const float scale,
+    const float* __restrict__ k_scale, const float* __restrict__ v_scale) {
+  constexpr float LOG2E = 1.4426950408889634f;
+  constexpr int D = 256, D8 = D / 8, TK = QD_TK;
+  constexpr int ITEMS = TK * D8 / THREADS;  // rows (keys) per thread
+  constexpr int VST = D / 2 + 4;  // sV row stride: conflict-free b128 stores
+  constexpr int HV = 2 * HS, HP = 4 * HS;  // heads per P V thread, padded G
+  static_assert(D8 == 32 && TK == 32, "a wave covers one row; lane = key");
+  static_assert(HP <= QD_HMAX, "at most 16 q heads per kv head");
+  __shared__ uint4 sQ[QD_HMAX][D8];
+  __shared__ uint4 sK[D8][TK];  // key k of piece c at [c][k ^ c % 8]
+  __shared__ __align__(16) uint32_t sV[TK][VST];
+  __shared__ float sS[2][QD_HMAX][TK];
+  __shared__ __align__(16) float sP[QD_HMAX][TK];
+  __shared__ float sA[QD_HMAX];
+  __shared__ long sOk[2][TK], sOv[2][TK];
+
+  const int tid = threadIdx.x, lane = tid % 32, wave = tid / 32;
+  const int t = blockIdx.x, kvh = blockIdx.y, seg = blockIdx.z;
+  const int tiles = (W + TK - 1) / TK;
+  const int tile0 = seg * tps, tile1 = min(tile0 + tps, tiles);
+  if (tile0 >= tiles) return;
+  const int req = tok2req[t];
+  const int* srow = sel + t * sel_st;
+  const int* bt = block_table + (long)max(req, 0) * bt_stride;
+  const float scale_log2e = scale * kv_scale<KV>(k_scale) * LOG2E;
+
+  for (int i = tid; i < QD_HMAX * TK; i += THREADS) sP[i / TK][i % TK] = 0.f;
+  for (int i = tid; i < HP * D8; i += THREADS)
+    sQ[i / D8][i % D8] =
+        i / D8 < G ? *reinterpret_cast<const uint4*>(
+                         Q + t * q_st + (kvh * G + i / D8) * q_sh + i % D8 * 8)
+                   : make_uint4(0, 0, 0, 0);
+
+  // Threads < TK: selection entry tid of a tile, then its cache offsets.
+  auto entry = [&](int tile) -> int {
+    const int e = tile * TK + tid;
+    return tid < TK && tile < tile1 && e < W ? srow[e] : -1;
+  };
+  long nk = -1, nv = -1;
+  auto resolve = [&](int tok) {
+    const bool ok = req >= 0 && tok >= 0 && tok / block_size < bt_w;
+    const long page = ok ? bt[tok / block_size] : 0;
+    nk = ok ? page * k_sb + tok % block_size * k_st + kvh * k_sh : -1;
+    nv = ok ? page * v_sb + tok % block_size * v_st + kvh * v_sh : -1;
+  };
+  // Thread: piece `lane` (dims 8 * lane ..) of keys wave + 8 * it.
+  KvRaw<KV> kr[ITEMS], vr[ITEMS];
+  auto issue = [&](int buf) {
+  #pragma unroll
+    for (int it = 0; it < ITEMS; it++) {
+      const int key = wave + 8 * it;
+      // Entries without a cache row read row 0 and are masked in S (their
+      // P is 0, and V is zeroed so that 0 * garbage stays 0).
+      const long ko = sOk[buf][key], vo = sOv[buf][key];
+      kr[it] = kv_load<KV>(Kc, max(ko, 0L) + lane * 8);
+      vr[it] = kv_load<KV>(Vc, max(vo, 0L) + lane * 8);
+      if (vo < 0) vr[it] = KvRaw<KV>{};
+    }
+  };
+
+  // S: dims half wave / 4 of heads (wave % 4) * hs ..; softmax: heads wave
+  // and wave + 8; P V: dims 2 * (tid % 128) of heads (tid / 128) * hv ...
+  const int sh = wave / 4, sh0 = wave % 4 * HS;
+  const int dp = tid % 128, hv0 = tid / 128 * HV;
+  float m_s[2] = {-INFINITY, -INFINITY}, l_s[2] = {0.f, 0.f};
+  float acc[HV][2];
+  #pragma unroll
+  for (int r = 0; r < HV; r++) acc[r][0] = acc[r][1] = 0.f;
+
+  int tok1 = entry(tile0 + 1), tok2 = entry(tile0 + 2);
+  resolve(entry(tile0));
+  if (tid < TK) {
+    sOk[0][tid] = nk;
+    sOv[0][tid] = nv;
+  }
+  __syncthreads();
+  issue(0);
+  resolve(tok1);
+  for (int tile = tile0, buf = 0; tile < tile1; tile++, buf ^= 1) {
+  #pragma unroll
+    for (int it = 0; it < ITEMS; it++) {
+      const int key = wave + 8 * it;
+      sK[lane][key ^ lane % 8] = kv_widen<KV>(kr[it]);
+      *reinterpret_cast<uint4*>(&sV[key][lane * 4]) = kv_widen<KV>(vr[it]);
+    }
+    if (tid < TK) {
+      sOk[buf ^ 1][tid] = nk;
+      sOv[buf ^ 1][tid] = nv;
+    }
+    __syncthreads();
+    const int tok3 = entry(tile + 3);
+    if (tile + 1 < tile1) issue(buf ^ 1);
+    resolve(tok2);
+
+    {
+      float sc[HS];
+  #pragma unroll
+      for (int r = 0; r < HS; r++) sc[r] = 0.f;
+  #pragma unroll 4
+      for (int c = sh * (D8 / 2); c < (sh + 1) * (D8 / 2); c++) {
+        const uint4 k = sK[c][lane ^ c % 8];
+  #pragma unroll
+        for (int r = 0; r < HS; r++) {
+          const uint4 q = sQ[sh0 + r][c];
+          sc[r] = __builtin_amdgcn_fdot2(as_h2(q.x), as_h2(k.x), sc[r], false);
+          sc[r] = __builtin_amdgcn_fdot2(as_h2(q.y), as_h2(k.y), sc[r], false);
+          sc[r] = __builtin_amdgcn_fdot2(as_h2(q.z), as_h2(k.z), sc[r], false);
+          sc[r] = __builtin_amdgcn_fdot2(as_h2(q.w), as_h2(k.w), sc[r], false);
+        }
+      }
+  #pragma unroll
+      for (int r = 0; r < HS; r++) sS[sh][sh0 + r][lane] = sc[r];
+    }
+    __syncthreads();
+
+  #pragma unroll
+    for (int r = 0; r < 2; r++) {
+      const int h = wave + 8 * r;
+      if (h >= G) break;  // wave-uniform
+      const float sc = sS[0][h][lane] + sS[1][h][lane];
+      const float x = sOk[buf][lane] >= 0 ? sc * scale_log2e : -INFINITY;
+      float mx = x;
+  #pragma unroll
+      for (int o = 16; o > 0; o >>= 1) mx = fmaxf(mx, __shfl_xor(mx, o));
+      const float m_new = fmaxf(fmaxf(m_s[r], mx), -1e30f);
+      const float p = exp2f(x - m_new);
+      float ps = p;
+  #pragma unroll
+      for (int o = 16; o > 0; o >>= 1) ps += __shfl_xor(ps, o);
+      const float alpha = exp2f(m_s[r] - m_new);
+      l_s[r] = l_s[r] * alpha + ps;
+      m_s[r] = m_new;
+      sP[h][lane] = p;
+      if (lane == 0) sA[h] = alpha;
+    }
+    __syncthreads();
+
+  #pragma unroll
+    for (int r = 0; r < HV; r++) {
+      const float a = hv0 + r < G ? sA[hv0 + r] : 0.f;
+      acc[r][0] *= a;
+      acc[r][1] *= a;
+    }
+  #pragma unroll 2
+    for (int j = 0; j < TK; j += 4) {
+      float2 v[4];
+  #pragma unroll
+      for (int u = 0; u < 4; u++) v[u] = __half22float2(as_h2(sV[j + u][dp]));
+  #pragma unroll
+      for (int r = 0; r < HV; r++) {
+        const float4 p = *reinterpret_cast<const float4*>(&sP[hv0 + r][j]);
+        acc[r][0] = fmaf(p.x, v[0].x, acc[r][0]);
+        acc[r][1] = fmaf(p.x, v[0].y, acc[r][1]);
+        acc[r][0] = fmaf(p.y, v[1].x, acc[r][0]);
+        acc[r][1] = fmaf(p.y, v[1].y, acc[r][1]);
+        acc[r][0] = fmaf(p.z, v[2].x, acc[r][0]);
+        acc[r][1] = fmaf(p.z, v[2].y, acc[r][1]);
+        acc[r][0] = fmaf(p.w, v[3].x, acc[r][0]);
+        acc[r][1] = fmaf(p.w, v[3].y, acc[r][1]);
+      }
+    }
+    tok2 = tok3;  // here, so that tok3's load does not stall the compute
+    __syncthreads();
+  }
+
+  const float vs = kv_scale<KV>(v_scale);
+  #pragma unroll
+  for (int r = 0; r < HV; r++) {
+    if (hv0 + r >= G) break;
+    const long base = ((long)t * HQ + kvh * G + hv0 + r) * nseg + seg;
+    *reinterpret_cast<float2*>(segm_out + base * D + 2 * dp) =
+        make_float2(acc[r][0] * vs, acc[r][1] * vs);
+  }
+  #pragma unroll
+  for (int r = 0; r < 2; r++) {
+    const int h = wave + 8 * r;
+    if (h >= G || lane != 0) break;
+    const long base = ((long)t * HQ + kvh * G + h) * nseg + seg;
+    segm_max[base] = m_s[r] / LOG2E;
+    segm_sum[base] = l_s[r];
+  }
+}
+
+// QSA decode: the out [T, HQ, 256] (fp16) of the first act (<= QD_MAXSEG)
+// segment partials of each (token, head) of qsa_decode_rdna2_kernel; weights
+// in LDS, 4 dims per thread.
+__global__ void __launch_bounds__(64)
+    qsa_decode_merge_kernel(const float* __restrict__ segm_out,
+                            const float* __restrict__ segm_max,
+                            const float* __restrict__ segm_sum,
+                            __half* __restrict__ out, const long o_st,
+                            const long o_sh, const int HQ, const int nseg,
+                            const int act) {
+  __shared__ float sw[QD_MAXSEG];
+  __shared__ float sred[2];
+  const int t = blockIdx.x, h = blockIdx.y, tid = threadIdx.x, d = tid * 4;
+  const long base = ((long)t * HQ + h) * nseg;
+  float m = -INFINITY;
+  for (int sg = tid; sg < act; sg += 64) m = fmaxf(m, segm_max[base + sg]);
+  #pragma unroll
+  for (int o = 16; o > 0; o >>= 1) m = fmaxf(m, __shfl_xor(m, o));
+  if (tid % 32 == 0) sred[tid / 32] = m;
+  __syncthreads();
+  m = fmaxf(sred[0], sred[1]);
+  float l = 0.f;
+  for (int sg = tid; sg < act; sg += 64) {
+    const float w = __expf(segm_max[base + sg] - m);
+    sw[sg] = w;
+    l += w * segm_sum[base + sg];
+  }
+  #pragma unroll
+  for (int o = 16; o > 0; o >>= 1) l += __shfl_xor(l, o);
+  __syncthreads();
+  if (tid % 32 == 0) sred[tid / 32] = l;
+  __syncthreads();
+  l = sred[0] + sred[1];
+  float o[4] = {0.f, 0.f, 0.f, 0.f};
+  #pragma unroll 8
+  for (int sg = 0; sg < act; sg++) {
+    const float w = sw[sg];
+    const float4 v =
+        *reinterpret_cast<const float4*>(segm_out + (base + sg) * 256 + d);
+    o[0] += w * v.x;
+    o[1] += w * v.y;
+    o[2] += w * v.z;
+    o[3] += w * v.w;
+  }
+  const float inv = l > 0.f ? 1.f / l : 0.f;
+  const half2 h0 = __floats2half2_rn(o[0] * inv, o[1] * inv);
+  const half2 h1 = __floats2half2_rn(o[2] * inv, o[3] * inv);
+  *reinterpret_cast<uint2*>(out + t * o_st + h * o_sh + d) =
+      make_uint2(*reinterpret_cast<const uint32_t*>(&h0),
+                 *reinterpret_cast<const uint32_t*>(&h1));
+}
+
 // QSA (Qwen4Exp sparse attention) prefill. Every query token attends to its own
 // selection: whole RATIO-token blocks plus the open group's causal tail, all
 // at or before its position. Consecutive tokens select mostly the same blocks
@@ -1154,6 +1422,19 @@ __global__ void decode_attention_rdna2_kernel(
     const float, const float*, const float*, const int, const float,
     const float*) {}
 
+template <int KV, int HS>
+__global__ void qsa_decode_rdna2_kernel(
+    const __half*, const void*, const void*, float*, float*, float*, const int*,
+    const long, const int, const int*, const int*, const long, const int,
+    const int, const int, const int, const long, const long, const long,
+    const long, const long, const long, const long, const long, const int,
+    const int, const float, const float*, const float*) {}
+
+__global__ void qsa_decode_merge_kernel(const float*, const float*,
+                                        const float*, __half*, const long,
+                                        const long, const int, const int,
+                                        const int) {}
+
 #endif  // __HIP__RDNA2__ || !__HIP_DEVICE_COMPILE__
 
 }  // namespace attention_rdna2
@@ -1516,4 +1797,97 @@ void qsa_attention_rdna2(
     VLLM_QSA_RDNA2_BY_KV(128);
   }
 #undef VLLM_QSA_RDNA2_BY_KV
+}
+
+// QSA (Qwen4Exp sparse attention) decode / spec-verify for head 256: query
+// token t of q [T, HQ, 256] fp16 (G = HQ / HKV <= 16) attends to its selection
+// sel [T, W] int32 of positions (-1: none) in request tok2req[t] of the paged
+// caches (and scales) as for unified_attention_rdna2, split into segments of
+// 32-entry tiles and merged into out [T, HQ, 256] fp16.
+void qsa_decode_rdna2(torch::Tensor& out, const torch::Tensor& q,
+                      const torch::Tensor& k_cache,
+                      const torch::Tensor& v_cache, const torch::Tensor& sel,
+                      const torch::Tensor& tok2req,
+                      const torch::Tensor& block_table, double scale,
+                      const std::optional<torch::Tensor>& k_scale,
+                      const std::optional<torch::Tensor>& v_scale) {
+  using namespace vllm::attention_rdna2;
+  TORCH_CHECK(q.dtype() == torch::kFloat16 && out.dtype() == torch::kFloat16,
+              "qsa_decode_rdna2: fp16 q and out");
+  const int kv =
+      check_kv_dtype("qsa_decode_rdna2", k_cache, v_cache, k_scale, v_scale);
+  const int T = q.size(0), HQ = q.size(1), HKV = k_cache.size(2);
+  TORCH_CHECK(q.dim() == 3 && q.size(2) == 256 && k_cache.size(3) == 256 &&
+                  v_cache.sizes() == k_cache.sizes() && HQ % HKV == 0 &&
+                  HQ / HKV <= QD_HMAX && out.sizes() == q.sizes() &&
+                  out.stride(2) == 1 && out.stride(1) % 4 == 0 &&
+                  out.stride(0) % 4 == 0,
+              "qsa_decode_rdna2: head 256, at most 16 q heads per kv head");
+  for (const torch::Tensor* t : {&q, &k_cache, &v_cache}) {
+    TORCH_CHECK(t->stride(-1) == 1 &&
+                    reinterpret_cast<uintptr_t>(t->data_ptr()) % 16 == 0,
+                "qsa_decode_rdna2 needs 16-byte aligned heads");
+    for (int d = 0; d < t->dim() - 1; d++)
+      TORCH_CHECK(t->stride(d) % 8 == 0,
+                  "qsa_decode_rdna2 needs 16-byte aligned head strides");
+  }
+  TORCH_CHECK(
+      sel.dtype() == torch::kInt32 && sel.dim() == 2 && sel.size(0) == T &&
+          sel.stride(1) == 1 && tok2req.dtype() == torch::kInt32 &&
+          tok2req.numel() == T && tok2req.is_contiguous() &&
+          block_table.dtype() == torch::kInt32 && block_table.stride(1) == 1,
+      "qsa_decode_rdna2: int32 sel [T, W], tok2req [T], block_table");
+  const int W = sel.size(1);
+  if (T == 0 || W == 0) return;
+  const int tiles = (W + QD_TK - 1) / QD_TK;
+  // ~2 workgroups per CU (72-CU V620); more segments only add partials.
+  const int nseg = std::max(
+      1, std::min(std::min(tiles, QD_MAXSEG), (144 + T * HKV - 1) / (T * HKV)));
+  const int tps = (tiles + nseg - 1) / nseg;
+  const int act = (tiles + tps - 1) / tps;
+  auto opts = q.options().dtype(torch::kFloat32);
+  auto segm_out = torch::empty({T, HQ, nseg, 256}, opts);
+  auto segm_max = torch::empty({T, HQ, nseg}, opts);
+  auto segm_sum = torch::empty({T, HQ, nseg}, opts);
+  const at::cuda::OptionalCUDAGuard device_guard(device_of(q));
+  const cudaStream_t stream = at::cuda::getCurrentCUDAStream();
+  auto launch = [&](auto kernel) {
+    kernel<<<dim3(T, HKV, nseg), THREADS, 0, stream>>>(
+        (const __half*)q.data_ptr(), k_cache.data_ptr(), v_cache.data_ptr(),
+        segm_out.data_ptr<float>(), segm_max.data_ptr<float>(),
+        segm_sum.data_ptr<float>(), sel.data_ptr<int>(), sel.stride(0), W,
+        tok2req.data_ptr<int>(), block_table.data_ptr<int>(),
+        block_table.stride(0), (int)block_table.size(1), HQ / HKV, HQ,
+        k_cache.size(1), q.stride(0), q.stride(1), k_cache.stride(0),
+        k_cache.stride(1), k_cache.stride(2), v_cache.stride(0),
+        v_cache.stride(1), v_cache.stride(2), nseg, tps, (float)scale,
+        scale_ptr(k_scale), scale_ptr(v_scale));
+  };
+  // Heads per S thread: ceil(G / 4).
+  auto by_heads = [&](auto kv_tag) {
+    constexpr int KVT = decltype(kv_tag)::value;
+    switch ((HQ / HKV + 3) / 4) {
+      case 1:
+        launch(qsa_decode_rdna2_kernel<KVT, 1>);
+        break;
+      case 2:
+        launch(qsa_decode_rdna2_kernel<KVT, 2>);
+        break;
+      case 3:
+        launch(qsa_decode_rdna2_kernel<KVT, 3>);
+        break;
+      default:
+        launch(qsa_decode_rdna2_kernel<KVT, 4>);
+    }
+  };
+  if (kv == KV_FP8)
+    by_heads(std::integral_constant<int, KV_FP8>{});
+  else if (kv == KV_BF16)
+    by_heads(std::integral_constant<int, KV_BF16>{});
+  else
+    by_heads(std::integral_constant<int, KV_FP16>{});
+  qsa_decode_merge_kernel<<<dim3(T, HQ), 64, 0, stream>>>(
+      segm_out.data_ptr<float>(), segm_max.data_ptr<float>(),
+      segm_sum.data_ptr<float>(), (__half*)out.data_ptr(), out.stride(0),
+      out.stride(1), HQ, nseg, act);
 }

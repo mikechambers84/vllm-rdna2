@@ -322,10 +322,11 @@ def test_qsa_sparse_attention_rdna2_matches_reference(
     context: int,
     dtype: torch.dtype,
 ) -> None:
-    """The gfx1030 path (tiles over the union of consecutive rows'
-    selections) must give each row attention over exactly its own selection:
-    long contexts (every row sparse, selections overlapping) and short ones
-    (every visible block selected, i.e. causal)."""
+    """The gfx1030 paths (prefill: tiles over the union of consecutive rows'
+    selections; decode: split-KV over each row's own) must give each row
+    attention over exactly its own selection: long contexts (every row
+    sparse, selections overlapping) and short ones (every visible block
+    selected, i.e. causal)."""
     torch.manual_seed(3)
     head_dim, page_size, num_requests = 256, 64, 2
     budget, ratio = 2048, 4
@@ -384,6 +385,15 @@ def test_qsa_sparse_attention_rdna2_matches_reference(
         ratio,
         torch.empty_like(q),
     )
+    decode = qsa_ops.qsa_sparse_decode_rdna2(
+        q,
+        k_cache,
+        v_cache,
+        logical_indices,
+        block_table,
+        token_to_req,
+        torch.empty_like(q),
+    )
     expected = _qsa_sparse_paged_attention_reference(
         q,
         k_cache,
@@ -394,13 +404,14 @@ def test_qsa_sparse_attention_rdna2_matches_reference(
         head_dim**-0.5,
     )
     torch.testing.assert_close(actual, expected, rtol=2e-2, atol=2e-2)
+    torch.testing.assert_close(decode, expected, rtol=2e-2, atol=2e-2)
 
 
 @requires_qsa_kernels
 @pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16])
 def test_qsa_fp8_kv_matches_reference(dtype: torch.dtype) -> None:
-    """FP8 (e4m3) main KV caches: both the Triton kernel (decode) and the
-    gfx1030 union-tile path (prefill) must equal attention over the cache
+    """FP8 (e4m3) main KV caches: the Triton kernel and the gfx1030 decode
+    and union-tile prefill paths must equal attention over the cache
     dequantized with its per-tensor scales."""
     torch.manual_seed(5)
     head_dim, page_size, num_requests, rows_per_request = 256, 64, 2, 40
@@ -479,3 +490,15 @@ def test_qsa_fp8_kv_matches_reference(dtype: torch.dtype) -> None:
             v_scale,
         )
         torch.testing.assert_close(rdna2_out, expected, rtol=2e-2, atol=2e-2)
+        decode_out = qsa_ops.qsa_sparse_decode_rdna2(
+            q,
+            k8,
+            v8,
+            logical_indices,
+            block_table,
+            token_to_req,
+            torch.empty_like(q),
+            k_scale,
+            v_scale,
+        )
+        torch.testing.assert_close(decode_out, expected, rtol=2e-2, atol=2e-2)

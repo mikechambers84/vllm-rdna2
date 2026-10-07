@@ -210,6 +210,12 @@ TORCH_LIBRARY_EXPAND(TORCH_EXTENSION_NAME, rocm_ops) {
       "int tile_tokens, int ratio, float scale, Tensor? k_scale=None, "
       "Tensor? v_scale=None) -> ()");
   rocm_ops.impl("qsa_attention_rdna2", torch::kCUDA, &qsa_attention_rdna2);
+  // Qwen4Exp QSA decode / spec-verify: split-KV over each token's selection.
+  rocm_ops.def(
+      "qsa_decode_rdna2(Tensor! out, Tensor q, Tensor k_cache, "
+      "Tensor v_cache, Tensor sel, Tensor tok2req, Tensor block_table, "
+      "float scale, Tensor? k_scale=None, Tensor? v_scale=None) -> ()");
+  rocm_ops.impl("qsa_decode_rdna2", torch::kCUDA, &qsa_decode_rdna2);
   // Gated DeltaNet prefill: post-conv1d q/k/v split, l2 norm and gating.
   rocm_ops.def(
       "gdn_post_conv_rdna2(Tensor conv_output, Tensor a, Tensor b, "

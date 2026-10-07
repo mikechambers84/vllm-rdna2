@@ -1056,6 +1056,42 @@ def qsa_sparse_attention_rdna2(
     return out
 
 
+def qsa_sparse_decode_rdna2(
+    q: torch.Tensor,
+    k_cache: torch.Tensor,
+    v_cache: torch.Tensor,
+    logical_indices: torch.Tensor,
+    block_table: torch.Tensor,
+    token_to_req: torch.Tensor,
+    out: torch.Tensor,
+    k_scale: torch.Tensor | None = None,
+    v_scale: torch.Tensor | None = None,
+) -> torch.Tensor:
+    """QSA decode / spec-verify on gfx1030 (head 256): every query token
+    attends to its own selection with the RDNA2 split-KV decode tiles; BF16
+    runs through FP16, FP8 caches take their per-tensor scales."""
+    if q.dtype == torch.float16:
+        q16, out16 = q, out
+    else:
+        q16 = q.clamp(-65504.0, 65504.0).to(torch.float16)
+        out16 = torch.empty_like(q16)
+    ops.qsa_decode_rdna2(
+        out16,
+        q16,
+        k_cache,
+        v_cache,
+        logical_indices,
+        token_to_req,
+        block_table,
+        q.shape[2] ** -0.5,
+        k_scale,
+        v_scale,
+    )
+    if out16 is not out:
+        out.copy_(out16)
+    return out
+
+
 def qsa_store_cache_rows(
     cache: torch.Tensor,
     slot_mapping: torch.Tensor,

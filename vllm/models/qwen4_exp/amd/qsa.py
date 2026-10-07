@@ -83,6 +83,19 @@ def _use_rdna2_qsa(
     )
 
 
+def _use_rdna2_qsa_decode(query: torch.Tensor, key_cache: torch.Tensor) -> bool:
+    if not current_platform.is_rocm():
+        return False
+    from vllm.platforms.rocm import on_gfx10
+
+    return (
+        on_gfx10()
+        and hasattr(torch.ops._rocm_C, "qsa_decode_rdna2")
+        and query.shape[2] == 256
+        and query.shape[1] // key_cache.shape[2] <= 16
+    )
+
+
 class Qwen4ExpQSAMetadataBuilder(FlashAttentionMetadataBuilder):
     """Flash metadata supporting uniform decode and target-verify graphs."""
 
@@ -252,6 +265,22 @@ class Qwen4ExpQSAFlashAttentionImpl(FlashAttentionImpl):
                 attn_metadata.query_start_loc,
                 attn_metadata.seq_lens,
                 layer.indexer.compress_ratio,
+                output[:num_tokens],
+                k_scale,
+                v_scale,
+            )
+            return output
+
+        if _use_rdna2_qsa_decode(query, key_cache):
+            from .ops.qsa import qsa_sparse_decode_rdna2
+
+            qsa_sparse_decode_rdna2(
+                query[:num_tokens],
+                key_cache,
+                value_cache,
+                logical_indices,
+                attn_metadata.block_table,
+                token_to_req,
                 output[:num_tokens],
                 k_scale,
                 v_scale,

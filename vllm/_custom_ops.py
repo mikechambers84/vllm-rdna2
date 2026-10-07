@@ -2567,6 +2567,27 @@ def qsa_attention_rdna2(
     )
 
 
+def qsa_decode_rdna2(
+    out: torch.Tensor,
+    q: torch.Tensor,
+    k_cache: torch.Tensor,
+    v_cache: torch.Tensor,
+    sel: torch.Tensor,
+    tok2req: torch.Tensor,
+    block_table: torch.Tensor,
+    scale: float,
+    k_scale: torch.Tensor | None = None,
+    v_scale: torch.Tensor | None = None,
+) -> None:
+    """RDNA2 QSA decode / spec-verify (head 256, fp16 ``q`` and ``out``):
+    query token t attends to its selection ``sel[t]`` of positions (-1: none)
+    in request ``tok2req[t]`` of the paged caches, split over segments of the
+    selection and merged into ``out``."""
+    torch.ops._rocm_C.qsa_decode_rdna2(
+        out, q, k_cache, v_cache, sel, tok2req, block_table, scale, k_scale, v_scale
+    )
+
+
 def unified_attention_rdna2(
     out: torch.Tensor,
     q: torch.Tensor,
