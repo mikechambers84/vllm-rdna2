@@ -747,10 +747,11 @@ __global__ void __launch_bounds__(THREADS) qsa_decode_rdna2_kernel(
     float* __restrict__ segm_max, float* __restrict__ segm_sum,
     const int* __restrict__ sel, const long sel_st, const int W,
     const int* __restrict__ tok2req, const int* __restrict__ block_table,
-    const long bt_stride, const int bt_w, const int G, const int HQ,
-    const int block_size, const long q_st, const long q_sh, const long k_sb,
-    const long k_st, const long k_sh, const long v_sb, const long v_st,
-    const long v_sh, const int nseg, const int tps, const float scale,
+    const long bt_stride, const int bt_w, const int num_reqs,
+    const int num_blocks, const int G, const int HQ, const int block_size,
+    const long q_st, const long q_sh, const long k_sb, const long k_st,
+    const long k_sh, const long v_sb, const long v_st, const long v_sh,
+    const int nseg, const int tps, const float scale,
     const float* __restrict__ k_scale, const float* __restrict__ v_scale) {
   constexpr float LOG2E = 1.4426950408889634f;
   constexpr int D = 256, D8 = D / 8, TK = QD_TK;
@@ -772,7 +773,11 @@ __global__ void __launch_bounds__(THREADS) qsa_decode_rdna2_kernel(
   const int tiles = (W + TK - 1) / TK;
   const int tile0 = seg * tps, tile1 = min(tile0 + tps, tiles);
   if (tile0 >= tiles) return;
-  const int req = tok2req[t];
+  // Rows of padded or stale tokens (e.g. MTP drafts reusing step-0
+  // selections) may name requests, positions or pages outside the block
+  // table and the cache: those entries are masked, never read.
+  int req = tok2req[t];
+  if (req >= num_reqs) req = -1;
   const int* srow = sel + t * sel_st;
   const int* bt = block_table + (long)max(req, 0) * bt_stride;
   const float scale_log2e = scale * kv_scale<KV>(k_scale) * LOG2E;
@@ -791,8 +796,9 @@ __global__ void __launch_bounds__(THREADS) qsa_decode_rdna2_kernel(
   };
   long nk = -1, nv = -1;
   auto resolve = [&](int tok) {
-    const bool ok = req >= 0 && tok >= 0 && tok / block_size < bt_w;
-    const long page = ok ? bt[tok / block_size] : 0;
+    bool ok = req >= 0 && tok >= 0 && tok / block_size < bt_w;
+    const int page = ok ? bt[tok / block_size] : -1;
+    ok = ok && page >= 0 && page < num_blocks;
     nk = ok ? page * k_sb + tok % block_size * k_st + kvh * k_sh : -1;
     nv = ok ? page * v_sb + tok % block_size * v_st + kvh * v_sh : -1;
   };
@@ -1426,9 +1432,10 @@ template <int KV, int HS>
 __global__ void qsa_decode_rdna2_kernel(
     const __half*, const void*, const void*, float*, float*, float*, const int*,
     const long, const int, const int*, const int*, const long, const int,
-    const int, const int, const int, const long, const long, const long,
-    const long, const long, const long, const long, const long, const int,
-    const int, const float, const float*, const float*) {}
+    const int, const int, const int, const int, const int, const long,
+    const long, const long, const long, const long, const long, const long,
+    const long, const int, const int, const float, const float*, const float*) {
+}
 
 __global__ void qsa_decode_merge_kernel(const float*, const float*,
                                         const float*, __half*, const long,
@@ -1857,7 +1864,8 @@ void qsa_decode_rdna2(torch::Tensor& out, const torch::Tensor& q,
         segm_out.data_ptr<float>(), segm_max.data_ptr<float>(),
         segm_sum.data_ptr<float>(), sel.data_ptr<int>(), sel.stride(0), W,
         tok2req.data_ptr<int>(), block_table.data_ptr<int>(),
-        block_table.stride(0), (int)block_table.size(1), HQ / HKV, HQ,
+        block_table.stride(0), (int)block_table.size(1),
+        (int)block_table.size(0), (int)k_cache.size(0), HQ / HKV, HQ,
         k_cache.size(1), q.stride(0), q.stride(1), k_cache.stride(0),
         k_cache.stride(1), k_cache.stride(2), v_cache.stride(0),
         v_cache.stride(1), v_cache.stride(2), nseg, tps, (float)scale,

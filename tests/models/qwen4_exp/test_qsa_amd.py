@@ -407,6 +407,50 @@ def test_qsa_sparse_attention_rdna2_matches_reference(
     torch.testing.assert_close(decode, expected, rtol=2e-2, atol=2e-2)
 
 
+@pytest.mark.skipif(not _on_gfx10(), reason="RDNA2 QSA kernels need gfx10")
+def test_qsa_decode_rdna2_masks_invalid_entries() -> None:
+    """Rows of padded or stale tokens (MTP drafts reuse step-0 selections)
+    may name requests past the block table, positions past its width or
+    pages that are unset or past the cache: the gfx1030 decode kernel must
+    mask those entries (never read them) and give the other entries' result."""
+    torch.manual_seed(7)
+    head_dim, page_size, num_requests, pages = 256, 64, 2, 64
+    num_blocks = num_requests * pages
+    q = torch.randn(3, 24, head_dim, device="cuda", dtype=torch.float16)
+    kv_cache = torch.randn(
+        num_blocks, page_size, 2, 2 * head_dim, device="cuda", dtype=torch.float16
+    )
+    k_cache, v_cache = kv_cache.split(head_dim, dim=-1)
+    block_table = (
+        torch.randperm(num_blocks, device="cuda")
+        .reshape(num_requests, pages)
+        .to(torch.int32)
+    )
+    block_table[0, 3] = -1
+    block_table[0, 5] = num_blocks + 100
+    logical = torch.randint(0, pages * page_size, (3, 600), device="cuda")
+    logical[0, :40] = pages * page_size + 7  # past the block table's width
+    logical[0, 40:80] = 3 * page_size + 1  # unset page
+    logical[0, 80:120] = 5 * page_size + 2  # page past the cache
+    logical[:, -20:] = -1
+    logical = logical.to(torch.int32)
+    token_to_req = torch.tensor([0, num_requests + 3, 1], device="cuda").to(torch.int32)
+
+    out = qsa_ops.qsa_sparse_decode_rdna2(
+        q, k_cache, v_cache, logical, block_table, token_to_req, torch.empty_like(q)
+    )
+
+    valid = logical.clone()
+    bad_page = (logical[0] // page_size == 3) | (logical[0] // page_size == 5)
+    valid[0, :40] = -1
+    valid[0][bad_page] = -1
+    valid[1] = -1
+    expected = _qsa_sparse_paged_attention_reference(
+        q, k_cache, v_cache, valid, block_table, token_to_req, head_dim**-0.5
+    )
+    torch.testing.assert_close(out, expected, rtol=2e-2, atol=2e-2)
+
+
 @requires_qsa_kernels
 @pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16])
 def test_qsa_fp8_kv_matches_reference(dtype: torch.dtype) -> None:
