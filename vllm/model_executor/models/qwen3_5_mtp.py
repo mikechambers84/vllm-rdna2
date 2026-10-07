@@ -56,6 +56,32 @@ from .utils import (
 logger = init_logger(__name__)
 
 
+def compute_draft_logits(
+    lm_head: nn.Module, logits_processor: LogitsProcessor, hidden_states: torch.Tensor
+) -> torch.Tensor | None:
+    """An MTP drafter's logits; with VLLM_MTP_DRAFT_VOCAB_SIZE (TP=1) only the
+    first that many rows of lm_head are read and the other tokens get -inf,
+    i.e. zero draft probability."""
+    draft_vocab = envs.VLLM_MTP_DRAFT_VOCAB_SIZE
+    if not (0 < draft_vocab < logits_processor.org_vocab_size and lm_head.tp_size == 1):
+        return logits_processor(lm_head, hidden_states)
+    if hasattr(lm_head, "kmajor_weight"):  # gfx1030 K-major lm_head
+        from vllm.model_executor.kernels.linear.rdna2_w8a16 import (
+            apply_rdna2_kmajor,
+        )
+
+        prefix = apply_rdna2_kmajor(lm_head, hidden_states, None, draft_vocab)
+    else:
+        prefix = dispatch_unquantized_gemm()(
+            lm_head, hidden_states, lm_head.weight[:draft_vocab]
+        )
+    logits = prefix.new_full(
+        (hidden_states.shape[0], logits_processor.org_vocab_size), float("-inf")
+    )
+    logits[:, :draft_vocab] = prefix
+    return logits
+
+
 def _vocab_layers_device():
     """With one pipeline stage the proposer replaces the drafter's embedding
     and lm_head with the target model's, so build them on the meta device: two
@@ -310,35 +336,7 @@ class Qwen3_5MTP(LocalArgmaxMixin, nn.Module, SupportsMultiModal, SupportsPP):
         hidden_states: torch.Tensor,
         spec_step_idx: int = 0,
     ) -> torch.Tensor | None:
-        draft_vocab = envs.VLLM_MTP_DRAFT_VOCAB_SIZE
-        if (
-            0 < draft_vocab < self.logits_processor.org_vocab_size
-            and self.lm_head.tp_size == 1
-        ):
-            return self._compute_prefix_logits(hidden_states, draft_vocab)
-        return self.logits_processor(self.lm_head, hidden_states)
-
-    def _compute_prefix_logits(
-        self, hidden_states: torch.Tensor, draft_vocab: int
-    ) -> torch.Tensor:
-        # Only the first draft_vocab rows of lm_head are read; the other tokens
-        # get -inf, i.e. zero draft probability.
-        if hasattr(self.lm_head, "kmajor_weight"):  # gfx1030 K-major lm_head
-            from vllm.model_executor.kernels.linear.rdna2_w8a16 import (
-                apply_rdna2_kmajor,
-            )
-
-            prefix = apply_rdna2_kmajor(self.lm_head, hidden_states, None, draft_vocab)
-        else:
-            prefix = dispatch_unquantized_gemm()(
-                self.lm_head, hidden_states, self.lm_head.weight[:draft_vocab]
-            )
-        logits = prefix.new_full(
-            (hidden_states.shape[0], self.logits_processor.org_vocab_size),
-            float("-inf"),
-        )
-        logits[:, :draft_vocab] = prefix
-        return logits
+        return compute_draft_logits(self.lm_head, self.logits_processor, hidden_states)
 
     def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
         def remap_weight_names(weights):

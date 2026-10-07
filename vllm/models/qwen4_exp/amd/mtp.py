@@ -36,6 +36,7 @@ from vllm.model_executor.layers.vocab_parallel_embedding import (
 from vllm.model_executor.model_loader.utils import configure_quant_config
 from vllm.model_executor.models.interfaces import SupportsPP
 from vllm.model_executor.models.qwen3_5 import Qwen3_5Model
+from vllm.model_executor.models.qwen3_5_mtp import compute_draft_logits
 from vllm.model_executor.models.utils import (
     AutoWeightsLoader,
     PPMissingLayer,
@@ -446,7 +447,7 @@ class Qwen4ExpMTP(nn.Module, SupportsPP, Qwen4ExpMixtureOfExperts):
     def compute_logits(
         self, hidden_states: torch.Tensor, spec_step_idx: int = 0
     ) -> torch.Tensor | None:
-        return self.logits_processor(self.lm_head, hidden_states)
+        return compute_draft_logits(self.lm_head, self.logits_processor, hidden_states)
 
     def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
         def remap_weight_names():

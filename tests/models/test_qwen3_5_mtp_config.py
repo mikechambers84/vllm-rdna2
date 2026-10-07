@@ -124,10 +124,16 @@ def test_mtp_override_downloads_real_hf_hub_configs(
     assert cfg.n_predict == 1
 
 
-def test_mtp_draft_vocab_prefix_logits(monkeypatch: pytest.MonkeyPatch) -> None:
+@pytest.mark.parametrize("drafter", ["qwen3_5", "qwen4_exp"])
+def test_mtp_draft_vocab_prefix_logits(
+    monkeypatch: pytest.MonkeyPatch, drafter: str
+) -> None:
     """VLLM_MTP_DRAFT_VOCAB_SIZE keeps draft logits for the first N token ids
     and gives every other id -inf, so drafts only propose prefix ids."""
-    from vllm.model_executor.models.qwen3_5_mtp import Qwen3_5MTP
+    if drafter == "qwen3_5":
+        from vllm.model_executor.models.qwen3_5_mtp import Qwen3_5MTP as MTP
+    else:
+        from vllm.models.qwen4_exp.amd.mtp import Qwen4ExpMTP as MTP
 
     monkeypatch.setenv("VLLM_MTP_DRAFT_VOCAB_SIZE", "8")
     torch.manual_seed(0)
@@ -137,11 +143,8 @@ def test_mtp_draft_vocab_prefix_logits(monkeypatch: pytest.MonkeyPatch) -> None:
         lm_head=types.SimpleNamespace(weight=weight, tp_size=1),
         logits_processor=types.SimpleNamespace(org_vocab_size=32),
     )
-    model._compute_prefix_logits = types.MethodType(
-        Qwen3_5MTP._compute_prefix_logits, model
-    )
 
-    logits = Qwen3_5MTP.compute_logits(model, hidden)
+    logits = MTP.compute_logits(model, hidden)
 
     assert logits.shape == (3, 32)
     torch.testing.assert_close(logits[:, :8], hidden @ weight[:8].T)
