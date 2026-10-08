@@ -718,7 +718,424 @@ __global__ void __launch_bounds__(THREADS) decode_attention_rdna2_kernel(
   }
 }
 
+// QSA (Qwen4Exp sparse attention) prefill. Every query token attends to its own
+// selection: whole RATIO-token blocks plus the open group's causal tail, all
+// at or before its position. Consecutive tokens select mostly the same blocks
+// (the union of 5 is ~1.5x one selection), so tiles of BQ = 64 / G tokens run
+// the prefill kernel above over the union of their selections, each row
+// masked to its own blocks and position.
+//
+// qsa_union_rdna2_kernel: per tile, the ascending union of the blocks its
+// tokens selected and, per block, the mask of those tokens (bit r = tile token
+// r). Bitmaps of QU_CW words per token cover 32 * QU_CW blocks at a time.
+static constexpr int QU_MAXBQ = 16;
+static constexpr int QU_CW = 2 * THREADS;
+
+__global__ void __launch_bounds__(THREADS)
+    qsa_union_rdna2_kernel(const int* __restrict__ idx, const long idx_st,
+                           const int width, const int* __restrict__ cu_q,
+                           const int* __restrict__ seq_lens, const int num_seqs,
+                           const int BQ, const int ratio,
+                           int* __restrict__ ublk, uint16_t* __restrict__ umask,
+                           int* __restrict__ ucount, const int cap) {
+  __shared__ uint32_t bm[QU_MAXBQ][QU_CW];
+  __shared__ int scan[THREADS];
+  const int tid = threadIdx.x, bid = blockIdx.x;
+  int lo = 0, hi = num_seqs - 1;
+  while (lo < hi) {
+    const int mid = (lo + hi + 1) / 2;
+    if (cu_q[mid] / BQ + mid <= bid)
+      lo = mid;
+    else
+      hi = mid - 1;
+  }
+  const int q0 = cu_q[lo], qlen = cu_q[lo + 1] - q0;
+  const int t0 = (bid - (q0 / BQ + lo)) * BQ;
+  if (t0 >= qlen) {
+    if (tid == 0) ucount[bid] = 0;
+    return;
+  }
+  const int ntok = min(BQ, qlen - t0);
+  const int nblk = (seq_lens[lo] - qlen + t0 + ntok - 1) / ratio + 1;
+  int* out_b = ublk + (long)bid * cap;
+  uint16_t* out_m = umask + (long)bid * cap;
+  int total = 0;
+  for (int c0 = 0; c0 < nblk; c0 += 32 * QU_CW) {
+    for (int i = tid; i < ntok * QU_CW; i += THREADS)
+      bm[i / QU_CW][i % QU_CW] = 0;
+    __syncthreads();
+    for (int r = 0; r < ntok; r++) {
+      const int* row = idx + (long)(q0 + t0 + r) * idx_st;
+      for (int j = tid; j < width; j += THREADS) {
+        const int t = row[j];
+        const int b = t / ratio - c0;
+        if (t >= 0 && b >= 0 && b < 32 * QU_CW)
+          atomicOr(&bm[r][b >> 5], 1u << (b & 31));
+      }
+    }
+    __syncthreads();
+    uint32_t u[2];
+    int cnt = 0;
+  #pragma unroll
+    for (int k = 0; k < 2; k++) {
+      uint32_t x = 0;
+      for (int r = 0; r < ntok; r++) x |= bm[r][tid * 2 + k];
+      u[k] = x;
+      cnt += __popc(x);
+    }
+    scan[tid] = cnt;
+    __syncthreads();
+    for (int off = 1; off < THREADS; off <<= 1) {
+      const int v = tid >= off ? scan[tid - off] : 0;
+      __syncthreads();
+      scan[tid] += v;
+      __syncthreads();
+    }
+    int pos = total + scan[tid] - cnt;
+  #pragma unroll
+    for (int k = 0; k < 2; k++) {
+      const int w = tid * 2 + k;
+      for (uint32_t x = u[k]; x; x &= x - 1) {
+        const int bit = __ffs(x) - 1;
+        uint32_t m = 0;
+        for (int r = 0; r < ntok; r++) m |= ((bm[r][w] >> bit) & 1u) << r;
+        if (pos < cap) {
+          out_b[pos] = c0 + w * 32 + bit;
+          out_m[pos] = (uint16_t)m;
+        }
+        pos++;
+      }
+    }
+    total += scan[THREADS - 1];
+    __syncthreads();
+  }
+  if (tid == 0) ucount[bid] = min(total, cap);
+}
+
+// qsa_attention_rdna2_kernel: unified_attention_rdna2_kernel over a tile's
+// union blocks (key k of the tile is token ublk[k / ratio] * ratio + k %
+// ratio). A row sees a key when its token selected the key's block and the key
+// is at or before its position; rows can see no key of a whole 64-key tile,
+// so the running max is clamped as on the sliding-window path.
+template <int D, int DC, int KV>
+__global__ void __launch_bounds__(THREADS) qsa_attention_rdna2_kernel(
+    const __half* __restrict__ Q, const void* __restrict__ Kc,
+    const void* __restrict__ Vc, __half* __restrict__ O,
+    const int* __restrict__ cu_q, const int* __restrict__ seq_lens,
+    const int* __restrict__ block_table, const int* __restrict__ ublk,
+    const uint16_t* __restrict__ umask, const int* __restrict__ ucount,
+    const int cap, const int ratio, const int num_seqs, const int G,
+    const int BQ, const int block_size, const long bt_stride, const long q_st,
+    const long q_sh, const long k_sb, const long k_st, const long k_sh,
+    const long v_sb, const long v_st, const long v_sh, const long o_st,
+    const long o_sh, const float scale, const float* __restrict__ k_scale,
+    const float* __restrict__ v_scale) {
+  constexpr float LOG2E = 1.4426950408889634f;
+  const float scale_log2e = scale * kv_scale<KV>(k_scale) * LOG2E;
+  constexpr int D2 = D / 2;
+  constexpr int TN = D / 16;
+  constexpr int Q_ITEMS = BM * (D / 8) / THREADS;
+  constexpr int KS = D / DC;
+  constexpr int KL = DC / 8;
+  constexpr int K_ITEMS = BN * KL / THREADS;
+  constexpr int K_STAGE = (DC / 2) * BN;
+  constexpr int VS = BN / VC;
+  constexpr int V_TOTAL = (VC / 2) * (D / 8);
+  constexpr int V_ITEMS = (V_TOTAL + THREADS - 1) / THREADS;
+  constexpr int V_STAGE = (VC / 2) * D;
+  constexpr int U_STAGE = K_STAGE > V_STAGE ? K_STAGE : V_STAGE;
+  static_assert(KS % 2 == 0 && K_ITEMS * THREADS == BN * KL, "K staging");
+  __shared__ __align__(16) uint32_t sQ[D2][BM];
+  __shared__ __align__(16) uint32_t sU[2][U_STAGE];
+  __shared__ __align__(16) uint32_t sP[BN / 2][BM];
+
+  const int tid = threadIdx.x, tx = tid % 16, ty = tid / 16;
+  const int kvh = blockIdx.y;
+  const int bid = gridDim.x - 1 - blockIdx.x;  // later (longer) tiles first
+  int lo = 0, hi = num_seqs - 1;
+  while (lo < hi) {
+    const int mid = (lo + hi + 1) / 2;
+    if (cu_q[mid] / BQ + mid <= bid)
+      lo = mid;
+    else
+      hi = mid - 1;
+  }
+  const int s = lo;
+  const int q0 = cu_q[s], qlen = cu_q[s + 1] - q0;
+  const int t0 = (bid - (q0 / BQ + s)) * BQ;
+  if (t0 >= qlen) return;
+  const int ctx = seq_lens[s] - qlen;
+  const int ntok = min(BQ, qlen - t0);
+  const int key_end = ucount[bid] * ratio;
+  const int* bt = block_table + s * bt_stride;
+  const int* ub = ublk + (long)bid * cap;
+  const uint16_t* um = umask + (long)bid * cap;
+
+  #pragma unroll
+  for (int it = 0; it < Q_ITEMS; it++) {
+    const int idx = tid + it * THREADS;
+    const int r = idx % BM, c = idx / BM;
+    const int tq = r / G, g = r % G;
+    uint4 v = make_uint4(0, 0, 0, 0);
+    if (tq < ntok)
+      v = *reinterpret_cast<const uint4*>(Q + (q0 + t0 + tq) * q_st +
+                                          (kvh * G + g) * q_sh + c * 8);
+    sQ[c * 4 + 0][r] = v.x;
+    sQ[c * 4 + 1][r] = v.y;
+    sQ[c * 4 + 2][r] = v.z;
+    sQ[c * 4 + 3][r] = v.w;
+  }
+
+  // This thread's rows: tile token rt[i] at position lim[i].
+  int lim[4], rt[4];
+  #pragma unroll
+  for (int i = 0; i < 4; i++) {
+    rt[i] = min((ty * 4 + i) / G, ntok - 1);
+    lim[i] = ctx + t0 + rt[i];
+  }
+
+  float acc[4][TN];
+  #pragma unroll
+  for (int i = 0; i < 4; i++)
+  #pragma unroll
+    for (int j = 0; j < TN; j++) acc[i][j] = 0.f;
+  float m_i[4], l_i[4];
+  #pragma unroll
+  for (int i = 0; i < 4; i++) {
+    m_i[i] = -INFINITY;
+    l_i[i] = 0.f;
+  }
+
+  auto token = [&](int key) { return ub[key / ratio] * ratio + key % ratio; };
+  auto k_off = [&](int t) -> long {
+    return bt[t / block_size] * k_sb + t % block_size * k_st + kvh * k_sh;
+  };
+  auto v_off = [&](int t) -> long {
+    return bt[t / block_size] * v_sb + t % block_size * v_st + kvh * v_sh;
+  };
+
+  long krow[K_ITEMS];
+  KvRaw<KV> kr[K_ITEMS];
+  auto kaddr = [&](int kt) {
+  #pragma unroll
+    for (int it = 0; it < K_ITEMS; it++) {
+      const int key = kt + (tid + it * THREADS) / KL;
+      krow[it] = key < key_end ? k_off(token(key)) : -1;
+    }
+  };
+  auto kload = [&](int dc) {
+  #pragma unroll
+    for (int it = 0; it < K_ITEMS; it++) {
+      const int part = (tid + it * THREADS) % KL;
+      kr[it] = krow[it] >= 0 ? kv_load<KV>(Kc, krow[it] + dc * DC + part * 8)
+                             : KvRaw<KV>{};
+    }
+  };
+  auto kstore = [&](int buf) {
+  #pragma unroll
+    for (int it = 0; it < K_ITEMS; it++) {
+      const int idx = tid + it * THREADS;
+      const int key = idx / KL, part = idx % KL;
+      uint32_t* d = &sU[buf][part * 4 * BN + (key ^ (part * (32 / KL)))];
+      const uint4 kv = kv_widen<KV>(kr[it]);
+      d[0] = kv.x;
+      d[BN] = kv.y;
+      d[2 * BN] = kv.z;
+      d[3 * BN] = kv.w;
+    }
+  };
+  KvRaw<KV> va[V_ITEMS], vb[V_ITEMS];
+  auto vload = [&](int kt, int vc) {
+  #pragma unroll
+    for (int it = 0; it < V_ITEMS; it++) {
+      const int idx = tid + it * THREADS;
+      const int kp = idx / (D / 8), c = idx % (D / 8);
+      const int k0 = kt + vc * VC + kp * 2;
+      va[it] = idx < V_TOTAL && k0 < key_end
+                   ? kv_load<KV>(Vc, v_off(token(k0)) + c * 8)
+                   : KvRaw<KV>{};
+      vb[it] = idx < V_TOTAL && k0 + 1 < key_end
+                   ? kv_load<KV>(Vc, v_off(token(k0 + 1)) + c * 8)
+                   : KvRaw<KV>{};
+    }
+  };
+  auto vstore = [&](int buf) {
+  #pragma unroll
+    for (int it = 0; it < V_ITEMS; it++) {
+      const int idx = tid + it * THREADS;
+      if (idx >= V_TOTAL) continue;
+      const int kp = idx / (D / 8), c = idx % (D / 8);
+      const uint4 av = kv_widen<KV>(va[it]), bv = kv_widen<KV>(vb[it]);
+      const uint32_t* a = reinterpret_cast<const uint32_t*>(&av);
+      const uint32_t* b = reinterpret_cast<const uint32_t*>(&bv);
+      uint32_t w[8];
+  #pragma unroll
+      for (int e = 0; e < 4; e++) {
+        w[2 * e] = (a[e] & 0xFFFFu) | (b[e] << 16);
+        w[2 * e + 1] = (a[e] >> 16) | (b[e] & 0xFFFF0000u);
+      }
+      uint32_t* d = &sU[buf][kp * D + c * 8];
+      *reinterpret_cast<uint4*>(d) = make_uint4(w[0], w[1], w[2], w[3]);
+      *reinterpret_cast<uint4*>(d + 4) = make_uint4(w[4], w[5], w[6], w[7]);
+    }
+  };
+
+  kaddr(0);
+  kload(0);
+  for (int kt = 0; kt < key_end; kt += BN) {
+    // This thread's 4 keys: tokens and the mask of tile tokens that see them.
+    int ktok[4];
+    uint32_t kmask[4];
+  #pragma unroll
+    for (int j = 0; j < 4; j++) {
+      const int key = kt + tx * 4 + j;
+      const bool ok = key < key_end;
+      ktok[j] = ok ? token(key) : 0;
+      kmask[j] = ok ? um[key / ratio] : 0u;
+    }
+    kstore(0);
+    __syncthreads();
+    float sacc[4][4];
+  #pragma unroll
+    for (int i = 0; i < 4; i++)
+  #pragma unroll
+      for (int j = 0; j < 4; j++) sacc[i][j] = 0.f;
+    for (int dc = 0; dc < KS; dc++) {
+      const int cur = dc & 1;
+      if (dc + 1 < KS)
+        kload(dc + 1);
+      else
+        vload(kt, 0);
+  #pragma unroll 4
+      for (int k2 = 0; k2 < DC / 2; k2++) {
+        const int sw = ((k2 >> 2) % KL) * (32 / KL);
+        const uint4 qa =
+            *reinterpret_cast<const uint4*>(&sQ[dc * (DC / 2) + k2][ty * 4]);
+        const uint4 kb = *reinterpret_cast<const uint4*>(
+            &sU[cur][k2 * BN + ((tx * 4) ^ sw)]);
+        const half2 a[4] = {as_h2(qa.x), as_h2(qa.y), as_h2(qa.z), as_h2(qa.w)};
+        const half2 b[4] = {as_h2(kb.x), as_h2(kb.y), as_h2(kb.z), as_h2(kb.w)};
+  #pragma unroll
+        for (int i = 0; i < 4; i++)
+  #pragma unroll
+          for (int j = 0; j < 4; j++)
+            sacc[i][j] = __builtin_amdgcn_fdot2(a[i], b[j], sacc[i][j], false);
+      }
+      if (dc + 1 < KS) {
+        kstore(cur ^ 1);
+        __syncthreads();
+      }
+    }
+
+    float alpha[4];
+    uint32_t pw[4][2];
+  #pragma unroll
+    for (int i = 0; i < 4; i++) {
+      float sv[4];
+      float mx = -INFINITY;
+  #pragma unroll
+      for (int j = 0; j < 4; j++) {
+        const bool seen = ((kmask[j] >> rt[i]) & 1u) && ktok[j] <= lim[i];
+        sv[j] = seen ? sacc[i][j] * scale_log2e : -INFINITY;
+        mx = fmaxf(mx, sv[j]);
+      }
+      mx = row16_max(mx);
+      const float m_new = fmaxf(fmaxf(m_i[i], mx), -1e30f);
+      alpha[i] = exp2f(m_i[i] - m_new);
+      m_i[i] = m_new;
+      float p[4], ps = 0.f;
+  #pragma unroll
+      for (int j = 0; j < 4; j++) {
+        p[j] = exp2f(sv[j] - m_new);
+        ps += p[j];
+      }
+      l_i[i] = l_i[i] * alpha[i] + ps;
+      const half2 h0 = __floats2half2_rn(p[0], p[1]);
+      const half2 h1 = __floats2half2_rn(p[2], p[3]);
+      pw[i][0] = *reinterpret_cast<const uint32_t*>(&h0);
+      pw[i][1] = *reinterpret_cast<const uint32_t*>(&h1);
+    }
+  #pragma unroll
+    for (int i = 0; i < 4; i++)
+  #pragma unroll
+      for (int j = 0; j < TN; j++) acc[i][j] *= alpha[i];
+    *reinterpret_cast<uint4*>(&sP[tx * 2][(ty ^ tx) * 4]) =
+        make_uint4(pw[0][0], pw[1][0], pw[2][0], pw[3][0]);
+    *reinterpret_cast<uint4*>(&sP[tx * 2 + 1][(ty ^ tx) * 4]) =
+        make_uint4(pw[0][1], pw[1][1], pw[2][1], pw[3][1]);
+    vstore(0);
+    __syncthreads();
+
+    for (int vc = 0; vc < VS; vc++) {
+      const int cur = vc & 1;
+      if (vc + 1 < VS) {
+        vload(kt, vc + 1);
+      } else if (kt + BN < key_end) {
+        kaddr(kt + BN);
+        kload(0);
+      }
+  #pragma unroll 2
+      for (int k2 = 0; k2 < VC / 2; k2++) {
+        const int pk = vc * (VC / 2) + k2;
+        const uint4 pa = *reinterpret_cast<const uint4*>(
+            &sP[pk][(ty ^ ((pk >> 1) & 15)) * 4]);
+        const half2 a[4] = {as_h2(pa.x), as_h2(pa.y), as_h2(pa.z), as_h2(pa.w)};
+  #pragma unroll
+        for (int j = 0; j < TN; j += 4) {
+          const uint4 vv = *reinterpret_cast<const uint4*>(
+              &sU[cur][k2 * D + j * 16 + tx * 4]);
+          const half2 b[4] = {as_h2(vv.x), as_h2(vv.y), as_h2(vv.z),
+                              as_h2(vv.w)};
+  #pragma unroll
+          for (int i = 0; i < 4; i++)
+  #pragma unroll
+            for (int jj = 0; jj < 4; jj++)
+              acc[i][j + jj] =
+                  __builtin_amdgcn_fdot2(a[i], b[jj], acc[i][j + jj], false);
+        }
+      }
+      if (vc + 1 < VS) {
+        vstore(cur ^ 1);
+        __syncthreads();
+      }
+    }
+  }
+
+  #pragma unroll
+  for (int i = 0; i < 4; i++) {
+    const int r = ty * 4 + i;
+    const int tq = r / G, g = r % G;
+    const float l = row16_sum(l_i[i]);
+    if (tq >= ntok) continue;
+    const float inv = l > 0.f ? kv_scale<KV>(v_scale) / l : 0.f;
+    __half* o = O + (q0 + t0 + tq) * o_st + (kvh * G + g) * o_sh;
+  #pragma unroll
+    for (int j = 0; j < TN; j += 4) {
+      const half2 h0 = __floats2half2_rn(acc[i][j] * inv, acc[i][j + 1] * inv);
+      const half2 h1 =
+          __floats2half2_rn(acc[i][j + 2] * inv, acc[i][j + 3] * inv);
+      *reinterpret_cast<uint2*>(o + j * 16 + tx * 4) =
+          make_uint2(*reinterpret_cast<const uint32_t*>(&h0),
+                     *reinterpret_cast<const uint32_t*>(&h1));
+    }
+  }
+}
+
 #else  // non-RDNA2 device pass: empty stub for symbol parity.
+
+__global__ void qsa_union_rdna2_kernel(const int*, const long, const int,
+                                       const int*, const int*, const int,
+                                       const int, const int, int*, uint16_t*,
+                                       int*, const int) {}
+
+template <int D, int DC, int KV>
+__global__ void qsa_attention_rdna2_kernel(
+    const __half*, const void*, const void*, __half*, const int*, const int*,
+    const int*, const int*, const uint16_t*, const int*, const int, const int,
+    const int, const int, const int, const int, const long, const long,
+    const long, const long, const long, const long, const long, const long,
+    const long, const long, const long, const float, const float*,
+    const float*) {}
 
 template <int D, int DC, bool EXT, int KV>
 __global__ void unified_attention_rdna2_kernel(
@@ -975,4 +1392,128 @@ void decode_attention_rdna2(
   }
 #undef VLLM_DECODE_RDNA2_BY_KV
 #undef VLLM_DECODE_RDNA2_BY_EXT
+}
+
+// QSA (Qwen4Exp sparse attention) prefill, step 1: for tiles of tile_tokens
+// consecutive query tokens of one sequence (cu_seqlens_q, seq_lens as for
+// unified_attention_rdna2), the ascending union of the ratio-token blocks of
+// the tokens' selections (indices [num_tokens, width] int32 request-relative
+// tokens, -1 padded) into ublk [tiles, cap] int32 with the masks of the tile
+// tokens selecting each block in umask [tiles, cap] int16 (bit r = token r)
+// and the counts in ucount [tiles]; tiles >= num_tokens / tile_tokens +
+// num_seqs, cap >= tile_tokens * (blocks one selection can touch).
+void qsa_union_rdna2(const torch::Tensor& indices,
+                     const torch::Tensor& cu_seqlens_q,
+                     const torch::Tensor& seq_lens, int64_t tile_tokens,
+                     int64_t ratio, torch::Tensor& ublk, torch::Tensor& umask,
+                     torch::Tensor& ucount) {
+  using namespace vllm::attention_rdna2;
+  TORCH_CHECK(indices.dtype() == torch::kInt32 && indices.dim() == 2 &&
+                  indices.stride(1) == 1,
+              "qsa_union_rdna2 needs int32 indices [tokens, width]");
+  TORCH_CHECK(cu_seqlens_q.dtype() == torch::kInt32 &&
+                  seq_lens.dtype() == torch::kInt32 &&
+                  cu_seqlens_q.is_contiguous() && seq_lens.is_contiguous(),
+              "qsa_union_rdna2 needs contiguous int32 metadata");
+  TORCH_CHECK(tile_tokens >= 1 && tile_tokens <= QU_MAXBQ && ratio >= 1,
+              "qsa_union_rdna2: 1 <= tile_tokens <= 16, ratio >= 1");
+  const int num_seqs = cu_seqlens_q.size(0) - 1;
+  const int tiles = indices.size(0) / tile_tokens + num_seqs;
+  TORCH_CHECK(ublk.dtype() == torch::kInt32 && umask.dtype() == torch::kInt16 &&
+                  ucount.dtype() == torch::kInt32 && ublk.is_contiguous() &&
+                  umask.is_contiguous() && ublk.sizes() == umask.sizes() &&
+                  ublk.size(0) >= tiles && ucount.numel() >= tiles,
+              "qsa_union_rdna2: output shapes");
+  if (num_seqs <= 0 || indices.size(0) == 0) return;
+  const at::cuda::OptionalCUDAGuard device_guard(device_of(indices));
+  qsa_union_rdna2_kernel<<<tiles, THREADS, 0,
+                           at::cuda::getCurrentCUDAStream()>>>(
+      indices.data_ptr<int>(), indices.stride(0), indices.size(1),
+      cu_seqlens_q.data_ptr<int>(), seq_lens.data_ptr<int>(), num_seqs,
+      tile_tokens, ratio, ublk.data_ptr<int>(),
+      reinterpret_cast<uint16_t*>(umask.data_ptr()), ucount.data_ptr<int>(),
+      ublk.size(1));
+}
+
+// QSA prefill, step 2: attention of fp16 q [num_tokens, num_q_heads, D] (D in
+// 128, 256) over the qsa_union_rdna2 tiles, against caches laid out as for
+// unified_attention_rdna2, into out (fp16, same shape as q).
+void qsa_attention_rdna2(
+    torch::Tensor& out, const torch::Tensor& q, const torch::Tensor& k_cache,
+    const torch::Tensor& v_cache, const torch::Tensor& cu_seqlens_q,
+    const torch::Tensor& seq_lens, const torch::Tensor& block_table,
+    const torch::Tensor& ublk, const torch::Tensor& umask,
+    const torch::Tensor& ucount, int64_t tile_tokens, int64_t ratio,
+    double scale, const std::optional<torch::Tensor>& k_scale,
+    const std::optional<torch::Tensor>& v_scale) {
+  using namespace vllm::attention_rdna2;
+  TORCH_CHECK(q.dtype() == torch::kFloat16 && out.dtype() == torch::kFloat16,
+              "qsa_attention_rdna2 needs fp16 queries and output");
+  const int kv =
+      check_kv_dtype("qsa_attention_rdna2", k_cache, v_cache, k_scale, v_scale);
+  TORCH_CHECK(q.dim() == 3 && k_cache.dim() == 4 && v_cache.dim() == 4 &&
+                  out.sizes() == q.sizes(),
+              "qsa_attention_rdna2 needs q/out [tokens, heads, D] and caches "
+              "[blocks, block_size, kv_heads, D]");
+  const int D = q.size(2), HQ = q.size(1), HKV = k_cache.size(2);
+  TORCH_CHECK((D == 128 || D == 256) && k_cache.size(3) == D &&
+                  v_cache.sizes() == k_cache.sizes() && HQ % HKV == 0,
+              "qsa_attention_rdna2 supports head sizes 128 and 256");
+  for (const torch::Tensor* t :
+       {&q, &k_cache, &v_cache, static_cast<const torch::Tensor*>(&out)}) {
+    TORCH_CHECK(t->stride(-1) == 1 &&
+                    reinterpret_cast<uintptr_t>(t->data_ptr()) % 16 == 0,
+                "qsa_attention_rdna2 needs 16-byte aligned, contiguous heads");
+    for (int d = 0; d < t->dim() - 1; d++)
+      TORCH_CHECK(t->stride(d) % 8 == 0,
+                  "qsa_attention_rdna2 needs strides that keep heads 16-byte "
+                  "aligned");
+  }
+  TORCH_CHECK(cu_seqlens_q.dtype() == torch::kInt32 &&
+                  seq_lens.dtype() == torch::kInt32 &&
+                  block_table.dtype() == torch::kInt32 &&
+                  cu_seqlens_q.is_contiguous() && seq_lens.is_contiguous() &&
+                  block_table.stride(1) == 1,
+              "qsa_attention_rdna2 needs int32 metadata with contiguous "
+              "block-table rows");
+  const int G = HQ / HKV;
+  TORCH_CHECK(tile_tokens >= 1 && tile_tokens <= QU_MAXBQ &&
+                  tile_tokens * G <= BM && ratio >= 1,
+              "qsa_attention_rdna2: tile_tokens * G must fit 64 rows");
+  const int num_seqs = cu_seqlens_q.size(0) - 1;
+  if (num_seqs <= 0 || q.size(0) == 0) return;
+  const int tiles = q.size(0) / tile_tokens + num_seqs;
+  TORCH_CHECK(ublk.dtype() == torch::kInt32 && umask.dtype() == torch::kInt16 &&
+                  ucount.dtype() == torch::kInt32 && ublk.size(0) >= tiles &&
+                  ucount.numel() >= tiles && ublk.sizes() == umask.sizes(),
+              "qsa_attention_rdna2: union shapes");
+  const at::cuda::OptionalCUDAGuard device_guard(device_of(q));
+  const dim3 grid(tiles, HKV);
+  auto launch = [&](auto kernel) {
+    kernel<<<grid, THREADS, 0, at::cuda::getCurrentCUDAStream()>>>(
+        (const __half*)q.data_ptr(), k_cache.data_ptr(), v_cache.data_ptr(),
+        (__half*)out.data_ptr(), cu_seqlens_q.data_ptr<int>(),
+        seq_lens.data_ptr<int>(), block_table.data_ptr<int>(),
+        ublk.data_ptr<int>(),
+        reinterpret_cast<const uint16_t*>(umask.data_ptr()),
+        ucount.data_ptr<int>(), ublk.size(1), ratio, num_seqs, G, tile_tokens,
+        k_cache.size(1), block_table.stride(0), q.stride(0), q.stride(1),
+        k_cache.stride(0), k_cache.stride(1), k_cache.stride(2),
+        v_cache.stride(0), v_cache.stride(1), v_cache.stride(2), out.stride(0),
+        out.stride(1), (float)scale, scale_ptr(k_scale), scale_ptr(v_scale));
+  };
+#define VLLM_QSA_RDNA2_BY_KV(HD)                         \
+  if (kv == KV_FP8) {                                    \
+    launch(qsa_attention_rdna2_kernel<HD, 64, KV_FP8>);  \
+  } else if (kv == KV_BF16) {                            \
+    launch(qsa_attention_rdna2_kernel<HD, 64, KV_BF16>); \
+  } else {                                               \
+    launch(qsa_attention_rdna2_kernel<HD, 64, KV_FP16>); \
+  }
+  if (D == 256) {
+    VLLM_QSA_RDNA2_BY_KV(256);
+  } else {
+    VLLM_QSA_RDNA2_BY_KV(128);
+  }
+#undef VLLM_QSA_RDNA2_BY_KV
 }

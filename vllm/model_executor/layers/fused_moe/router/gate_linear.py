@@ -92,6 +92,9 @@ class GateLinear(ReplicatedLinear):
             return_bias=return_bias,
         )
         self.out_dtype = out_dtype
+        # Routing is precision-sensitive (and the tiers below read self.weight):
+        # the gfx1030 int8 / K-major storage opt-ins leave router weights alone.
+        self.keep_unquantized_weight = True
 
         # A quantized gate exposes no plain ``weight``, so every specialized
         # tier below is disabled and forward falls back to ReplicatedLinear.

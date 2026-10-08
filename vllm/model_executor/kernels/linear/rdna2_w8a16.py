@@ -3,8 +3,9 @@
 """K-major linear layers on gfx1030 (RDNA2): the weight layouts and the op
 shared by FP8 and W8A8 int8 checkpoints (scaled_mm/rdna2.py) and by the
 opt-in storage of unquantized linear layers and the lm_head, as int8
-weight-only (VLLM_ROCM_W8A16_UNQUANTIZED, VLLM_ROCM_W8A16_LM_HEAD) or as fp16
-(VLLM_ROCM_KMAJOR_UNQUANTIZED, lossless).
+weight-only (VLLM_ROCM_W8A16_UNQUANTIZED, VLLM_ROCM_W8A16_LM_HEAD; with
+VLLM_ROCM_W4A8_PREFILL prefill-sized batches quantize their activations per
+token and run W8A8) or as fp16 (VLLM_ROCM_KMAJOR_UNQUANTIZED, lossless).
 
 Checkpoints that quantize only part of a model (e.g. Qwen3.6-35B-A3B W4A16
 keeps its attention, GDN and shared-expert projections in fp16) spend much of
@@ -137,6 +138,7 @@ def _rdna2_w8_linear(
     bias: torch.Tensor | None,
     scale_a: torch.Tensor | None,
     out_dtype: torch.dtype | None,
+    act_quant_min_rows: int,
 ) -> torch.Tensor:
     x_2d = x.reshape(-1, x.shape[-1])
     if (
@@ -145,6 +147,10 @@ def _rdna2_w8_linear(
         or x_2d.data_ptr() % 16
     ):
         x_2d = x_2d.clone(memory_format=torch.contiguous_format)
+    if 0 < act_quant_min_rows <= x_2d.shape[0] and scale_a is None:
+        # Prefill-sized batches as W8A8: per-token int8 activations, v_dot4.
+        out_dtype = x_2d.dtype
+        x_2d, scale_a, _ = ops.scaled_int8_quant(x_2d)
     out = ops.gemm_w8_rdna2(
         x_2d,
         weight,
@@ -170,6 +176,7 @@ def _rdna2_w8_linear_fake(
     bias: torch.Tensor | None,
     scale_a: torch.Tensor | None,
     out_dtype: torch.dtype | None,
+    act_quant_min_rows: int,
 ) -> torch.Tensor:
     return x.new_empty((*x.shape[:-1], weight.shape[1]), dtype=out_dtype or x.dtype)
 
@@ -189,11 +196,22 @@ def rdna2_w8_linear(
     bias: torch.Tensor | None = None,
     scale_a: torch.Tensor | None = None,
     out_dtype: torch.dtype | None = None,
+    act_quant_min_rows: int = 0,
 ) -> torch.Tensor:
     """X @ W^T (+ bias) for K-major 8-bit weights, as ``gemm_w8_rdna2`` (int8
-    X with its scale_a and out_dtype: W8A8)."""
+    X with its scale_a and out_dtype: W8A8). With int8 weights, batches of at
+    least ``act_quant_min_rows`` (> 0) rows quantize X per token and run W8A8."""
     return torch.ops.vllm.rdna2_w8_linear(
-        x, weight, scale, block_scale, block_n, block_k, bias, scale_a, out_dtype
+        x,
+        weight,
+        scale,
+        block_scale,
+        block_n,
+        block_k,
+        bias,
+        scale_a,
+        out_dtype,
+        act_quant_min_rows,
     )
 
 
@@ -215,13 +233,20 @@ def apply_rdna2_kmajor(
             rows,
         )
         return out.to(torch.bfloat16)
-    if rows is None:
-        return rdna2_w8_linear(x, weight, scale, bias=bias)
-    # The kernel takes whole dwords of 4 output channels.
-    n = min(-(-rows // 4) * 4, weight.shape[1])
-    if bias is not None:
-        bias = bias[:n]
-    if scale is not None:
-        scale = scale[:n]
-    out = rdna2_w8_linear(x, weight[:, :n], scale, bias=bias)
-    return out[..., :rows]
+    if rows is not None:
+        # The kernel takes whole dwords of 4 output channels.
+        n = min(-(-rows // 4) * 4, weight.shape[1])
+        weight = weight[:, :n]
+        if bias is not None:
+            bias = bias[:n]
+        if scale is not None:
+            scale = scale[:n]
+    act_quant_min_rows = (
+        envs.VLLM_ROCM_W4A8_MIN_ROWS
+        if envs.VLLM_ROCM_W4A8_PREFILL and weight.dtype == torch.int8
+        else 0
+    )
+    out = rdna2_w8_linear(
+        x, weight, scale, bias=bias, act_quant_min_rows=act_quant_min_rows
+    )
+    return out if rows is None else out[..., :rows]

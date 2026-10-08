@@ -882,13 +882,24 @@ class Qwen4ExpForConditionalGenerationConfig(Qwen3_5ForConditionalGenerationConf
                 "Qwen4Exp PLE/QSA does not support dual-batch overlap or microbatching"
             )
         # Checked again in Qwen4ExpModelState; rejecting it here keeps the
-        # engine from loading weights first.
-        if text_config.ple_layer_ids and parallel_config.pipeline_parallel_size > 1:
-            raise NotImplementedError(
-                "Qwen4Exp N-gram PLE embedding requires pipeline_parallel_size=1 "
-                "because non-first pipeline ranks do not receive the raw input_ids "
-                "it needs. Please run with PP=1."
-            )
+        # engine from loading weights first. Only the first pipeline rank gets
+        # the raw input_ids, so every PLE layer has to live there (decoder
+        # layer i hosts PLE layer id i + 1); the AMD model state supports that.
+        pp_size = parallel_config.pipeline_parallel_size
+        if text_config.ple_layer_ids and pp_size > 1:
+            from vllm.distributed.utils import get_pp_indices
+            from vllm.platforms import current_platform
+
+            _, first_end = get_pp_indices(text_config.num_hidden_layers, 0, pp_size)
+            ple_on_first_rank = max(text_config.ple_layer_ids) <= first_end
+            if not (current_platform.is_rocm() and ple_on_first_rank):
+                raise NotImplementedError(
+                    "Qwen4Exp N-gram PLE embedding with pipeline_parallel_size > 1 "
+                    "needs ROCm and every PLE layer on the first pipeline stage, "
+                    "the only one that receives the raw input_ids "
+                    f"(PLE layer ids {text_config.ple_layer_ids}, first stage "
+                    f"layers 0-{first_end - 1}). Please run with PP=1."
+                )
         multimodal_config = vllm_config.model_config.multimodal_config
         if multimodal_config is not None and multimodal_config.language_model_only:
             _strip_qwen4_exp_mrope(vllm_config.model_config)

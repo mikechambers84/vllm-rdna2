@@ -1806,6 +1806,50 @@ def test_project_kv_cache_groups_to_worker():
     assert set(proj_spec.kv_cache_specs.keys()) == {"layer1", "layer3"}
 
 
+def test_kv_cache_tensors_cover_only_this_pp_stage():
+    """A UniformType group whose layers all sit on another pipeline stage keeps
+    its full spec when projected; the worker must not get tensors for them."""
+    vllm_config = VllmConfig()
+    vllm_config.cache_config.kv_cache_layout = "BLNHC"
+    spec_a = new_kv_cache_spec()
+    spec_b = new_kv_cache_spec(num_kv_heads=4)
+    global_groups = [
+        KVCacheGroupSpec(["layer1"], spec_a),
+        KVCacheGroupSpec(
+            ["layer2", "layer3"],
+            UniformTypeKVCacheSpecs(
+                block_size=16, kv_cache_specs={"layer2": spec_a, "layer3": spec_b}
+            ),
+        ),
+    ]
+    projected = kv_cache_utils._project_kv_cache_groups_to_worker(
+        global_groups, {"layer1": spec_a}
+    )
+    assert [group.layer_names for group in projected] == [["layer1"], []]
+
+    kv_cache_config = kv_cache_utils.get_kv_cache_config_from_groups(
+        vllm_config, projected, spec_a.page_size_bytes * 100
+    )
+    assert [t.layers for t in kv_cache_config.kv_cache_tensors] == [["layer1"]]
+
+
+def test_kv_cache_layout_uses_layouts_common_to_all_pp_stages(monkeypatch):
+    """Pipeline stages can hold different layer types and so report different
+    layout lists; the result must be one every stage supports."""
+    from vllm.v1.attention.backends.utils import resolve_kv_cache_layout
+
+    monkeypatch.delenv("VLLM_KV_CACHE_LAYOUT", raising=False)
+    config = VllmConfig()
+    layout = resolve_kv_cache_layout(
+        config, [["LBNHC", "LBHNC", "BLNHC", "BLHNC"], ["BLNHC", "BLHNC"]]
+    )
+    assert layout == KVCacheLayout.BLNHC
+
+    config.cache_config.kv_cache_layout = None
+    with pytest.raises(AssertionError, match="share no supported"):
+        resolve_kv_cache_layout(config, [["LBNHC"], ["BLNHC"]])
+
+
 @pytest.mark.parametrize("sliding_window", [None, 256])
 @pytest.mark.parametrize("disable_hybrid", [False, True])
 @pytest.mark.parametrize("pcp_size", [1, 4])

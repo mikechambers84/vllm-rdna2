@@ -489,3 +489,43 @@ def test_fp8_moe_selects_rdna2_backend():
         config, kFp8Static128BlockSym, kFp8Dynamic128Sym
     )
     assert backend == Fp8MoeBackend.RDNA2
+
+
+def test_unquantized_experts_become_rdna2_int8_with_opt_in(
+    monkeypatch, default_vllm_config
+):
+    """With VLLM_ROCM_W8A16_UNQUANTIZED, unquantized MoE layers (e.g. an MTP
+    drafter a checkpoint leaves in 16 bits) are quantized to int8 at load and
+    run on Rdna2Int8Experts, whose kernels need dynamic per-token activations
+    in the quant config."""
+    from tests.kernels.moe.utils import make_dummy_moe_config
+    from vllm.model_executor.layers.fused_moe import routed_experts
+    from vllm.model_executor.layers.fused_moe.experts.rdna2_moe import (
+        Rdna2Int8Experts,
+    )
+    from vllm.model_executor.layers.quantization.online.int8 import (
+        Rdna2Int8OnlineMoEMethod,
+    )
+
+    monkeypatch.setenv("VLLM_ROCM_W8A16_UNQUANTIZED", "1")
+    config = make_dummy_moe_config(
+        num_experts=E, experts_per_token=TOPK, hidden_dim=H, in_dtype=torch.float16
+    )
+    method = routed_experts.RoutedExperts._get_quant_method(
+        None, "mtp.layers.0.mlp.experts", None, config
+    )
+    assert isinstance(method, Rdna2Int8OnlineMoEMethod)
+    assert method.experts_cls is Rdna2Int8Experts
+
+    layer = torch.nn.Module()
+    layer.w13_scale = torch.ones(E, 2 * INTER, device="cuda")
+    layer.w2_scale = torch.ones(E, H, device="cuda")
+    quant_config = method.get_fused_moe_quant_config(layer)
+    assert quant_config is not None
+    assert quant_config.use_int8_w8a8 and quant_config.per_act_token_quant
+
+    monkeypatch.setenv("VLLM_ROCM_W8A16_UNQUANTIZED", "0")
+    method = routed_experts.RoutedExperts._get_quant_method(
+        None, "mtp.layers.0.mlp.experts", None, config
+    )
+    assert not isinstance(method, Rdna2Int8OnlineMoEMethod)

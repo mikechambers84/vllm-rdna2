@@ -173,6 +173,21 @@ void decode_attention_rdna2(
     const std::optional<torch::Tensor>& v_scale, int64_t window, double softcap,
     const std::optional<torch::Tensor>& sinks);
 
+void qsa_union_rdna2(const torch::Tensor& indices,
+                     const torch::Tensor& cu_seqlens_q,
+                     const torch::Tensor& seq_lens, int64_t tile_tokens,
+                     int64_t ratio, torch::Tensor& ublk, torch::Tensor& umask,
+                     torch::Tensor& ucount);
+
+void qsa_attention_rdna2(
+    torch::Tensor& out, const torch::Tensor& q, const torch::Tensor& k_cache,
+    const torch::Tensor& v_cache, const torch::Tensor& cu_seqlens_q,
+    const torch::Tensor& seq_lens, const torch::Tensor& block_table,
+    const torch::Tensor& ublk, const torch::Tensor& umask,
+    const torch::Tensor& ucount, int64_t tile_tokens, int64_t ratio,
+    double scale, const std::optional<torch::Tensor>& k_scale,
+    const std::optional<torch::Tensor>& v_scale);
+
 void gdn_post_conv_rdna2(const torch::Tensor& conv_output,
                          const torch::Tensor& a, const torch::Tensor& b,
                          const torch::Tensor& A_log,
