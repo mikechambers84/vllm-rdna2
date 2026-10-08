@@ -2163,6 +2163,20 @@ def gemm_w8_rdna2(
     )
 
 
+def hc_up_mix_rdna2(
+    lora: torch.Tensor,
+    w: torch.Tensor,
+    scale: torch.Tensor,
+    xn: torch.Tensor,
+    hc_count: int,
+) -> torch.Tensor:
+    """Qwen4Exp hyper-connection gate for a few tokens in one RDNA2 kernel:
+    ``g = silu(lora / hc_count) @ (w * scale).T`` (int8 K-major ``w``
+    [R / 4, hc_count * HS, 4]), then the mean over the streams of
+    ``sigmoid(g) * xn``; returns [M, HS]. hc_count must be 4."""
+    return torch.ops._rocm_C.hc_up_mix_rdna2(lora, w, scale, xn, hc_count)
+
+
 def quant_int8_exl_rdna2(
     x: torch.Tensor,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
@@ -2550,6 +2564,27 @@ def qsa_attention_rdna2(
         scale,
         k_scale,
         v_scale,
+    )
+
+
+def qsa_decode_rdna2(
+    out: torch.Tensor,
+    q: torch.Tensor,
+    k_cache: torch.Tensor,
+    v_cache: torch.Tensor,
+    sel: torch.Tensor,
+    tok2req: torch.Tensor,
+    block_table: torch.Tensor,
+    scale: float,
+    k_scale: torch.Tensor | None = None,
+    v_scale: torch.Tensor | None = None,
+) -> None:
+    """RDNA2 QSA decode / spec-verify (head 256, fp16 ``q`` and ``out``):
+    query token t attends to its selection ``sel[t]`` of positions (-1: none)
+    in request ``tok2req[t]`` of the paged caches, split over segments of the
+    selection and merged into ``out``."""
+    torch.ops._rocm_C.qsa_decode_rdna2(
+        out, q, k_cache, v_cache, sel, tok2req, block_table, scale, k_scale, v_scale
     )
 
 

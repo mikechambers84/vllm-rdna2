@@ -4,6 +4,8 @@
 
 import torch
 
+from vllm import _custom_ops as ops
+from vllm.model_executor.kernels.linear.rdna2_w8a16 import rdna2_w8_linear
 from vllm.platforms import current_platform
 from vllm.triton_utils import tl, triton
 from vllm.utils.torch_utils import direct_register_custom_op
@@ -375,6 +377,29 @@ def _hc_combine_norm(
     return out, y
 
 
+# Up to this many rows one RDNA2 kernel beats silu + GEMM + gate mix.
+_HC_UP_MIX_MAX_ROWS = 4
+
+
+def _hc_up_mix(
+    lora: torch.Tensor,
+    xn: torch.Tensor,
+    weight: torch.Tensor,
+    scale: torch.Tensor,
+    hc_count: int,
+    act_quant_min_rows: int,
+) -> torch.Tensor:
+    if lora.shape[0] <= _HC_UP_MIX_MAX_ROWS:
+        return ops.hc_up_mix_rdna2(lora, weight, scale, xn, hc_count)
+    gate = rdna2_w8_linear(
+        _hc_silu(lora, hc_count),
+        weight,
+        scale,
+        act_quant_min_rows=act_quant_min_rows,
+    )
+    return _hc_gate_mix(xn, gate, hc_count)
+
+
 def _same_shape_fake(x: torch.Tensor, *args) -> torch.Tensor:
     return x.new_empty(x.shape)
 
@@ -384,6 +409,18 @@ def _hc_gate_mix_fake(
 ) -> torch.Tensor:
     del gate
     return x.new_empty((x.shape[0], x.shape[1] // hc_count))
+
+
+def _hc_up_mix_fake(
+    lora: torch.Tensor,
+    xn: torch.Tensor,
+    weight: torch.Tensor,
+    scale: torch.Tensor,
+    hc_count: int,
+    act_quant_min_rows: int,
+) -> torch.Tensor:
+    del lora, weight, scale, act_quant_min_rows
+    return xn.new_empty((xn.shape[0], xn.shape[1] // hc_count))
 
 
 def _hc_combine_fake(
@@ -424,6 +461,11 @@ direct_register_custom_op(
     fake_impl=_hc_gate_mix_fake,
 )
 direct_register_custom_op(
+    op_name="qwen4_exp_hc_up_mix",
+    op_func=_hc_up_mix,
+    fake_impl=_hc_up_mix_fake,
+)
+direct_register_custom_op(
     op_name="qwen4_exp_hc_combine",
     op_func=_hc_combine,
     fake_impl=_hc_combine_fake,
@@ -447,6 +489,22 @@ def hc_silu(x: torch.Tensor, hc_count: int) -> torch.Tensor:
 
 def hc_gate_mix(x: torch.Tensor, gate: torch.Tensor, hc_count: int) -> torch.Tensor:
     return torch.ops.vllm.qwen4_exp_hc_gate_mix(x, gate, hc_count)
+
+
+def hc_up_mix(
+    lora: torch.Tensor,
+    xn: torch.Tensor,
+    weight: torch.Tensor,
+    scale: torch.Tensor,
+    hc_count: int,
+    act_quant_min_rows: int,
+) -> torch.Tensor:
+    """hc_gate_mix(xn, silu-gate up projection of lora, hc_count) for int8
+    K-major up weights (kmajor_w8) with per-channel scales: one RDNA2 kernel
+    for decode-sized batches."""
+    return torch.ops.vllm.qwen4_exp_hc_up_mix(
+        lora, xn, weight, scale, hc_count, act_quant_min_rows
+    )
 
 
 def hc_combine(
@@ -484,4 +542,5 @@ __all__ = [
     "hc_combine_norm",
     "hc_gate_mix",
     "hc_silu",
+    "hc_up_mix",
 ]

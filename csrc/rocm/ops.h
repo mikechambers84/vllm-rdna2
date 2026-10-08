@@ -52,6 +52,10 @@ torch::Tensor gemm_w8_rdna2(const at::Tensor& a, const at::Tensor& w,
                             const std::optional<at::Tensor>& scale_a,
                             std::optional<at::ScalarType> out_dtype);
 
+torch::Tensor hc_up_mix_rdna2(const at::Tensor& lora, const at::Tensor& w,
+                              const at::Tensor& scale, const at::Tensor& xn,
+                              int64_t hc_count);
+
 torch::Tensor gemm_rocblas_rdna2(const at::Tensor& a, const at::Tensor& w,
                                  int64_t solution, bool w_kn);
 
@@ -187,6 +191,14 @@ void qsa_attention_rdna2(
     const torch::Tensor& ucount, int64_t tile_tokens, int64_t ratio,
     double scale, const std::optional<torch::Tensor>& k_scale,
     const std::optional<torch::Tensor>& v_scale);
+
+void qsa_decode_rdna2(torch::Tensor& out, const torch::Tensor& q,
+                      const torch::Tensor& k_cache,
+                      const torch::Tensor& v_cache, const torch::Tensor& sel,
+                      const torch::Tensor& tok2req,
+                      const torch::Tensor& block_table, double scale,
+                      const std::optional<torch::Tensor>& k_scale,
+                      const std::optional<torch::Tensor>& v_scale);
 
 void gdn_post_conv_rdna2(const torch::Tensor& conv_output,
                          const torch::Tensor& a, const torch::Tensor& b,

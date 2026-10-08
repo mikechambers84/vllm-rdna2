@@ -80,6 +80,12 @@ TORCH_LIBRARY_EXPAND(TORCH_EXTENSION_NAME, rocm_ops) {
       "int block_n, int block_k, Tensor? bias, int cfg, Tensor? scale_a=None, "
       "ScalarType? out_dtype=None) -> Tensor");
   rocm_ops.impl("gemm_w8_rdna2", torch::kCUDA, &gemm_w8_rdna2);
+  // Qwen4Exp hyper-connection gate for a few tokens: silu(lora / 4) through
+  // the int8 K-major up projection, sigmoid-gated mean over xn's 4 streams.
+  rocm_ops.def(
+      "hc_up_mix_rdna2(Tensor lora, Tensor w, Tensor scale, Tensor xn, "
+      "int hc_count) -> Tensor");
+  rocm_ops.impl("hc_up_mix_rdna2", torch::kCUDA, &hc_up_mix_rdna2);
   // fp16/bf16 GEMM with an explicit rocBLAS solution, and the solutions and
   // rocBLAS version for tuning them.
   rocm_ops.def(
@@ -204,6 +210,12 @@ TORCH_LIBRARY_EXPAND(TORCH_EXTENSION_NAME, rocm_ops) {
       "int tile_tokens, int ratio, float scale, Tensor? k_scale=None, "
       "Tensor? v_scale=None) -> ()");
   rocm_ops.impl("qsa_attention_rdna2", torch::kCUDA, &qsa_attention_rdna2);
+  // Qwen4Exp QSA decode / spec-verify: split-KV over each token's selection.
+  rocm_ops.def(
+      "qsa_decode_rdna2(Tensor! out, Tensor q, Tensor k_cache, "
+      "Tensor v_cache, Tensor sel, Tensor tok2req, Tensor block_table, "
+      "float scale, Tensor? k_scale=None, Tensor? v_scale=None) -> ()");
+  rocm_ops.impl("qsa_decode_rdna2", torch::kCUDA, &qsa_decode_rdna2);
   // Gated DeltaNet prefill: post-conv1d q/k/v split, l2 norm and gating.
   rocm_ops.def(
       "gdn_post_conv_rdna2(Tensor conv_output, Tensor a, Tensor b, "

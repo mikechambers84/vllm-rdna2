@@ -568,14 +568,15 @@ def test_rocm_gemm_w8_rdna2_fp16_weights_tiled(n, cfg):
     assert ((out.float() - ref).norm() / ref.norm()).item() < 1e-3
 
 
-@pytest.mark.parametrize("cfg", range(12))
+@pytest.mark.parametrize("cfg", range(15))
+@pytest.mark.parametrize("n", [1, 3, 37])
 @pytest.mark.skipif(not on_gfx1030(), reason="RDNA2 (gfx1030) kernel")
-def test_rocm_gemm_w8_rdna2_configs(cfg):
+def test_rocm_gemm_w8_rdna2_configs(cfg, n):
     """Every tile config gives the same result (row counts not a multiple of
     the token tile, K % 32 == 16)."""
     torch.manual_seed(0)
     k, m = 1040, 516
-    A = torch.randn(37, k, dtype=torch.float16, device="cuda") * math.sqrt(2 / k)
+    A = torch.randn(n, k, dtype=torch.float16, device="cuda") * math.sqrt(2 / k)
     W, scale, ratio, block_n, block_k, ref_w = _w8_rdna2_weights("fp8_block", m, k)
 
     out = ops.gemm_w8_rdna2(A, W, scale, ratio, block_n, block_k, None, cfg)

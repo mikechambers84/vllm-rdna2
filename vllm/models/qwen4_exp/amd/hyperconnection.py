@@ -25,6 +25,7 @@ Typical usage inside a transformer decoder layer::
 import torch
 from torch import nn
 
+from vllm.model_executor.kernels.linear.rdna2_w8a16 import act_quant_min_rows
 from vllm.model_executor.layers.linear import (
     MergedColumnParallelLinear,
     ReplicatedLinear,
@@ -41,6 +42,7 @@ from .ops.hc import (
     hc_combine_norm,
     hc_gate_mix,
     hc_silu,
+    hc_up_mix,
 )
 
 
@@ -114,6 +116,13 @@ class GatedResidual(nn.Module):
                 prefix=maybe_prefix(prefix, "input_mix_weight_down"),
                 return_bias=False,
             )
+        # Shapes the fused RDNA2 gate kernel (hc_up_mix) takes.
+        self.fusable_up = (
+            self.hc_count == 4
+            and config.hidden_size % 32 == 0
+            and self.lora_rank % 8 == 0
+            and self.lora_rank <= 512
+        )
         self.input_mix_weight_up = ReplicatedLinear(
             self.lora_rank,
             self.hyper_hidden_size,
@@ -143,9 +152,7 @@ class GatedResidual(nn.Module):
             lora = self.input_mix_weight_down(xn)
             injection = None
 
-        lora = hc_silu(lora, self.hc_count)
-        gate = self.input_mix_weight_up(lora)  # [M, D]
-        block_input = hc_gate_mix(xn, gate, self.hc_count)
+        block_input = self.gate_mix(lora, xn)
 
         return hidden_states, block_input, injection
 
@@ -179,11 +186,27 @@ class GatedResidual(nn.Module):
             lora = self.input_mix_weight_down(xn)
             injection = None
 
-        lora = hc_silu(lora, self.hc_count)
-        gate = self.input_mix_weight_up(lora)  # [M, D]
-        block_input = hc_gate_mix(xn, gate, self.hc_count)
+        block_input = self.gate_mix(lora, xn)
 
         return hidden_states, block_input, injection
+
+    def gate_mix(self, lora: torch.Tensor, xn: torch.Tensor) -> torch.Tensor:
+        """Mean over the HC streams of xn gated by the up projection of
+        silu(lora / HC)."""
+        up = self.input_mix_weight_up
+        weight = getattr(up, "kmajor_weight", None)
+        if self.fusable_up and weight is not None and weight.dtype == torch.int8:
+            return hc_up_mix(
+                lora,
+                xn,
+                weight,
+                up.kmajor_scale,
+                self.hc_count,
+                act_quant_min_rows(weight),
+            )
+        lora = hc_silu(lora, self.hc_count)
+        gate = up(lora)  # [M, D]
+        return hc_gate_mix(xn, gate, self.hc_count)
 
     def combine(
         self,

@@ -215,6 +215,14 @@ def rdna2_w8_linear(
     )
 
 
+def act_quant_min_rows(weight: torch.Tensor) -> int:
+    """Rows from which a layer with these K-major weights runs W8A8 (int8
+    weights under VLLM_ROCM_W4A8_PREFILL); 0: never."""
+    if envs.VLLM_ROCM_W4A8_PREFILL and weight.dtype == torch.int8:
+        return envs.VLLM_ROCM_W4A8_MIN_ROWS
+    return 0
+
+
 def apply_rdna2_kmajor(
     layer: torch.nn.Module,
     x: torch.Tensor,
@@ -241,12 +249,7 @@ def apply_rdna2_kmajor(
             bias = bias[:n]
         if scale is not None:
             scale = scale[:n]
-    act_quant_min_rows = (
-        envs.VLLM_ROCM_W4A8_MIN_ROWS
-        if envs.VLLM_ROCM_W4A8_PREFILL and weight.dtype == torch.int8
-        else 0
-    )
     out = rdna2_w8_linear(
-        x, weight, scale, bias=bias, act_quant_min_rows=act_quant_min_rows
+        x, weight, scale, bias=bias, act_quant_min_rows=act_quant_min_rows(weight)
     )
     return out if rows is None else out[..., :rows]

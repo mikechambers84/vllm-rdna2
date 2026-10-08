@@ -37,7 +37,7 @@ static constexpr int WARP32 = 32;
 static constexpr int WAVES = 8;
 static constexpr int GROUP = 32;
 static constexpr int R1 = 2;  // output columns per wave, gate_up_silu
-static constexpr int R2 = 1;  // output rows per wave, down_sum
+static constexpr int R2 = 4;  // output rows per wave, down_sum
 
 #if defined(__HIP__RDNA2__) || !defined(__HIP_DEVICE_COMPILE__)
 
