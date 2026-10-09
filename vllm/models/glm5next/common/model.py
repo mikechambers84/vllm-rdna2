@@ -751,6 +751,17 @@ class Glm5NextModel(nn.Module):
     def embed_input_ids(self, input_ids: torch.Tensor) -> torch.Tensor:
         return self.embed_tokens(input_ids)
 
+    def make_empty_intermediate_tensors(
+        self, batch_size: int, dtype: torch.dtype, device: torch.device
+    ) -> IntermediateTensors:
+        # mHC models pass all hc_mult residual streams between PP ranks.
+        shape: tuple[int, ...] = (batch_size, self.config.hidden_size)
+        if self.config.mhc:
+            shape = (batch_size, self.config.hc_mult, self.config.hidden_size)
+        return IntermediateTensors(
+            {"hidden_states": torch.zeros(shape, dtype=dtype, device=device)}
+        )
+
     def forward(
         self,
         input_ids: torch.Tensor | None,
@@ -768,11 +779,12 @@ class Glm5NextModel(nn.Module):
             post = None
             comb = None
         else:
+            # The previous rank sends complete hidden states (mHC: all
+            # residual streams, its last hc_post applied), so the first layer
+            # here starts from a standalone pre.
             assert intermediate_tensors is not None
             hidden_states = intermediate_tensors["hidden_states"]
-            residual = intermediate_tensors["residual"]
-            # post/comb (deferred mHC hc_post state) are not propagated across
-            # PP ranks; the receiving rank's first mHC layer uses standalone pre.
+            residual = None
             post = None
             comb = None
 
@@ -786,14 +798,14 @@ class Glm5NextModel(nn.Module):
             )
 
         if not get_pp_group().is_last_rank:
-            # PP is gated off for GLM-5.3-Flash (no make_empty_intermediate_tensors),
-            # so this branch is not exercised. post/comb are the deferred
-            # hc_post state of this rank's last mHC layer; a future PP path
-            # would need to propagate them, but for now they are dropped (the
-            # receiving rank's first layer would fall back to standalone pre).
-            return IntermediateTensors(
-                {"hidden_states": hidden_states, "residual": residual}
-            )
+            if post is not None:
+                # Apply this rank's deferred hc_post: send the full streams.
+                hidden_states = self._active_layers[-1].hc_post(
+                    hidden_states, residual, post, comb
+                )
+            if self.is_sequence_parallel:
+                hidden_states = sp_all_gather(hidden_states)[:full_num_tokens]
+            return IntermediateTensors({"hidden_states": hidden_states})
 
         if self.is_sequence_parallel:
             hidden_states = sp_all_gather(hidden_states)[:full_num_tokens]
@@ -1009,6 +1021,9 @@ class Glm5NextForCausalLM(
         self.logits_processor = LogitsProcessor(
             self.config.vocab_size, scale=_LOGIT_SCALE
         )
+        self.make_empty_intermediate_tensors = (
+            self.model.make_empty_intermediate_tensors
+        )
 
     def embed_input_ids(self, input_ids: torch.Tensor) -> torch.Tensor:
         return self.model.embed_input_ids(input_ids)
@@ -1165,10 +1180,9 @@ class Glm5NextForConditionalGeneration(
             )
 
         self.set_moe_parameters()
-
-        # Glm5NextForCausalLM does not implement make_empty_intermediate_tensors,
-        # so pipeline parallelism is gated off (consistent with the text-only
-        # model) and we intentionally do not alias it here.
+        self.make_empty_intermediate_tensors = (
+            self.language_model.make_empty_intermediate_tensors
+        )
 
     def set_moe_parameters(self) -> None:
         self.moe_mlp_layers = [
@@ -1236,6 +1250,8 @@ def _try_load_fp8_indexer_wk(name, tensor, buf, params_dict, loaded_params):
     if not is_weight and not is_scale:
         return False
     layer_prefix = name.rsplit(".wk.", 1)[0]
+    if f"{layer_prefix}.wk_weights_proj.weight" not in params_dict:
+        return True  # a layer of another pipeline-parallel rank
     entry = buf.setdefault(layer_prefix, {})
     entry["weight" if is_weight else "scale"] = tensor
     if "weight" not in entry or "scale" not in entry:
@@ -1330,6 +1346,8 @@ def _try_load_fp8_attn_proj(
     layer_prefix = name.rsplit(suffix, 1)[0]
     target_w = f"{layer_prefix}.{target_base}.weight"
     target_s = f"{layer_prefix}.{target_base}.weight_scale_inv"
+    if target_w not in params_dict:
+        return True  # a layer of another pipeline-parallel rank
     # If the model actually kept this projection in FP8, let the normal path
     # handle it (it has a weight_scale_inv param).
     if target_s in params_dict:
