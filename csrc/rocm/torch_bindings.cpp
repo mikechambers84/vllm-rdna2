@@ -134,7 +134,7 @@ TORCH_LIBRARY_EXPAND(TORCH_EXTENSION_NAME, rocm_ops) {
   rocm_ops.def(
       "moe_wna16_decode_rdna2(Tensor! output, Tensor x, Tensor topk_ids, "
       "Tensor topk_weights, Tensor w13, Tensor s13, Tensor w2, Tensor s2, "
-      "Tensor? z13, Tensor? z2, Tensor! act) -> ()");
+      "Tensor? z13, Tensor? z2, Tensor! act, float swiglu_limit=0.0) -> ()");
   rocm_ops.impl("moe_wna16_decode_rdna2", torch::kCUDA,
                 &moe_wna16_decode_rdna2);
   // Grouped W4A16 GEMM for fused-MoE prefill on the Triton WNA16 layout.

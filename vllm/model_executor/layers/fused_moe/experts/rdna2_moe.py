@@ -400,6 +400,7 @@ class Rdna2WNA16Experts(TritonWNA16Experts):
             act,
             self.w1_zp,
             self.w2_zp,
+            self.activation_config.clamp_limit or 0.0,
         )
 
 

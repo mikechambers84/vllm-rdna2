@@ -52,22 +52,27 @@ def _experts(n, k, group=GROUP, zp=False, requant=False):
     return packed, scales, ref, zeros
 
 
-def _reference(x, topk_weights, topk_ids, w13_ref, w2_ref):
+def _reference(x, topk_weights, topk_ids, w13_ref, w2_ref, limit=0.0):
     gate_up = torch.einsum("tk,tjnk->tjn", x.float(), w13_ref[topk_ids])
     inter = gate_up.shape[-1] // 2
-    hidden = F.silu(gate_up[..., :inter]) * gate_up[..., inter:]
+    gate, up = gate_up[..., :inter], gate_up[..., inter:]
+    if limit > 0:
+        gate, up = gate.clamp(max=limit), up.clamp(-limit, limit)
+    hidden = F.silu(gate) * up
     return torch.einsum("tj,tjhn,tjn->th", topk_weights, w2_ref[topk_ids], hidden)
 
 
+@pytest.mark.parametrize("limit", [0.0, 0.05])
 @pytest.mark.parametrize("zp", [False, True])
 @pytest.mark.parametrize("group", [32, 128])
 @pytest.mark.parametrize("num_tokens", [1, 3, 16])
 @pytest.mark.parametrize("dims", [(H, INTER), (1152, 384)])
-def test_moe_wna16_decode_rdna2_matches_reference(num_tokens, group, zp, dims):
+def test_moe_wna16_decode_rdna2_matches_reference(num_tokens, group, zp, dims, limit):
     """Exact integer dequant with the group scale applied in fp32 keeps the
     error at fp16-rounding level (a scale-folded fp16 dequant costs ~2.5%),
     for both group sizes and with zero points; H and I need not be multiples
-    of 256 (or of the 8 * R rows a workgroup covers)."""
+    of 256 (or of the 8 * R rows a workgroup covers). A SwiGLU limit (0.05
+    clamps many of these gate/up values) matches the clamped reference."""
     from vllm import _custom_ops as ops
 
     hidden, inter = dims
@@ -87,11 +92,11 @@ def test_moe_wna16_decode_rdna2_matches_reference(num_tokens, group, zp, dims):
     act = torch.empty(num_tokens * TOPK, inter, dtype=torch.float16, device="cuda")
 
     ops.moe_wna16_decode_rdna2(
-        out, x, topk_ids, topk_weights, w13, s13, w2, s2, act, z13, z2
+        out, x, topk_ids, topk_weights, w13, s13, w2, s2, act, z13, z2, limit
     )
 
     topk_ids[0, -1] = 0
-    ref = _reference(x, topk_weights, topk_ids, w13_ref, w2_ref)
+    ref = _reference(x, topk_weights, topk_ids, w13_ref, w2_ref, limit)
     assert ((out.float() - ref).norm() / ref.norm()).item() < 2e-3
 
 

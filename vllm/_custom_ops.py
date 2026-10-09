@@ -2286,11 +2286,13 @@ def moe_wna16_decode_rdna2(
     act: torch.Tensor,
     w13_zeros: torch.Tensor | None = None,
     w2_zeros: torch.Tensor | None = None,
+    swiglu_limit: float = 0.0,
 ) -> None:
     """RDNA2 W4A16 fused-MoE decode (SiLU, int4 with group size a multiple of
     32, optional ``[E, N/2, K/G]`` zero points) into ``output``, on the
     uint8-packed ``[E, N, K/2]`` weights of the Triton WNA16 backend; ``act`` is
-    a ``[M * topk, I]`` workspace."""
+    a ``[M * topk, I]`` workspace. ``swiglu_limit`` > 0 clamps the activation to
+    silu(min(gate, L)) * clamp(up, -L, L)."""
     torch.ops._rocm_C.moe_wna16_decode_rdna2(
         output,
         x,
@@ -2303,6 +2305,7 @@ def moe_wna16_decode_rdna2(
         w13_zeros,
         w2_zeros,
         act,
+        swiglu_limit,
     )
 
 
