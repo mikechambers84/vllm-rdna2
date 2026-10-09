@@ -750,7 +750,11 @@ class SparseAttnIndexerKpool(CustomOp):
         assert isinstance(q_quant, torch.Tensor), (
             "AMD sparse_attn_indexer expects a single FP8 q_quant tensor"
         )
-        if not rocm_aiter_ops.is_enabled():
+        from vllm.platforms.rocm import on_gfx1030
+
+        # The kpool path is local Triton/C++ kernels plus fallbacks for the
+        # aiter-only pieces, which gfx1030 (no aiter) runs.
+        if not rocm_aiter_ops.is_enabled() and not (index_kpool > 1 and on_gfx1030()):
             raise RuntimeError(
                 "Sparse attention indexer ROCm path is only supported on AITER. "
                 "Please enable aiter with VLLM_ROCM_USE_AITER=1"
@@ -772,6 +776,12 @@ class SparseAttnIndexerKpool(CustomOp):
                 self.topk_indices_buffer,
                 skip_k_cache_insert=self.skip_k_cache_insert,
             )
+        if k is not None and k.dtype == torch.float16:
+            # The kpool kernels and the tail cache work on bf16 K and gate
+            # scores (a bf16 model's rounding); fp16 models convert here.
+            k = k.to(torch.bfloat16)
+            if gate_score is not None:
+                gate_score = gate_score.to(torch.bfloat16)
         return sparse_attn_indexer_kpool(
             hidden_states,
             self.k_cache.prefix,

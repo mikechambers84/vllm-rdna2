@@ -112,14 +112,14 @@ def fwht128_quant_fp8(q: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
     fp32 ``1 / sqrt(128)`` scale before block-128 ue8m0 quantization.
 
     Args:
-        q: ``[rows, 128]`` bf16 — one head vector per row.
+        q: ``[rows, 128]`` bf16 or fp16 — one head vector per row.
 
     Returns:
         (q_fp8 ``[rows, 128]`` float8_e4m3fn, scale ``[rows, 1]`` float32).
 
     """
     assert q.ndim == 2 and q.shape[1] == 128, q.shape
-    assert q.dtype == torch.bfloat16
+    assert q.dtype in (torch.bfloat16, torch.float16)
     assert q.is_contiguous()
     n_rows = q.shape[0]
     q_fp8 = torch.empty((n_rows, 128), dtype=torch.float8_e4m3fn, device=q.device)
