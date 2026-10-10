@@ -38,10 +38,7 @@ namespace moe_wna16_rdna2 {
 static constexpr int WARP32 = 32;
 static constexpr int WAVES = 8;
 static constexpr int GROUP = 32;
-// Output columns per wave in gate_up_silu: 2, or 1 for experts with I >= 1024
-// (twice the workgroups; GLM-5.3-Flash's I = 2048 decodes 8-9% faster, the
-// Qwen MoE checkpoints with I = 512 / 640 stay at 2).
-static constexpr int R1_LARGE_I = 1024;
+static constexpr int R1 = 2;  // output columns per wave, gate_up_silu
 static constexpr int R2 = 4;  // output rows per wave, down_sum
 
 #if defined(__HIP__RDNA2__) || !defined(__HIP_DEVICE_COMPILE__)
@@ -117,7 +114,7 @@ __device__ __forceinline__ void stage_row(__half* dst, const __half* src,
   }
 }
 
-template <bool ZP, int R1>
+template <bool ZP>
 __global__ void __launch_bounds__(WAVES* WARP32)
     gate_up_silu_kernel(const __half* __restrict__ x,
                         const int32_t* __restrict__ topk_ids,
@@ -214,7 +211,7 @@ __global__ void __launch_bounds__(WAVES* WARP32)
 
 #else  // non-RDNA2 device pass: empty stubs for symbol parity.
 
-template <bool ZP, int R1>
+template <bool ZP>
 __global__ void gate_up_silu_kernel(const __half*, const int32_t*,
                                     const uint32_t*, const __half*,
                                     const uint8_t*, __half*, const int,
@@ -299,19 +296,14 @@ void moe_wna16_decode_rdna2(torch::Tensor& output, const torch::Tensor& x,
   const int gsub = G / GROUP;
   const uint8_t* z13p = zp ? z13->data_ptr<uint8_t>() : nullptr;
   const uint8_t* z2p = zp ? z2->data_ptr<uint8_t>() : nullptr;
-#define VLLM_MOE_GATE_UP_LAUNCH(ZPV, R)                                    \
-  gate_up_silu_kernel<ZPV, R>                                              \
-      <<<dim3((I + WAVES * R - 1) / (WAVES * R), M * topk), block,         \
-         H * sizeof(__half), stream>>>(                                    \
-          (const __half*)x.data_ptr(), topk_ids.data_ptr<int32_t>(),       \
-          (const uint32_t*)w13.data_ptr(), (const __half*)s13.data_ptr(),  \
-          z13p, (__half*)act.data_ptr(), E, H, I, topk, x.stride(0), gsub, \
-          (float)swiglu_limit)
 #define VLLM_MOE_DECODE_LAUNCH(ZPV)                                           \
-  if (I >= R1_LARGE_I)                                                        \
-    VLLM_MOE_GATE_UP_LAUNCH(ZPV, 1);                                          \
-  else                                                                        \
-    VLLM_MOE_GATE_UP_LAUNCH(ZPV, 2);                                          \
+  gate_up_silu_kernel<ZPV>                                                    \
+      <<<dim3((I + WAVES * R1 - 1) / (WAVES * R1), M * topk), block,          \
+         H * sizeof(__half), stream>>>(                                       \
+          (const __half*)x.data_ptr(), topk_ids.data_ptr<int32_t>(),          \
+          (const uint32_t*)w13.data_ptr(), (const __half*)s13.data_ptr(),     \
+          z13p, (__half*)act.data_ptr(), E, H, I, topk, x.stride(0), gsub,    \
+          (float)swiglu_limit);                                               \
   down_sum_kernel<ZPV><<<dim3((H + WAVES * R2 - 1) / (WAVES * R2), M), block, \
                          topk * I * sizeof(__half), stream>>>(                \
       (const __half*)act.data_ptr(), topk_ids.data_ptr<int32_t>(),            \
@@ -324,5 +316,4 @@ void moe_wna16_decode_rdna2(torch::Tensor& output, const torch::Tensor& x,
     VLLM_MOE_DECODE_LAUNCH(false);
   }
 #undef VLLM_MOE_DECODE_LAUNCH
-#undef VLLM_MOE_GATE_UP_LAUNCH
 }

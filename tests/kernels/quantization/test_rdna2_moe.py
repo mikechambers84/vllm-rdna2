@@ -66,14 +66,13 @@ def _reference(x, topk_weights, topk_ids, w13_ref, w2_ref, limit=0.0):
 @pytest.mark.parametrize("zp", [False, True])
 @pytest.mark.parametrize("group", [32, 128])
 @pytest.mark.parametrize("num_tokens", [1, 3, 16])
-@pytest.mark.parametrize("dims", [(H, INTER), (1152, 384), (512, 1152)])
+@pytest.mark.parametrize("dims", [(H, INTER), (1152, 384)])
 def test_moe_wna16_decode_rdna2_matches_reference(num_tokens, group, zp, dims, limit):
     """Exact integer dequant with the group scale applied in fp32 keeps the
     error at fp16-rounding level (a scale-folded fp16 dequant costs ~2.5%),
     for both group sizes and with zero points; H and I need not be multiples
-    of 256 (or of the 8 * R rows a workgroup covers; I >= 1024 runs one
-    column per wave). A SwiGLU limit (0.05 clamps many of these gate/up
-    values) matches the clamped reference."""
+    of 256 (or of the 8 * R rows a workgroup covers). A SwiGLU limit (0.05
+    clamps many of these gate/up values) matches the clamped reference."""
     from vllm import _custom_ops as ops
 
     hidden, inter = dims
