@@ -216,6 +216,12 @@ TORCH_LIBRARY_EXPAND(TORCH_EXTENSION_NAME, rocm_ops) {
       "Tensor v_cache, Tensor sel, Tensor tok2req, Tensor block_table, "
       "float scale, Tensor? k_scale=None, Tensor? v_scale=None) -> ()");
   rocm_ops.impl("qsa_decode_rdna2", torch::kCUDA, &qsa_decode_rdna2);
+  // Rope-free sparse MLA attention over ragged key lists (GLM-5.3-Flash DSA).
+  rocm_ops.def(
+      "sparse_mla_attn_rdna2(Tensor q, Tensor kv, Tensor indices, "
+      "Tensor indptr, Tensor! out, Tensor(a!)? part_o, Tensor(b!)? part_ml, "
+      "int nseg, float scale) -> ()");
+  rocm_ops.impl("sparse_mla_attn_rdna2", torch::kCUDA, &sparse_mla_attn_rdna2);
   // mHC seam (post mix, pre mix logits + Sinkhorn, layer input + RMS norm)
   // in one kernel per token.
   rocm_ops.def(

@@ -4065,6 +4065,25 @@ def _rocm_sparse_attn_decode_triton(
     )
 
 
+def _rdna2_sparse_mla_supported(
+    q: torch.Tensor,
+    kv: torch.Tensor,
+    attn_sink: torch.Tensor | None,
+    output: torch.Tensor,
+) -> bool:
+    """gfx1030's HIP kernel covers the rope-free fp16 512-wide latent case."""
+    from vllm.platforms.rocm import on_gfx1030
+
+    return (
+        on_gfx1030()
+        and attn_sink is None
+        and q.dtype == kv.dtype == output.dtype == torch.float16
+        and q.shape[-1] == kv.shape[-1] == output.shape[-1] == 512
+        and q.shape[1] % 32 == 0
+        and q.stride(-1) == kv.stride(-1) == output.stride(-1) == 1
+    )
+
+
 def rocm_sparse_attn_prefill(
     q: torch.Tensor,
     kv: torch.Tensor,
@@ -4116,6 +4135,18 @@ def rocm_sparse_attn_prefill(
             return
 
     if ragged_indices is not None and ragged_indptr is not None:
+        if _rdna2_sparse_mla_supported(q, kv, attn_sink, output):
+            from vllm import _custom_ops as ops
+
+            ops.sparse_mla_attn_rdna2(
+                q,
+                kv.squeeze(1),
+                _as_int32_contiguous_1d(ragged_indices),
+                _as_int32_contiguous_1d(ragged_indptr),
+                output,
+                scale,
+            )
+            return
         _rocm_sparse_attn_prefill_ragged_triton(
             q=q,
             kv=kv.squeeze(1),

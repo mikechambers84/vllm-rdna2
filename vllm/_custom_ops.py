@@ -2673,6 +2673,31 @@ def decode_attention_rdna2(
     )
 
 
+def sparse_mla_attn_rdna2(
+    q: torch.Tensor,
+    kv: torch.Tensor,
+    indices: torch.Tensor,
+    indptr: torch.Tensor,
+    out: torch.Tensor,
+    scale: float,
+) -> None:
+    """RDNA2 rope-free sparse MLA attention: ``out[t, h] = softmax(scale *
+    q[t, h] . kv[s]) . kv[s]`` over the slots ``s`` in ``indices[indptr[t]:
+    indptr[t + 1]]`` (K = V = the 512-wide latent rows of ``kv``). With few
+    tokens the key lists are split over workgroups and merged."""
+    num_tokens, num_heads = q.shape[:2]
+    nseg = max(1, min(16, 128 // max(1, num_tokens * num_heads // 32)))
+    part_o = part_ml = None
+    if nseg > 1:
+        part_o = q.new_empty(
+            num_tokens * nseg * num_heads * q.shape[-1], dtype=torch.float32
+        )
+        part_ml = q.new_empty(num_tokens * nseg * num_heads * 2, dtype=torch.float32)
+    torch.ops._rocm_C.sparse_mla_attn_rdna2(
+        q, kv, indices, indptr, out, part_o, part_ml, nseg, scale
+    )
+
+
 def mhc_rdna2_supported(residual: torch.Tensor) -> bool:
     """Whether the RDNA2 mHC kernels take this [..., hc_mult, hidden] residual."""
     return (

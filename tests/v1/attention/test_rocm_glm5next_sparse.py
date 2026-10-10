@@ -224,3 +224,100 @@ def test_sparse_prefill_kv_row_offset_does_not_overflow_int32():
     _store_sparse_kv_row_offset_kernel[(1,)](slot, output, stride=512)
 
     assert output.item() == 6554 * 640 * 512
+
+
+def _on_gfx1030() -> bool:
+    if not current_platform.is_rocm():
+        return False
+    from vllm.platforms.rocm import on_gfx1030
+
+    return on_gfx1030()
+
+
+def _ragged_lists(num_tokens, num_slots, max_keys, generator):
+    """Per-token slot lists with invalid entries, one empty list, and lengths
+    crossing the 128-key tile boundary."""
+    lists = []
+    for t in range(num_tokens):
+        n = (
+            0
+            if t == 1
+            else int(torch.randint(1, max_keys + 1, (1,), generator=generator))
+        )
+        sl = torch.randperm(num_slots, generator=generator)[:n].to(torch.int32)
+        if n > 4:
+            sl[::7] = -1
+            sl[3] = num_slots + 5
+        lists.append(sl)
+    indptr = torch.zeros(num_tokens + 1, dtype=torch.int32)
+    indptr[1:] = torch.cumsum(torch.tensor([len(x) for x in lists]), 0)
+    return torch.cat(lists).cuda(), indptr.cuda()
+
+
+def _sparse_mla_reference(q, kv, indices, indptr, scale):
+    out = torch.zeros_like(q)
+    for t in range(q.shape[0]):
+        sl = indices[indptr[t] : indptr[t + 1]].long()
+        sl = sl[(sl >= 0) & (sl < kv.shape[0])]
+        if sl.numel():
+            k = kv[sl].float()
+            p = torch.softmax(q[t].float() @ k.T * scale, dim=-1)
+            out[t] = (p @ k).to(q.dtype)
+    return out
+
+
+@pytest.mark.skipif(not _on_gfx1030(), reason="gfx1030 HIP kernel")
+@pytest.mark.parametrize("num_tokens", [1, 3, 40, 130])
+@pytest.mark.parametrize("max_keys", [5, 300])
+def test_rdna2_sparse_mla_matches_reference(num_tokens, max_keys):
+    """Covers the split-KV (few tokens) and direct paths, invalid slots and an
+    empty key list."""
+    from vllm import _custom_ops as ops
+
+    g = torch.Generator().manual_seed(num_tokens * 1000 + max_keys)
+    num_heads, num_slots = 64, 700
+    q = torch.randn(num_tokens, num_heads, 512, generator=g).half().cuda()
+    kv = torch.randn(num_slots, 512, generator=g).half().cuda()
+    indices, indptr = _ragged_lists(num_tokens, num_slots, max_keys, g)
+    scale = 512**-0.5
+    out = torch.full_like(q, float("nan"))
+    ops.sparse_mla_attn_rdna2(q, kv, indices, indptr, out, scale)
+    ref = _sparse_mla_reference(q, kv, indices, indptr, scale)
+    torch.testing.assert_close(out, ref, atol=2e-2, rtol=2e-2)
+
+
+@pytest.mark.skipif(not _on_gfx1030(), reason="gfx1030 HIP kernel")
+def test_rocm_sparse_prefill_routes_glm_shapes_to_rdna2(monkeypatch):
+    from vllm import _custom_ops as ops
+    from vllm.v1.attention.ops.rocm_aiter_mla_sparse import rocm_sparse_attn_prefill
+
+    calls = []
+    kernel = ops.sparse_mla_attn_rdna2
+
+    def spy(*args):
+        calls.append(1)
+        kernel(*args)
+
+    monkeypatch.setattr(ops, "sparse_mla_attn_rdna2", spy)
+    g = torch.Generator().manual_seed(7)
+    q = torch.randn(9, 64, 512, generator=g).half().cuda()
+    kv = torch.randn(300, 512, generator=g).half().cuda()
+    indices, indptr = _ragged_lists(9, 300, 200, g)
+    out = torch.empty_like(q)
+    rocm_sparse_attn_prefill(
+        q=q,
+        kv=kv.view(-1, 1, 512),
+        indices=None,
+        topk_length=None,
+        scale=0.05,
+        head_dim=512,
+        nope_head_dim=512,
+        rope_head_dim=0,
+        attn_sink=None,
+        output=out,
+        ragged_indices=indices,
+        ragged_indptr=indptr,
+    )
+    assert calls
+    ref = _sparse_mla_reference(q, kv, indices, indptr, 0.05)
+    torch.testing.assert_close(out, ref, atol=2e-2, rtol=2e-2)

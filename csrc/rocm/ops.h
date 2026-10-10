@@ -200,6 +200,13 @@ void qsa_decode_rdna2(torch::Tensor& out, const torch::Tensor& q,
                       const std::optional<torch::Tensor>& k_scale,
                       const std::optional<torch::Tensor>& v_scale);
 
+void sparse_mla_attn_rdna2(const torch::Tensor& q, const torch::Tensor& kv,
+                           const torch::Tensor& indices,
+                           const torch::Tensor& indptr, torch::Tensor& out,
+                           const std::optional<torch::Tensor>& part_o,
+                           const std::optional<torch::Tensor>& part_ml,
+                           int64_t nseg, double scale);
+
 void mhc_rdna2(
     const torch::Tensor& residual, const std::optional<torch::Tensor>& x,
     const std::optional<torch::Tensor>& post_layer_mix,
