@@ -707,6 +707,27 @@ def paged_mqa_logits_module():
     return None
 
 
+def _rdna2_paged_mqa_logits_supported(
+    q_fp8: torch.Tensor, kv_cache_fp8: torch.Tensor
+) -> bool:
+    """gfx1030's HIP indexer-logits kernel: 32 / 64 heads of 128 fp8 dims."""
+    if not current_platform.is_rocm():
+        return False
+    from vllm.platforms.rocm import on_gfx1030
+
+    return (
+        on_gfx1030()
+        and q_fp8.dim() == 4
+        and q_fp8.shape[2] in (32, 64)
+        and q_fp8.shape[3] == 128
+        and q_fp8.element_size() == 1
+        and q_fp8.is_contiguous()
+        and kv_cache_fp8.shape[-1] == 132
+        and kv_cache_fp8.shape[1] % 4 == 0
+        and kv_cache_fp8.is_contiguous()
+    )
+
+
 def rocm_fp8_paged_mqa_logits(
     q_fp8: torch.Tensor,
     kv_cache_fp8: torch.Tensor,
@@ -744,6 +765,22 @@ def rocm_fp8_paged_mqa_logits(
 
     batch_size, next_n = q_fp8.shape[:2]
     block_size = kv_cache_fp8.shape[1]
+
+    if _rdna2_paged_mqa_logits_supported(q_fp8, kv_cache_fp8):
+        from vllm import _custom_ops as ops
+
+        (out_logits,) = current_workspace_manager().get_simultaneous(
+            ((batch_size * next_n, max_model_len), torch.float32),
+        )
+        return ops.paged_mqa_logits_rdna2(
+            q_fp8,
+            kv_cache_fp8,
+            weights,
+            context_lens,
+            block_tables,
+            max_model_len,
+            out=out_logits,
+        )
 
     # C4A only: Flash/DSv3.2 also skip insert but still write SHUFFLE.
     if (

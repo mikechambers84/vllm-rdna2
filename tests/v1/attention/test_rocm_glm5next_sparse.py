@@ -321,3 +321,74 @@ def test_rocm_sparse_prefill_routes_glm_shapes_to_rdna2(monkeypatch):
     assert calls
     ref = _sparse_mla_reference(q, kv, indices, indptr, 0.05)
     torch.testing.assert_close(out, ref, atol=2e-2, rtol=2e-2)
+
+
+def _paged_fp8_cache(num_blocks, block_size, generator):
+    """Packed per-block [block_size x 128 fp8 | block_size fp32 scales]."""
+    vals = torch.randn(num_blocks, block_size, 128, generator=generator) * 2
+    vals = vals.to(torch.float8_e4m3fn).view(torch.uint8)
+    scales = torch.rand(num_blocks, block_size, generator=generator) + 0.5
+    packed = torch.cat(
+        [
+            vals.reshape(num_blocks, -1),
+            scales.view(torch.uint8).reshape(num_blocks, -1),
+        ],
+        dim=1,
+    )
+    return packed.reshape(num_blocks, block_size, 1, 132).cuda()
+
+
+@pytest.mark.skipif(not _on_gfx1030(), reason="gfx1030 HIP kernel")
+@pytest.mark.parametrize("block_size", [64, 160])
+@pytest.mark.parametrize("next_n,ctx_per_row", [(1, True), (2, True), (2, False)])
+def test_rdna2_paged_mqa_logits_matches_torch(block_size, next_n, ctx_per_row):
+    from vllm import _custom_ops as ops
+    from vllm.v1.attention.ops.rocm_aiter_mla_sparse import (
+        fp8_paged_mqa_logits_torch,
+    )
+
+    g = torch.Generator().manual_seed(block_size + next_n)
+    # The torch reference's MTP branch needs whole blocks.
+    batch, heads = 3, 32
+    pages = (1000 + block_size - 1) // block_size
+    max_len = pages * block_size
+    num_blocks = batch * pages + 5
+    cache = _paged_fp8_cache(num_blocks, block_size, g)
+    q = (torch.randn(batch, next_n, heads, 128, generator=g) * 2).to(
+        torch.float8_e4m3fn
+    )
+    weights = torch.randn(batch * next_n, heads, generator=g)
+    lens = torch.tensor([1, 333, 999])[:batch]
+    if ctx_per_row:
+        context_lens = (lens[:, None] - next_n + 1 + torch.arange(next_n)).int()
+    else:
+        context_lens = lens.int()
+    block_tables = torch.randperm(num_blocks, generator=g)[: batch * pages]
+    block_tables = block_tables.reshape(batch, pages).int()
+    q, weights, context_lens, block_tables = (
+        t.cuda() for t in (q, weights, context_lens, block_tables)
+    )
+    out = ops.paged_mqa_logits_rdna2(
+        q, cache, weights, context_lens, block_tables, max_len
+    )
+    # The reference's next_n > 1 branch reads per-key [values | scale] rows,
+    # not the block-flat layout its next_n == 1 branch (and the cache writer)
+    # uses, so MTP rows are checked as single-token rows.
+    row_lens = (
+        context_lens.reshape(-1)
+        if ctx_per_row
+        else (context_lens[:, None] - next_n + 1 + torch.arange(next_n).cuda())
+        .reshape(-1)
+        .int()
+    )
+    ref = fp8_paged_mqa_logits_torch(
+        q.reshape(batch * next_n, 1, heads, 128),
+        cache,
+        weights,
+        row_lens[:, None],
+        block_tables.repeat_interleave(next_n, dim=0),
+        max_len,
+    )
+    finite = torch.isfinite(ref)
+    assert torch.equal(finite, torch.isfinite(out))
+    torch.testing.assert_close(out[finite], ref[finite], atol=1e-2, rtol=1e-3)

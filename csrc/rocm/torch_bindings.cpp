@@ -216,6 +216,13 @@ TORCH_LIBRARY_EXPAND(TORCH_EXTENSION_NAME, rocm_ops) {
       "Tensor v_cache, Tensor sel, Tensor tok2req, Tensor block_table, "
       "float scale, Tensor? k_scale=None, Tensor? v_scale=None) -> ()");
   rocm_ops.impl("qsa_decode_rdna2", torch::kCUDA, &qsa_decode_rdna2);
+  // Sparse-attention indexer: paged fp8 MQA logits for decode / MTP.
+  rocm_ops.def(
+      "paged_mqa_logits_rdna2(Tensor q, Tensor kv_cache, Tensor weights, "
+      "Tensor context_lens, Tensor block_tables, Tensor! out, int max_len) "
+      "-> ()");
+  rocm_ops.impl("paged_mqa_logits_rdna2", torch::kCUDA,
+                &paged_mqa_logits_rdna2);
   // Rope-free sparse MLA attention over ragged key lists (GLM-5.3-Flash DSA).
   rocm_ops.def(
       "sparse_mla_attn_rdna2(Tensor q, Tensor kv, Tensor indices, "

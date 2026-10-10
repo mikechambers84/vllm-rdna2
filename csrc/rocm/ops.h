@@ -200,6 +200,13 @@ void qsa_decode_rdna2(torch::Tensor& out, const torch::Tensor& q,
                       const std::optional<torch::Tensor>& k_scale,
                       const std::optional<torch::Tensor>& v_scale);
 
+void paged_mqa_logits_rdna2(const torch::Tensor& q,
+                            const torch::Tensor& kv_cache,
+                            const torch::Tensor& weights,
+                            const torch::Tensor& context_lens,
+                            const torch::Tensor& block_tables,
+                            torch::Tensor& out, int64_t max_len);
+
 void sparse_mla_attn_rdna2(const torch::Tensor& q, const torch::Tensor& kv,
                            const torch::Tensor& indices,
                            const torch::Tensor& indptr, torch::Tensor& out,

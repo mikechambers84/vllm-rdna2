@@ -2673,6 +2673,33 @@ def decode_attention_rdna2(
     )
 
 
+def paged_mqa_logits_rdna2(
+    q: torch.Tensor,
+    kv_cache: torch.Tensor,
+    weights: torch.Tensor,
+    context_lens: torch.Tensor,
+    block_tables: torch.Tensor,
+    max_len: int,
+    out: torch.Tensor | None = None,
+) -> torch.Tensor:
+    """RDNA2 indexer logits for decode / MTP: ``scale[t] * sum_h w[r, h] *
+    relu(q[r, h] . k[t])`` over the paged fp8 cache, -inf past each row's
+    context; returns [B * next_n, max_len] fp32 with no host sync."""
+    rows = q.shape[0] * q.shape[1]
+    if out is None:
+        out = torch.empty(rows, max_len, dtype=torch.float32, device=q.device)
+    torch.ops._rocm_C.paged_mqa_logits_rdna2(
+        q.view(torch.uint8),
+        kv_cache.view(torch.uint8),
+        weights.contiguous(),
+        context_lens.to(torch.int32).contiguous(),
+        block_tables.to(torch.int32),
+        out,
+        max_len,
+    )
+    return out
+
+
 def sparse_mla_attn_rdna2(
     q: torch.Tensor,
     kv: torch.Tensor,

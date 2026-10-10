@@ -37,6 +37,7 @@ from vllm.model_executor.layers.mamba.mamba_utils import (
     MambaStateShapeCalculator,
 )
 from vllm.model_executor.layers.mhc import (
+    HAS_TILELANG_MHC,
     MHCFusedPostPreOp,
     MHCPostOp,
     MHCPreOp,
@@ -456,7 +457,7 @@ class Glm5NextDecoderLayer(nn.Module):
             self.mhc_post_op = MHCPostOp()
             self.mhc_fused_post_pre_op = MHCFusedPostPreOp()
 
-            if vllm_config.kernel_config.enable_jit_warmup:
+            if vllm_config.kernel_config.enable_jit_warmup and HAS_TILELANG_MHC:
                 from vllm.model_executor.kernels.mhc.tilelang_kernels import (
                     _HC_PRENORM_GEMM_TILELANG_KERNEL,
                     _MHC_FUSED_TILELANG_KERNEL,
