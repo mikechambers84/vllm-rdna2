@@ -200,6 +200,21 @@ void qsa_decode_rdna2(torch::Tensor& out, const torch::Tensor& q,
                       const std::optional<torch::Tensor>& k_scale,
                       const std::optional<torch::Tensor>& v_scale);
 
+void mhc_rdna2(
+    const torch::Tensor& residual, const std::optional<torch::Tensor>& x,
+    const std::optional<torch::Tensor>& post_layer_mix,
+    const std::optional<torch::Tensor>& comb_res_mix, const torch::Tensor& fn,
+    const torch::Tensor& hc_scale, const torch::Tensor& hc_base,
+    const std::optional<torch::Tensor>& norm_weight,
+    std::optional<torch::Tensor> residual_out, torch::Tensor& post_mix,
+    torch::Tensor& comb_mix, torch::Tensor& layer_input, torch::Tensor& partial,
+    double rms_eps, double hc_pre_eps, double hc_sinkhorn_eps,
+    double hc_post_mult_value, int64_t sinkhorn_repeat, double norm_eps);
+
+void mhc_post_rdna2(const torch::Tensor& x, const torch::Tensor& residual,
+                    const torch::Tensor& post_layer_mix,
+                    const torch::Tensor& comb_res_mix, torch::Tensor& out);
+
 void gdn_post_conv_rdna2(const torch::Tensor& conv_output,
                          const torch::Tensor& a, const torch::Tensor& b,
                          const torch::Tensor& A_log,

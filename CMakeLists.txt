@@ -1559,6 +1559,7 @@ if(VLLM_GPU_LANG STREQUAL "HIP")
                                   "csrc/rocm/moe_int8_rdna2.cu"
                                   "csrc/rocm/attention_rdna2.cu"
                                   "csrc/rocm/gdn_rdna2.cu"
+                                  "csrc/rocm/mhc_rdna2.cu"
                                   "csrc/rocm/gemm_rocblas_rdna2.cu")
   endif()
 

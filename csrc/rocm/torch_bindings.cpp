@@ -216,6 +216,20 @@ TORCH_LIBRARY_EXPAND(TORCH_EXTENSION_NAME, rocm_ops) {
       "Tensor v_cache, Tensor sel, Tensor tok2req, Tensor block_table, "
       "float scale, Tensor? k_scale=None, Tensor? v_scale=None) -> ()");
   rocm_ops.impl("qsa_decode_rdna2", torch::kCUDA, &qsa_decode_rdna2);
+  // mHC seam (post mix, pre mix logits + Sinkhorn, layer input + RMS norm)
+  // in one kernel per token.
+  rocm_ops.def(
+      "mhc_rdna2(Tensor residual, Tensor? x, Tensor? post_layer_mix, "
+      "Tensor? comb_res_mix, Tensor fn, Tensor hc_scale, Tensor hc_base, "
+      "Tensor? norm_weight, Tensor(a!)? residual_out, Tensor! post_mix, "
+      "Tensor! comb_mix, Tensor! layer_input, Tensor! partial, float rms_eps, "
+      "float hc_pre_eps, float hc_sinkhorn_eps, float hc_post_mult_value, "
+      "int sinkhorn_repeat, float norm_eps) -> ()");
+  rocm_ops.impl("mhc_rdna2", torch::kCUDA, &mhc_rdna2);
+  rocm_ops.def(
+      "mhc_post_rdna2(Tensor x, Tensor residual, Tensor post_layer_mix, "
+      "Tensor comb_res_mix, Tensor! out) -> ()");
+  rocm_ops.impl("mhc_post_rdna2", torch::kCUDA, &mhc_post_rdna2);
   // Gated DeltaNet prefill: post-conv1d q/k/v split, l2 norm and gating.
   rocm_ops.def(
       "gdn_post_conv_rdna2(Tensor conv_output, Tensor a, Tensor b, "
