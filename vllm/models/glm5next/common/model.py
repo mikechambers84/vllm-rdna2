@@ -994,6 +994,8 @@ class Glm5NextModel(nn.Module):
                     )
                     weight_loader(param, loaded_weight, **kwargs)
             loaded_params.add(name)
+        if _keep_fp8_attn_proj():
+            _store_fp8_attn_projs(self)
         return loaded_params
 
 
@@ -1379,4 +1381,45 @@ def _try_load_fp8_attn_proj(
     else:
         param.weight_loader(param, weight_bf16, shard_id)
     loaded_params.add(target_w)
+    if _keep_fp8_attn_proj() and not (is_kva and kv_a_pad_size > 0):
+        # Kept for _store_fp8_attn_projs, which swaps in the FP8 weights.
+        if not hasattr(param, "fp8_block_shards"):
+            param.fp8_block_shards = {}
+        param.fp8_block_shards[shard_id] = (weight_fp8, scale_inv)
     return True
+
+
+def _keep_fp8_attn_proj() -> bool:
+    """gfx1030 computes with the block-FP8 attention projections directly."""
+    if not current_platform.is_rocm():
+        return False
+    from vllm.platforms.rocm import on_gfx1030
+
+    return on_gfx1030() and hasattr(torch.ops._rocm_C, "gemm_w8_rdna2")
+
+
+def _store_fp8_attn_projs(model: nn.Module) -> None:
+    """Replace the dequantized FP8 attention projections with their
+    checkpoint FP8 weights where every shard of a layer arrived."""
+    from vllm.model_executor.kernels.linear.rdna2_w8a16 import fp8_block_weight
+
+    for module in model.modules():
+        param = getattr(module, "weight", None)
+        shards = getattr(param, "fp8_block_shards", None)
+        if param is None or not shards:
+            continue
+        del param.fp8_block_shards
+        sizes = getattr(module, "output_sizes", None)
+        order = list(range(len(sizes))) if sizes and None not in shards else [None]
+        if any(s not in shards for s in order):
+            continue
+        weight = torch.cat([shards[s][0] for s in order])
+        scale = torch.cat([shards[s][1] for s in order])
+        if weight.shape != param.shape or any(
+            d % b for d, b in zip(weight.shape, scale.shape)
+        ):
+            continue
+        block_n = weight.shape[0] // scale.shape[0]
+        block_k = weight.shape[1] // scale.shape[1]
+        if all(shards[s][0].shape[0] % block_n == 0 for s in order):
+            fp8_block_weight(module, weight, scale, block_n, block_k)
