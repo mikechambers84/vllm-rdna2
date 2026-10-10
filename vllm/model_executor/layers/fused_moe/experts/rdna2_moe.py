@@ -112,9 +112,12 @@ class Rdna2WNA16Experts(TritonWNA16Experts):
     # the fused decode kernel from ~2 routed rows per expert in the engine
     # (Qwen3.6-35B-A3B: equal at 64-token prefills, -26 to -34% at 96-128;
     # +12% at batch-16 decode) and the tiled GEMM up to ~28 (~16 against the
-    # W4A8 GEMM), E=256 top-8.
+    # W4A8 GEMM), E=256 top-8. Large experts keep it ahead longer: GLM-5.3-Flash
+    # (gate_up 4096 x 4096) up to ~44 rows per expert, -26% at 28.
     MIN_SKINNY_ROWS_PER_EXPERT = 2.5
     MAX_SKINNY_ROWS_PER_EXPERT = 28
+    MAX_SKINNY_ROWS_PER_EXPERT_LARGE = 44
+    LARGE_EXPERT_ELEMENTS = 8 << 20
     MAX_SKINNY_ROWS_PER_EXPERT_W4A8 = 16
 
     @staticmethod
@@ -199,14 +202,17 @@ class Rdna2WNA16Experts(TritonWNA16Experts):
         )
 
     @classmethod
-    def _skinny_block_m(cls, rows_per_expert: float, w4a8: bool) -> int:
+    def _skinny_block_m(
+        cls, rows_per_expert: float, w4a8: bool, expert_elements: int = 0
+    ) -> int:
         """Rows per workgroup of moe_wna16_skinny_rdna2, 0 to use the tiled
-        GEMMs instead."""
-        limit = (
-            cls.MAX_SKINNY_ROWS_PER_EXPERT_W4A8
-            if w4a8
-            else cls.MAX_SKINNY_ROWS_PER_EXPERT
-        )
+        GEMMs instead. ``expert_elements``: N * K of one expert's gate_up."""
+        if w4a8:
+            limit: float = cls.MAX_SKINNY_ROWS_PER_EXPERT_W4A8
+        elif expert_elements >= cls.LARGE_EXPERT_ELEMENTS:
+            limit = cls.MAX_SKINNY_ROWS_PER_EXPERT_LARGE
+        else:
+            limit = cls.MAX_SKINNY_ROWS_PER_EXPERT
         if not rdna2_moe_kernel_available("moe_wna16_skinny_rdna2") or not (
             cls.MIN_SKINNY_ROWS_PER_EXPERT <= rows_per_expert <= limit
         ):
@@ -253,7 +259,7 @@ class Rdna2WNA16Experts(TritonWNA16Experts):
         num_experts, n = w1.size(0), w1.size(1)
         rows_per_expert = num_tokens * top_k / num_experts
         w4a8 = self._use_w4a8(num_tokens, w1, w2)
-        skinny = self._skinny_block_m(rows_per_expert, w4a8)
+        skinny = self._skinny_block_m(rows_per_expert, w4a8, n * hidden_states.size(1))
         if skinny:
             w4a8, block_m = False, skinny
         elif w4a8:
@@ -354,7 +360,12 @@ class Rdna2WNA16Experts(TritonWNA16Experts):
             apply_router_weight_on_input,
         ) or (
             prefill_ok
-            and self._skinny_block_m(topk_ids.numel() / w1.size(0), False) > 0
+            and self._skinny_block_m(
+                topk_ids.numel() / w1.size(0),
+                False,
+                w1.size(1) * hidden_states.size(1),
+            )
+            > 0
         ):
             if prefill_ok:
                 return self._apply_prefill(

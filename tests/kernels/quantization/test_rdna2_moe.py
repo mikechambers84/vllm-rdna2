@@ -534,3 +534,24 @@ def test_unquantized_experts_become_rdna2_int8_with_opt_in(
         None, "mtp.layers.0.mlp.experts", None, config
     )
     assert not isinstance(method, Rdna2Int8OnlineMoEMethod)
+
+
+@pytest.mark.parametrize(
+    "rows_per_expert,expert_elements,expected",
+    [
+        (28.4, 1024 * 2048, 0),  # Qwen3.6-35B-A3B experts: tiled GEMM
+        (28.4, 4096 * 4096, 16),  # GLM-5.3-Flash at 1024-token chunks
+        (49.8, 4096 * 4096, 0),
+        (10.0, 4096 * 4096, 8),
+    ],
+)
+def test_skinny_moe_range_grows_with_expert_size(
+    rows_per_expert, expert_elements, expected
+):
+    """Large experts stay on the skinny GEMM longer (measured on a V620)."""
+    from vllm.model_executor.layers.fused_moe.experts.rdna2_moe import (
+        Rdna2WNA16Experts,
+    )
+
+    got = Rdna2WNA16Experts._skinny_block_m(rows_per_expert, False, expert_elements)
+    assert got == expected
