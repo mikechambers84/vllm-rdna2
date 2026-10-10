@@ -206,6 +206,64 @@ def test_moe_wna16_skinny_rdna2_matches_reference(block_m, group, zp, dims):
     assert ((out - ref).norm() / ref.norm()).item() < 2e-3
 
 
+@pytest.mark.parametrize("zp", [False, True])
+@pytest.mark.parametrize("group", [32, 128])
+@pytest.mark.parametrize("block_m", [8, 16])
+@pytest.mark.parametrize("dims", [(H, INTER), (1280, 768)])
+def test_moe_wna16_kslice_rdna2_matches_reference(block_m, group, zp, dims):
+    """The K-split few-rows GEMM (lane octets share a column) gives both routed
+    GEMMs to fp16-rounding accuracy, symmetric and with zero points."""
+    from vllm import _custom_ops as ops
+    from vllm.model_executor.layers.fused_moe.moe_align_block_size import (
+        moe_align_block_size,
+    )
+
+    hidden, inter = dims
+    torch.manual_seed(0)
+    num_tokens = 24
+    w13, s13, w13_ref, z13 = _experts(2 * inter, hidden, group, zp)
+    w2, s2, w2_ref, z2 = _experts(hidden, inter, group, zp)
+    x = torch.randn(num_tokens, hidden, dtype=torch.float16, device="cuda") * 0.5
+    topk_weights, topk_ids = torch.topk(
+        torch.randn(num_tokens, E, device="cuda").softmax(-1), TOPK, dim=-1
+    )
+    topk_ids = topk_ids.int()
+    sorted_ids, expert_ids, num_post_padded = moe_align_block_size(topk_ids, block_m, E)
+    gate_up = torch.empty(num_tokens * TOPK, 2 * inter, dtype=x.dtype, device="cuda")
+    act = torch.empty(num_tokens * TOPK, inter, dtype=x.dtype, device="cuda")
+    down = torch.empty(num_tokens, TOPK, hidden, dtype=x.dtype, device="cuda")
+    args = (sorted_ids, expert_ids, num_post_padded, topk_weights)
+
+    ops.moe_wna16_kslice_rdna2(gate_up, x, w13, s13, z13, *args, TOPK, False, block_m)
+    torch.ops._C.silu_and_mul(act, gate_up)
+    ops.moe_wna16_kslice_rdna2(down, act, w2, s2, z2, *args, 1, True, block_m)
+
+    ref = _reference(x, topk_weights, topk_ids.long(), w13_ref, w2_ref)
+    out = down.float().sum(1)
+    assert ((out - ref).norm() / ref.norm()).item() < 2e-3
+
+
+@pytest.mark.parametrize(
+    "rows_per_expert,elements,k1,k2,expected",
+    [
+        (28.4, 4096 * 4096, 4096, 2048, True),  # GLM-5.3-Flash, 1024-token chunk
+        (3.0, 4096 * 4096, 4096, 2048, True),
+        (113.0, 4096 * 4096, 4096, 2048, False),  # 128-row tiles win
+        (2.0, 4096 * 4096, 4096, 2048, False),  # fused decode kernel
+        (28.4, 1024 * 2048, 2048, 512, False),  # Qwen3.6-35B-A3B experts
+        (28.4, 4096 * 4224, 4224, 2048, False),  # K % 256 != 0
+    ],
+)
+def test_kslice_moe_takes_large_experts(rows_per_expert, elements, k1, k2, expected):
+    """moe_wna16_kslice_rdna2 serves large experts over the measured range."""
+    from vllm.model_executor.layers.fused_moe.experts.rdna2_moe import (
+        Rdna2WNA16Experts,
+    )
+
+    got = Rdna2WNA16Experts._use_kslice(rows_per_expert, elements, k1, k2)
+    assert got == expected
+
+
 @pytest.mark.parametrize(
     "op,block_m",
     [

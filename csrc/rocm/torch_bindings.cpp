@@ -216,6 +216,14 @@ TORCH_LIBRARY_EXPAND(TORCH_EXTENSION_NAME, rocm_ops) {
       "Tensor v_cache, Tensor sel, Tensor tok2req, Tensor block_table, "
       "float scale, Tensor? k_scale=None, Tensor? v_scale=None) -> ()");
   rocm_ops.impl("qsa_decode_rdna2", torch::kCUDA, &qsa_decode_rdna2);
+  // W4A16 fused-MoE GEMM at a few rows per expert, K split over lane octets.
+  rocm_ops.def(
+      "moe_wna16_kslice_rdna2(Tensor! output, Tensor a, Tensor w, "
+      "Tensor scales, Tensor? zeros, Tensor sorted_ids, Tensor expert_ids, "
+      "Tensor num_tokens_post_padded, Tensor topk_weights, int top_k, "
+      "bool mul_routed_weight, int block_m) -> ()");
+  rocm_ops.impl("moe_wna16_kslice_rdna2", torch::kCUDA,
+                &moe_wna16_kslice_rdna2);
   // Batched GEMV for a few rows (MLA absorption products in decode).
   rocm_ops.def("bmm_skinny_rdna2(Tensor x, Tensor w, Tensor! out) -> ()");
   rocm_ops.impl("bmm_skinny_rdna2", torch::kCUDA, &bmm_skinny_rdna2);

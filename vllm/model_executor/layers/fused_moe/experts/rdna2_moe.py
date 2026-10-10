@@ -119,6 +119,10 @@ class Rdna2WNA16Experts(TritonWNA16Experts):
     MAX_SKINNY_ROWS_PER_EXPERT_LARGE = 44
     LARGE_EXPERT_ELEMENTS = 8 << 20
     MAX_SKINNY_ROWS_PER_EXPERT_W4A8 = 16
+    # moe_wna16_kslice_rdna2 (8-row tiles) beats the skinny and tiled GEMMs on
+    # large experts from 3 to ~80 rows per expert (GLM-5.3-Flash: -20% at 3-8,
+    # -16% at 28, ahead of 128-row tiles at 80, behind them at 113).
+    MAX_KSLICE_ROWS_PER_EXPERT = 96
 
     @staticmethod
     def _supports_current_device() -> bool:
@@ -221,6 +225,21 @@ class Rdna2WNA16Experts(TritonWNA16Experts):
             return 4
         return 8 if rows_per_expert <= 12 else 16
 
+    @classmethod
+    def _use_kslice(
+        cls, rows_per_expert: float, expert_elements: int, k1: int, k2: int
+    ) -> bool:
+        """moe_wna16_kslice_rdna2 for both routed GEMMs (K = k1, k2)."""
+        return (
+            expert_elements >= cls.LARGE_EXPERT_ELEMENTS
+            and cls.MIN_SKINNY_ROWS_PER_EXPERT
+            <= rows_per_expert
+            <= cls.MAX_KSLICE_ROWS_PER_EXPERT
+            and k1 % 256 == 0
+            and k2 % 256 == 0
+            and rdna2_moe_kernel_available("moe_wna16_kslice_rdna2")
+        )
+
     @staticmethod
     def _prefill_block_m(rows_per_expert: float) -> int:
         # Tile height by routed rows per expert, from a sweep on E=256 top-8.
@@ -259,8 +278,20 @@ class Rdna2WNA16Experts(TritonWNA16Experts):
         num_experts, n = w1.size(0), w1.size(1)
         rows_per_expert = num_tokens * top_k / num_experts
         w4a8 = self._use_w4a8(num_tokens, w1, w2)
-        skinny = self._skinny_block_m(rows_per_expert, w4a8, n * hidden_states.size(1))
-        if skinny:
+        kslice = not w4a8 and self._use_kslice(
+            rows_per_expert,
+            n * hidden_states.size(1),
+            hidden_states.size(1),
+            w2.size(2) * 2,
+        )
+        skinny = 0
+        if not kslice:
+            skinny = self._skinny_block_m(
+                rows_per_expert, w4a8, n * hidden_states.size(1)
+            )
+        if kslice:
+            block_m = 8
+        elif skinny:
             w4a8, block_m = False, skinny
         elif w4a8:
             block_m = 64 if num_tokens * top_k <= 96 * num_experts else 128
@@ -277,7 +308,11 @@ class Rdna2WNA16Experts(TritonWNA16Experts):
         )
 
         def gemm(out, a, w, scale, zp, k, mul):
-            if skinny:
+            if kslice:
+                ops.moe_wna16_kslice_rdna2(
+                    out, a, w, scale, zp, *align, k, mul, block_m
+                )
+            elif skinny:
                 ops.moe_wna16_skinny_rdna2(
                     out, a, w, scale, zp, *align, k, mul, block_m
                 )

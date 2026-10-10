@@ -200,6 +200,15 @@ void qsa_decode_rdna2(torch::Tensor& out, const torch::Tensor& q,
                       const std::optional<torch::Tensor>& k_scale,
                       const std::optional<torch::Tensor>& v_scale);
 
+void moe_wna16_kslice_rdna2(torch::Tensor& output, const torch::Tensor& a,
+                            const torch::Tensor& w, const torch::Tensor& scales,
+                            const std::optional<torch::Tensor>& zeros,
+                            const torch::Tensor& sorted_ids,
+                            const torch::Tensor& expert_ids,
+                            const torch::Tensor& num_tokens_post_padded,
+                            const torch::Tensor& topk_weights, int64_t top_k,
+                            bool mul_routed_weight, int64_t block_m);
+
 void bmm_skinny_rdna2(const torch::Tensor& x, const torch::Tensor& w,
                       torch::Tensor& out);
 

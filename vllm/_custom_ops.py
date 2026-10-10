@@ -2376,6 +2376,38 @@ def moe_fp8_gemm_rdna2(
     )
 
 
+def moe_wna16_kslice_rdna2(
+    output: torch.Tensor,
+    a: torch.Tensor,
+    w: torch.Tensor,
+    scales: torch.Tensor,
+    zeros: torch.Tensor | None,
+    sorted_ids: torch.Tensor,
+    expert_ids: torch.Tensor,
+    num_tokens_post_padded: torch.Tensor,
+    topk_weights: torch.Tensor,
+    top_k: int,
+    mul_routed_weight: bool,
+    block_m: int,
+) -> None:
+    """RDNA2 W4A16 MoE GEMM with moe_wna16_skinny_rdna2's contract for block_m
+    8 or 16 and K % 256 == 0; lane octets split K so weight loads coalesce."""
+    torch.ops._rocm_C.moe_wna16_kslice_rdna2(
+        output,
+        a,
+        w,
+        scales,
+        zeros,
+        sorted_ids,
+        expert_ids,
+        num_tokens_post_padded,
+        topk_weights,
+        top_k,
+        mul_routed_weight,
+        block_m,
+    )
+
+
 def moe_wna16_skinny_rdna2(
     output: torch.Tensor,
     a: torch.Tensor,
