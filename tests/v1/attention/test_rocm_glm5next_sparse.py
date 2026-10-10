@@ -413,3 +413,23 @@ def test_rdna2_paged_mqa_logits_matches_torch(block_size, next_n, ctx_per_row):
     finite = torch.isfinite(ref)
     assert torch.equal(finite, torch.isfinite(out))
     torch.testing.assert_close(out[finite], ref[finite], atol=1e-2, rtol=1e-3)
+
+
+@pytest.mark.skipif(not _on_gfx1030(), reason="gfx1030 HIP kernel")
+@pytest.mark.parametrize("rows", [1, 3, 8])
+@pytest.mark.parametrize("k,c", [(256, 512), (512, 256)])
+def test_rdna2_bmm_skinny_matches_bmm(rows, k, c):
+    """MLA's decode absorption products (q_nope @ W_UK^T, o @ W_UV) on the
+    batched GEMV, with the token-major views the MLA layer passes."""
+    from vllm import _custom_ops as ops
+
+    g = torch.Generator().manual_seed(rows * 7 + k)
+    heads = 64
+    x = (torch.randn(rows, heads, k, generator=g) * 0.5).half().cuda()
+    w = (torch.randn(heads, k, c, generator=g) * 0.05).half().cuda()
+    out = torch.full((rows, heads, c), float("nan"), dtype=torch.half, device="cuda")
+    x_nbk = x.transpose(0, 1)
+    assert ops.bmm_skinny_rdna2_supported(x_nbk, w)
+    ops.bmm_skinny_rdna2(x_nbk, w, out.transpose(0, 1))
+    ref = torch.bmm(x_nbk.float(), w.float()).transpose(0, 1)
+    torch.testing.assert_close(out.float(), ref, atol=2e-2, rtol=1e-2)

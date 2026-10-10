@@ -200,6 +200,9 @@ void qsa_decode_rdna2(torch::Tensor& out, const torch::Tensor& q,
                       const std::optional<torch::Tensor>& k_scale,
                       const std::optional<torch::Tensor>& v_scale);
 
+void bmm_skinny_rdna2(const torch::Tensor& x, const torch::Tensor& w,
+                      torch::Tensor& out);
+
 void paged_mqa_logits_rdna2(const torch::Tensor& q,
                             const torch::Tensor& kv_cache,
                             const torch::Tensor& weights,

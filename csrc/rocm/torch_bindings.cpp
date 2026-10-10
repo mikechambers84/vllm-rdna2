@@ -216,6 +216,9 @@ TORCH_LIBRARY_EXPAND(TORCH_EXTENSION_NAME, rocm_ops) {
       "Tensor v_cache, Tensor sel, Tensor tok2req, Tensor block_table, "
       "float scale, Tensor? k_scale=None, Tensor? v_scale=None) -> ()");
   rocm_ops.impl("qsa_decode_rdna2", torch::kCUDA, &qsa_decode_rdna2);
+  // Batched GEMV for a few rows (MLA absorption products in decode).
+  rocm_ops.def("bmm_skinny_rdna2(Tensor x, Tensor w, Tensor! out) -> ()");
+  rocm_ops.impl("bmm_skinny_rdna2", torch::kCUDA, &bmm_skinny_rdna2);
   // Sparse-attention indexer: paged fp8 MQA logits for decode / MTP.
   rocm_ops.def(
       "paged_mqa_logits_rdna2(Tensor q, Tensor kv_cache, Tensor weights, "

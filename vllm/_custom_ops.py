@@ -2673,6 +2673,25 @@ def decode_attention_rdna2(
     )
 
 
+def bmm_skinny_rdna2_supported(x: torch.Tensor, w: torch.Tensor) -> bool:
+    """Whether bmm_skinny_rdna2 takes x [N, B, K] @ w [N, K, C]."""
+    return (
+        x.dtype == w.dtype == torch.float16
+        and x.dim() == 3
+        and x.shape[1] <= 8
+        and x.shape[2] <= 512
+        and x.stride(2) == 1
+        and w.is_contiguous()
+        and w.shape[2] % 8 == 0
+    )
+
+
+def bmm_skinny_rdna2(x: torch.Tensor, w: torch.Tensor, out: torch.Tensor) -> None:
+    """RDNA2 batched GEMV ``out[n] = x[n] @ w[n]`` for at most 8 rows per
+    batch (``out`` [N, B, C] with contiguous rows, any N / B strides)."""
+    torch.ops._rocm_C.bmm_skinny_rdna2(x, w, out)
+
+
 def paged_mqa_logits_rdna2(
     q: torch.Tensor,
     kv_cache: torch.Tensor,
