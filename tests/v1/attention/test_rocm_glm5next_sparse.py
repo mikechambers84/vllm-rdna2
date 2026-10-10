@@ -338,6 +338,44 @@ def _paged_fp8_cache(num_blocks, block_size, generator):
     return packed.reshape(num_blocks, block_size, 1, 132).cuda()
 
 
+@pytest.mark.skipif(not current_platform.is_rocm(), reason="ROCm required")
+@pytest.mark.parametrize("ctx_per_row", [True, False])
+def test_paged_mqa_logits_reference_mtp_rows_match_single_rows(ctx_per_row):
+    """MTP rows of the reference read the block-flat cache like single-token
+    rows (a past version read per-key [values | scale] rows)."""
+    from vllm.v1.attention.ops.rocm_aiter_mla_sparse import (
+        fp8_paged_mqa_logits_torch,
+    )
+
+    g = torch.Generator().manual_seed(11)
+    batch, next_n, heads, block_size, max_len = 2, 3, 32, 64, 300
+    pages = (max_len + block_size - 1) // block_size
+    cache = _paged_fp8_cache(batch * pages, block_size, g)
+    q = (torch.randn(batch, next_n, heads, 128, generator=g) * 2).to(
+        torch.float8_e4m3fn
+    )
+    weights = torch.randn(batch * next_n, heads, generator=g)
+    lens = torch.tensor([70, 299])
+    row_lens = (lens[:, None] - next_n + 1 + torch.arange(next_n)).int()
+    context_lens = row_lens if ctx_per_row else lens.int()
+    block_tables = torch.arange(batch * pages).reshape(batch, pages).int()
+    q, weights, context_lens, block_tables, row_lens = (
+        t.cuda() for t in (q, weights, context_lens, block_tables, row_lens)
+    )
+    mtp = fp8_paged_mqa_logits_torch(
+        q, cache, weights, context_lens, block_tables, max_len
+    )
+    single = fp8_paged_mqa_logits_torch(
+        q.reshape(batch * next_n, 1, heads, 128),
+        cache,
+        weights,
+        row_lens.reshape(-1, 1),
+        block_tables.repeat_interleave(next_n, dim=0),
+        max_len,
+    )
+    torch.testing.assert_close(mtp, single)
+
+
 @pytest.mark.skipif(not _on_gfx1030(), reason="gfx1030 HIP kernel")
 @pytest.mark.parametrize("block_size", [64, 160])
 @pytest.mark.parametrize("next_n,ctx_per_row", [(1, True), (2, True), (2, False)])
@@ -348,10 +386,8 @@ def test_rdna2_paged_mqa_logits_matches_torch(block_size, next_n, ctx_per_row):
     )
 
     g = torch.Generator().manual_seed(block_size + next_n)
-    # The torch reference's MTP branch needs whole blocks.
-    batch, heads = 3, 32
-    pages = (1000 + block_size - 1) // block_size
-    max_len = pages * block_size
+    batch, heads, max_len = 3, 32, 1000
+    pages = (max_len + block_size - 1) // block_size
     num_blocks = batch * pages + 5
     cache = _paged_fp8_cache(num_blocks, block_size, g)
     q = (torch.randn(batch, next_n, heads, 128, generator=g) * 2).to(
@@ -371,23 +407,8 @@ def test_rdna2_paged_mqa_logits_matches_torch(block_size, next_n, ctx_per_row):
     out = ops.paged_mqa_logits_rdna2(
         q, cache, weights, context_lens, block_tables, max_len
     )
-    # The reference's next_n > 1 branch reads per-key [values | scale] rows,
-    # not the block-flat layout its next_n == 1 branch (and the cache writer)
-    # uses, so MTP rows are checked as single-token rows.
-    row_lens = (
-        context_lens.reshape(-1)
-        if ctx_per_row
-        else (context_lens[:, None] - next_n + 1 + torch.arange(next_n).cuda())
-        .reshape(-1)
-        .int()
-    )
     ref = fp8_paged_mqa_logits_torch(
-        q.reshape(batch * next_n, 1, heads, 128),
-        cache,
-        weights,
-        row_lens[:, None],
-        block_tables.repeat_interleave(next_n, dim=0),
-        max_len,
+        q, cache, weights, context_lens, block_tables, max_len
     )
     finite = torch.isfinite(ref)
     assert torch.equal(finite, torch.isfinite(out))
