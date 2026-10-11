@@ -52,6 +52,19 @@ def _on_gfx1030() -> bool:
     return on_gfx1030() and hasattr(torch.ops._rocm_C, "gemv_rdna2")
 
 
+def _use_rdna2_kmajor_gemm(x: torch.Tensor) -> bool:
+    """gfx1030 runs the indexer's small projections above 8 rows (prefill) as
+    one K-major fp16 gemm_w8_rdna2."""
+    return (
+        _on_gfx1030()
+        and hasattr(torch.ops._rocm_C, "gemm_w8_rdna2")
+        and x.dim() == 2
+        and x.shape[0] > 8
+        and x.dtype == torch.float16
+        and x.stride(1) == 1
+    )
+
+
 def _use_rdna2_gemv(x: torch.Tensor) -> bool:
     """gfx1030 runs the indexer's small projections at 1-8 rows (decode, MTP
     verify) as gemv_rdna2 instead of rocBLAS GEMMs (~60-130 us each)."""
@@ -315,6 +328,7 @@ class Indexer(nn.Module):
         self.topk_indices_buffer = topk_indices_buffer
         self._wp_fp32: torch.Tensor | None = None
         self._wp_f16: torch.Tensor | None = None
+        self._kg_kmajor: torch.Tensor | None = None
 
         # NOTE: (zyongye) we use fp8 naive cache,
         #       where we store value in fp8 and scale in fp32
@@ -364,8 +378,27 @@ class Indexer(nn.Module):
 
         # Compute the head gate in fp32; bf16 error can change near-tie pool
         # rankings on long-context tasks. Cache it after weights are loaded.
-        kw, _ = self.wk_weights_proj(hidden_states)
-        k = kw[:, : self.head_dim]
+        gate_score = None
+        if _use_rdna2_kmajor_gemm(hidden_states):
+            # gfx1030 prefill: wk and the kpool gate as one K-major fp16 GEMM
+            # (rocBLAS took ~0.6 ms for each of these 128-column outputs).
+            if self._kg_kmajor is None:
+                from vllm.model_executor.kernels.linear.rdna2_w8a16 import kmajor_w16
+
+                self._kg_kmajor = kmajor_w16(
+                    torch.cat(
+                        [
+                            self.wk_weights_proj.weight.data[: self.head_dim],
+                            self.index_kpool_compress_gate.data,
+                        ]
+                    ).half()
+                )
+            kg = ops.gemm_w8_rdna2(hidden_states, self._kg_kmajor, None)
+            k = kg[:, : self.head_dim]
+            gate_score = kg[:, self.head_dim :].contiguous()
+        else:
+            kw, _ = self.wk_weights_proj(hidden_states)
+            k = kw[:, : self.head_dim]
         if _use_rdna2_gemv(hidden_states):
             # fp32 accumulation and output on the fp16 weights (exact copies of
             # the checkpoint's bf16 ones): the fp32 mm below up to summation
@@ -430,7 +463,9 @@ class Indexer(nn.Module):
         # kpool: per-token gate score driving the softmax-weighted pool. Computed
         # from the same hidden_states that produced `k`, so it stays token-aligned.
         # F.linear(x, gate) = x @ gate.T  with gate [head_dim, hidden_size].
-        if _use_rdna2_gemv(hidden_states):
+        if gate_score is not None:
+            pass
+        elif _use_rdna2_gemv(hidden_states):
             gate_score = ops.gemv_rdna2(hidden_states, self.index_kpool_compress_gate)
         else:
             gate_score = F.linear(hidden_states, self.index_kpool_compress_gate)
