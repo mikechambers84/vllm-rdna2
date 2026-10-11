@@ -2132,10 +2132,15 @@ def w8a8_gemm_rdna2(
 
 
 def gemv_rdna2(
-    a: torch.Tensor, w: torch.Tensor, bias: torch.Tensor | None = None
+    a: torch.Tensor,
+    w: torch.Tensor,
+    bias: torch.Tensor | None = None,
+    out_fp32: bool = False,
 ) -> torch.Tensor:
-    """RDNA2 fp16/bf16 GEMV: ``a @ w.T (+ bias)`` for ``a`` of at most 8 rows."""
-    return torch.ops._rocm_C.gemv_rdna2(a, w, bias)
+    """RDNA2 fp16/bf16 GEMV: ``a @ w.T (+ bias)`` for ``a`` of at most 8 rows,
+    accumulated in fp32 and returned in the input dtype (fp32 with
+    ``out_fp32``)."""
+    return torch.ops._rocm_C.gemv_rdna2(a, w, bias, out_fp32)
 
 
 def gemm_w8_rdna2(

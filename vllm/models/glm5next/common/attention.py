@@ -1,11 +1,14 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
+import functools
+
 import torch
 import torch.nn.functional as F
 from torch import nn
 from transformers import Glm5NextTextConfig
 
+from vllm import _custom_ops as ops
 from vllm.config import (
     CacheConfig,
     VllmConfig,
@@ -38,6 +41,31 @@ from vllm.utils.math_utils import cdiv, next_power_of_2
 from vllm.v1.kv_cache_interface import KpoolTailSpec, MLAAttentionSpec
 
 logger = init_logger(__name__)
+
+
+@functools.cache
+def _on_gfx1030() -> bool:
+    if not current_platform.is_rocm():
+        return False
+    from vllm.platforms.rocm import on_gfx1030
+
+    return on_gfx1030() and hasattr(torch.ops._rocm_C, "gemv_rdna2")
+
+
+def _use_rdna2_gemv(x: torch.Tensor) -> bool:
+    """gfx1030 runs the indexer's small projections at 1-8 rows (decode, MTP
+    verify) as gemv_rdna2 instead of rocBLAS GEMMs (~60-130 us each)."""
+    return (
+        _on_gfx1030()
+        and x.dim() == 2
+        and 1 <= x.shape[0] <= 8
+        and x.dtype in (torch.float16, torch.bfloat16)
+        and x.stride(1) == 1
+        and x.stride(0) % 8 == 0
+        and x.shape[1] % 8 == 0
+        and x.data_ptr() % 16 == 0
+    )
+
 
 # Shared torch.compile config for the indexer's small-kernel leaves. The MLA
 # indexer runs under breakable-CG (CompilationMode.NONE), which blocks FX-graph
@@ -286,6 +314,7 @@ class Indexer(nn.Module):
         self.quant_block_size = 128  # TODO: get from config
         self.topk_indices_buffer = topk_indices_buffer
         self._wp_fp32: torch.Tensor | None = None
+        self._wp_f16: torch.Tensor | None = None
 
         # NOTE: (zyongye) we use fp8 naive cache,
         #       where we store value in fp8 and scale in fp32
@@ -337,14 +366,24 @@ class Indexer(nn.Module):
         # rankings on long-context tasks. Cache it after weights are loaded.
         kw, _ = self.wk_weights_proj(hidden_states)
         k = kw[:, : self.head_dim]
-        if self._wp_fp32 is None:
-            self._wp_fp32 = (
-                self.wk_weights_proj.weight.data[self.head_dim :, :]
-                .t()
-                .contiguous()
-                .float()
-            )
-        weights = torch.mm(hidden_states.float(), self._wp_fp32)
+        if _use_rdna2_gemv(hidden_states):
+            # fp32 accumulation and output on the fp16 weights (exact copies of
+            # the checkpoint's bf16 ones): the fp32 mm below up to summation
+            # order, without rocBLAS's ~60 us for 1-8 rows.
+            if self._wp_f16 is None:
+                self._wp_f16 = self.wk_weights_proj.weight.data[
+                    self.head_dim :, :
+                ].contiguous()
+            weights = ops.gemv_rdna2(hidden_states, self._wp_f16, out_fp32=True)
+        else:
+            if self._wp_fp32 is None:
+                self._wp_fp32 = (
+                    self.wk_weights_proj.weight.data[self.head_dim :, :]
+                    .t()
+                    .contiguous()
+                    .float()
+                )
+            weights = torch.mm(hidden_states.float(), self._wp_fp32)
 
         k = _fused_indexer_k_norm(
             k, self.k_norm.weight, self.k_norm.bias, self.head_dim, self.k_norm.eps
@@ -391,7 +430,10 @@ class Indexer(nn.Module):
         # kpool: per-token gate score driving the softmax-weighted pool. Computed
         # from the same hidden_states that produced `k`, so it stays token-aligned.
         # F.linear(x, gate) = x @ gate.T  with gate [head_dim, hidden_size].
-        gate_score = F.linear(hidden_states, self.index_kpool_compress_gate)
+        if _use_rdna2_gemv(hidden_states):
+            gate_score = ops.gemv_rdna2(hidden_states, self.index_kpool_compress_gate)
+        else:
+            gate_score = F.linear(hidden_states, self.index_kpool_compress_gate)
 
         # DeepGEMM's MQA-logits kernels (fp8_mqa_logits /
         # fp8_fp4_paged_mqa_logits) require num_heads in {32, 64}; this

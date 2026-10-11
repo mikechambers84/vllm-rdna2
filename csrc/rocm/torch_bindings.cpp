@@ -70,7 +70,9 @@ TORCH_LIBRARY_EXPAND(TORCH_EXTENSION_NAME, rocm_ops) {
       "Tensor? bias, ScalarType out_dtype) -> Tensor");
   rocm_ops.impl("w8a8_gemm_rdna2", torch::kCUDA, &w8a8_gemm_rdna2);
   // fp16/bf16 GEMV (M <= 8).
-  rocm_ops.def("gemv_rdna2(Tensor a, Tensor w, Tensor? bias) -> Tensor");
+  rocm_ops.def(
+      "gemv_rdna2(Tensor a, Tensor w, Tensor? bias, bool out_fp32=False) -> "
+      "Tensor");
   rocm_ops.impl("gemv_rdna2", torch::kCUDA, &gemv_rdna2);
   // GEMM on K-major int8 or fp8 e4m3fn weights (per-channel scales, fp8 also
   // with 2D block scales) with fp16/bf16 activations, or int8 weights with

@@ -1341,10 +1341,14 @@ class MLAAttention(nn.Module, AttentionLayerBase):
                     x, self.W_V, self.W_V_scale, group_size=128, transpose_bm=True
                 )
         else:
-            # Convert from (L, N, V) to (N, L, V)
-            replace_parameter(self, "W_UV", W_UV.transpose(0, 1), prefer_copy=True)
-            # Convert from (L, N, P) to (N, P, L)
-            replace_parameter(self, "W_UK_T", W_UK.permute(1, 2, 0), prefer_copy=True)
+            # Convert from (L, N, V) to (N, L, V) and from (L, N, P) to (N, P, L).
+            W_UV, W_UK_T = W_UV.transpose(0, 1), W_UK.permute(1, 2, 0)
+            if _on_gfx1030():
+                # bmm_skinny_rdna2 reads contiguous [N, K, C] weights; as
+                # views these fell back to 128 x 128-tile rocBLAS GEMMs.
+                W_UV, W_UK_T = W_UV.contiguous(), W_UK_T.contiguous()
+            replace_parameter(self, "W_UV", W_UV, prefer_copy=True)
+            replace_parameter(self, "W_UK_T", W_UK_T, prefer_copy=True)
             if self.dcp_q_replicate:
                 self.W_UK_T_dcp_qrep = get_dcp_group().all_gather(
                     self.W_UK_T.contiguous(), dim=0

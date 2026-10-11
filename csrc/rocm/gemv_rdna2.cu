@@ -41,6 +41,10 @@ template <>
 __device__ __forceinline__ __hip_bfloat16 from_float<__hip_bfloat16>(float v) {
   return __float2bfloat16(v);
 }
+template <>
+__device__ __forceinline__ float from_float<float>(float v) {
+  return v;
+}
 
 template <typename T>
 __device__ __forceinline__ float to_float(T v);
@@ -86,11 +90,11 @@ __device__ __forceinline__ float dot8<__hip_bfloat16>(const int4& a,
 }
 
 // One wave computes one output row for all M tokens. kc_len is the number of
-// K elements per LDS chunk (K itself when A fits).
-template <typename T, int M>
+// K elements per LDS chunk (K itself when A fits). OutT is T or float.
+template <typename T, typename OutT, int M>
 __global__ void __launch_bounds__(WAVES* WARP32)
     gemv_rdna2_kernel(const T* __restrict__ W, const T* __restrict__ A,
-                      const T* __restrict__ bias, T* __restrict__ C,
+                      const T* __restrict__ bias, OutT* __restrict__ C,
                       const int N, const int K, const int kc_len, const int lda,
                       const int ldw, const int ldc) {
   extern __shared__ __align__(16) unsigned char smem[];
@@ -166,16 +170,16 @@ __global__ void __launch_bounds__(WAVES* WARP32)
     const float b = bias ? to_float<T>(bias[n]) : 0.f;
   #pragma unroll
     for (int i = 0; i < M; i++)
-      C[(long)i * ldc + n] = from_float<T>(acc[i] + b);
+      C[(long)i * ldc + n] = from_float<OutT>(acc[i] + b);
   }
 }
 
 #else  // non-RDNA2 device pass: empty stub for symbol parity.
 
-template <typename T, int M>
-__global__ void gemv_rdna2_kernel(const T*, const T*, const T*, T*, const int,
+template <typename T, typename OutT, int M>
+__global__ void gemv_rdna2_kernel(const T*, const T*, const T*, OutT*,
                                   const int, const int, const int, const int,
-                                  const int) {}
+                                  const int, const int) {}
 
 #endif  // __HIP__RDNA2__ || !__HIP_DEVICE_COMPILE__
 
@@ -184,9 +188,10 @@ __global__ void gemv_rdna2_kernel(const T*, const T*, const T*, T*, const int,
 
 // Requirements: a [M, K] with M in [1, 8] and w [N, K], fp16 or bf16 (same
 // dtype), both with contiguous, 16-byte aligned rows (K % 8 == 0); optional
-// contiguous bias [N]. Returns [M, N] in the input dtype.
+// contiguous bias [N]. Returns [M, N] in the input dtype, or fp32 with
+// out_fp32.
 torch::Tensor gemv_rdna2(const at::Tensor& a, const at::Tensor& w,
-                         const std::optional<at::Tensor>& bias) {
+                         const std::optional<at::Tensor>& bias, bool out_fp32) {
   using namespace vllm::gemv_rdna2;
   TORCH_CHECK(a.dtype() == w.dtype() && (a.dtype() == torch::kFloat16 ||
                                          a.dtype() == torch::kBFloat16),
@@ -209,7 +214,8 @@ torch::Tensor gemv_rdna2(const at::Tensor& a, const at::Tensor& w,
                 "gemv_rdna2 bias must be a contiguous [N] of the input dtype");
   }
 
-  auto c = torch::empty({M, N}, a.options());
+  auto c = torch::empty(
+      {M, N}, out_fp32 ? a.options().dtype(torch::kFloat32) : a.options());
   const at::cuda::OptionalCUDAGuard device_guard(device_of(a));
   const cudaStream_t stream = at::cuda::getCurrentCUDAStream();
 
@@ -223,30 +229,38 @@ torch::Tensor gemv_rdna2(const at::Tensor& a, const at::Tensor& w,
   const dim3 grid((N + WAVES - 1) / WAVES);
   const dim3 block(WAVES * WARP32);
 
-#define VLLM_GEMV_RDNA2_CASE(T, MM)                               \
-  case MM:                                                        \
-    gemv_rdna2_kernel<T, MM><<<grid, block, lds, stream>>>(       \
-        (const T*)w.data_ptr(), (const T*)a.data_ptr(),           \
-        bias.has_value() ? (const T*)bias->data_ptr() : nullptr,  \
-        (T*)c.data_ptr(), N, K, kc_len, a.stride(0), w.stride(0), \
-        c.stride(0));                                             \
+#define VLLM_GEMV_RDNA2_CASE(T, OutT, MM)                            \
+  case MM:                                                           \
+    gemv_rdna2_kernel<T, OutT, MM><<<grid, block, lds, stream>>>(    \
+        (const T*)w.data_ptr(), (const T*)a.data_ptr(),              \
+        bias.has_value() ? (const T*)bias->data_ptr() : nullptr,     \
+        (OutT*)c.data_ptr(), N, K, kc_len, a.stride(0), w.stride(0), \
+        c.stride(0));                                                \
     break;
-#define VLLM_GEMV_RDNA2_BY_M(T) \
-  switch (M) {                  \
-    VLLM_GEMV_RDNA2_CASE(T, 1)  \
-    VLLM_GEMV_RDNA2_CASE(T, 2)  \
-    VLLM_GEMV_RDNA2_CASE(T, 3)  \
-    VLLM_GEMV_RDNA2_CASE(T, 4)  \
-    VLLM_GEMV_RDNA2_CASE(T, 5)  \
-    VLLM_GEMV_RDNA2_CASE(T, 6)  \
-    VLLM_GEMV_RDNA2_CASE(T, 7)  \
-    VLLM_GEMV_RDNA2_CASE(T, 8)  \
+#define VLLM_GEMV_RDNA2_BY_M(T, OutT) \
+  switch (M) {                        \
+    VLLM_GEMV_RDNA2_CASE(T, OutT, 1)  \
+    VLLM_GEMV_RDNA2_CASE(T, OutT, 2)  \
+    VLLM_GEMV_RDNA2_CASE(T, OutT, 3)  \
+    VLLM_GEMV_RDNA2_CASE(T, OutT, 4)  \
+    VLLM_GEMV_RDNA2_CASE(T, OutT, 5)  \
+    VLLM_GEMV_RDNA2_CASE(T, OutT, 6)  \
+    VLLM_GEMV_RDNA2_CASE(T, OutT, 7)  \
+    VLLM_GEMV_RDNA2_CASE(T, OutT, 8)  \
   }
 
   if (a.dtype() == torch::kFloat16) {
-    VLLM_GEMV_RDNA2_BY_M(__half);
+    if (out_fp32) {
+      VLLM_GEMV_RDNA2_BY_M(__half, float);
+    } else {
+      VLLM_GEMV_RDNA2_BY_M(__half, __half);
+    }
   } else {
-    VLLM_GEMV_RDNA2_BY_M(__hip_bfloat16);
+    if (out_fp32) {
+      VLLM_GEMV_RDNA2_BY_M(__hip_bfloat16, float);
+    } else {
+      VLLM_GEMV_RDNA2_BY_M(__hip_bfloat16, __hip_bfloat16);
+    }
   }
 
 #undef VLLM_GEMV_RDNA2_BY_M

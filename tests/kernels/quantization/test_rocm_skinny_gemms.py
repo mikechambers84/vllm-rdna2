@@ -417,9 +417,14 @@ def test_rocm_gemv_rdna2_kernel(n, k, m, dtype, with_bias):
 
     out = ops.gemv_rdna2(A, B, bias)
     ref_bias = bias.float() if bias is not None else None
-    ref = torch.nn.functional.linear(A.float(), B.float(), ref_bias).to(dtype)
+    ref32 = torch.nn.functional.linear(A.float(), B.float(), ref_bias)
     atol = torch.finfo(dtype).eps * math.sqrt(k)
-    torch.testing.assert_close(out, ref, atol=atol, rtol=1e-2)
+    torch.testing.assert_close(out, ref32.to(dtype), atol=atol, rtol=1e-2)
+    # out_fp32 keeps the fp32 accumulation (GLM's indexer head weights): only
+    # fp32 summation order separates it from the fp32 reference.
+    out32 = ops.gemv_rdna2(A, B, bias, out_fp32=True)
+    assert out32.dtype == torch.float32
+    torch.testing.assert_close(out32, ref32, atol=1e-5, rtol=1e-4)
 
 
 def _w8_rdna2_weights(fmt: str, m: int, k: int):

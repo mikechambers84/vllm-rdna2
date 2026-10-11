@@ -42,7 +42,7 @@ torch::Tensor w8a8_gemm_rdna2(const at::Tensor& a, const at::Tensor& w,
                               at::ScalarType out_dtype);
 
 torch::Tensor gemv_rdna2(const at::Tensor& a, const at::Tensor& w,
-                         const std::optional<at::Tensor>& bias);
+                         const std::optional<at::Tensor>& bias, bool out_fp32);
 
 torch::Tensor gemm_w8_rdna2(const at::Tensor& a, const at::Tensor& w,
                             const std::optional<at::Tensor>& scale,
