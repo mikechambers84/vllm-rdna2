@@ -17,7 +17,14 @@
 // pair-permuted ((a0, a4), (a1, a5), ...) to match the nibble expansion (w >>
 // 4i) & 0x000F000F | 0x64006400 = half2(1024 + q_i, 1024 + q_(i+4)); (q - z)
 // is exact in fp16 and the group scale is applied per 32-k chunk in fp32. The
-// next chunk's weights and scale are loaded while the current one is dotted.
+// next chunk's weights are loaded while the current one is dotted; each
+// phase's group scales for the workgroup's 256 columns come through LDS, and
+// padding rows of a block are skipped (16-row blocks then cover most experts
+// of a 384-token chunk in one pass over their weights).
+//
+// At the 140 W cap this kernel runs at the power limit, so its speed follows
+// its energy per row: reading the experts from DRAM, re-gathering activations
+// per workgroup and per-chunk scale loads each cost 10-30%.
 
 #include <torch/all.h>
 #include <c10/cuda/CUDAGuard.h>
@@ -33,9 +40,11 @@
 namespace vllm {
 namespace moe_wna16_kslice_rdna2 {
 
-static constexpr int THREADS = 256;
-static constexpr int LDS_ELEMS = 16384;  // 32 KB of activations per phase
-static constexpr int KW = 256;           // k per wave load (8 lanes x 32)
+static constexpr int THREADS = 512;
+static constexpr int LDS_ELEMS = 16384;   // 32 KB of activations per phase
+static constexpr int KW = 256;            // k per wave load (8 lanes x 32)
+static constexpr int COLS = 256;          // columns per workgroup (NG = 4)
+static constexpr int SCALE_ELEMS = 8192;  // COLS x up to 32 groups per phase
 
 #if defined(__HIP__RDNA2__) || !defined(__HIP_DEVICE_COMPILE__)
 
@@ -51,7 +60,7 @@ __device__ __forceinline__ int lds_group(int kq, int q) {
   return kq * 4 + ((q + (kq >> 1)) & 3);
 }
 
-// T rows per workgroup, NG groups of 4 columns per wave (32 * NG columns per
+// T rows per workgroup, NG groups of 4 columns per wave (COLS columns per
 // workgroup); kp: K per activation phase (a multiple of 256 dividing K).
 template <int T, int NG, bool MUL_W, bool ZP>
 __global__ void __launch_bounds__(THREADS) moe_wna16_kslice_rdna2_kernel(
@@ -61,16 +70,23 @@ __global__ void __launch_bounds__(THREADS) moe_wna16_kslice_rdna2_kernel(
     const int* __restrict__ expert_ids, const int* __restrict__ num_post_padded,
     const float* __restrict__ topk_w, const int num_valid, const int top_k,
     const int N, const int K, const int group_size, const int E, const int lda,
-    const int ldc, const int kp) {
+    const int ldc, const int kp, const int num_sorted) {
   __shared__ __align__(16) __half sA[LDS_ELEMS];
+  __shared__ __align__(16) __half sS[SCALE_ELEMS];
   const int tid = threadIdx.x, lane = tid % 32, wave = tid / 32;
   const int row0 = blockIdx.x * T;
-  if (row0 >= num_post_padded[0]) return;
+  // All routing loads at once; padding rows (sid >= num_valid) are skipped.
+  const int padded = num_post_padded[0];
   const int e = expert_ids[blockIdx.x];
-  if (e < 0 || e >= E) return;
   int sid[T];
   #pragma unroll
-  for (int t = 0; t < T; t++) sid[t] = sorted_ids[row0 + t];
+  for (int t = 0; t < T; t++)
+    sid[t] = sorted_ids[min(row0 + t, num_sorted - 1)];
+  if (row0 >= padded || e < 0 || e >= E) return;
+  uint32_t valid = 0;
+  #pragma unroll
+  for (int t = 0; t < T; t++) valid |= (uint32_t)(sid[t] < num_valid) << t;
+  valid = __builtin_amdgcn_readfirstlane(valid);
 
   const int cg = lane / 8, kq = lane % 8;
   const int groups = K / group_size;
@@ -80,7 +96,7 @@ __global__ void __launch_bounds__(THREADS) moe_wna16_kslice_rdna2_kernel(
   int col[NG];
   #pragma unroll
   for (int g = 0; g < NG; g++)
-    col[g] = min(blockIdx.y * 32 * NG + (wave * NG + g) * 4 + cg, N - 1);
+    col[g] = min(blockIdx.y * COLS + (wave * NG + g) * 4 + cg, N - 1);
 
   float acc[NG][T];
   #pragma unroll
@@ -91,12 +107,11 @@ __global__ void __launch_bounds__(THREADS) moe_wna16_kslice_rdna2_kernel(
   const int kpb = kp / KW;  // chunks per phase
   // Chunk c of a phase: k = p0 + c * 256 + kq * 32 for all NG column groups,
   // so every activation read from LDS feeds NG columns.
-  auto wload = [&](int k, uint4(&wv)[NG], __half(&sc)[NG], uint32_t (&zb)[NG]) {
+  auto wload = [&](int k, uint4(&wv)[NG], uint32_t (&zb)[NG]) {
   #pragma unroll
     for (int g = 0; g < NG; g++) {
       wv[g] =
           *reinterpret_cast<const uint4*>(We + (long)col[g] * (K / 2) + k / 2);
-      sc[g] = Se[(long)col[g] * groups + k / group_size];
       zb[g] = 0x64086408u;  // 1024 + 8
       if constexpr (ZP)
         zb[g] = (0x6400u | ((Ze[(long)(col[g] / 2) * groups + k / group_size] >>
@@ -106,13 +121,34 @@ __global__ void __launch_bounds__(THREADS) moe_wna16_kslice_rdna2_kernel(
     }
   };
 
+  // The group scales of the workgroup's columns go through LDS per phase.
+  const int gp = kp / group_size, col0 = blockIdx.y * COLS;
+  const int gshift = __builtin_ctz(group_size), cstep = KW >> gshift;
+  int sbase[NG];
+  #pragma unroll
+  for (int g = 0; g < NG; g++)
+    sbase[g] = ((wave * NG + g) * 4 + cg) * gp + ((kq * 32) >> gshift);
+  const int rows = 32 - __builtin_clz(valid);
   for (int p0 = 0; p0 < K; p0 += kp) {
     uint4 wv[NG];
-    __half sc[NG];
     uint32_t zb[NG];
-    wload(p0 + kq * 32, wv, sc, zb);  // in flight during the activation gather
+    wload(p0 + kq * 32, wv, zb);  // in flight during the activation gather
     if (p0 > 0) __syncthreads();
-    for (int i = tid; i < T * (kp / 8); i += THREADS) {
+    const int g0 = p0 / group_size;
+    if (gp % 8 == 0 && groups % 8 == 0) {
+      for (int i = tid; i < COLS * gp / 8; i += THREADS) {
+        const int cl = i / (gp / 8), gi = (i % (gp / 8)) * 8;
+        *reinterpret_cast<uint4*>(&sS[cl * gp + gi]) =
+            *reinterpret_cast<const uint4*>(
+                Se + (long)min(col0 + cl, N - 1) * groups + g0 + gi);
+      }
+    } else {
+      for (int i = tid; i < COLS * gp; i += THREADS) {
+        const int cl = i / gp, gi = i % gp;
+        sS[cl * gp + gi] = Se[(long)min(col0 + cl, N - 1) * groups + g0 + gi];
+      }
+    }
+    for (int i = tid; i < rows * (kp / 8); i += THREADS) {
       const int t = i / (kp / 8), c = i % (kp / 8);
       uint4 v = make_uint4(0, 0, 0, 0);
       if (sid[t] < num_valid)
@@ -128,12 +164,15 @@ __global__ void __launch_bounds__(THREADS) moe_wna16_kslice_rdna2_kernel(
           &sA[t * kp + span * KW + lds_group(kq8, c % 4) * 8]) = q;
     }
     __syncthreads();
+    float snext[NG];
+  #pragma unroll
+    for (int g = 0; g < NG; g++) snext[g] = __half2float(sS[sbase[g]]);
     for (int c = 0; c < kpb; c++) {
       half2 w[NG][16];
       float s[NG];
   #pragma unroll
       for (int g = 0; g < NG; g++) {
-        s[g] = __half2float(sc[g]);
+        s[g] = snext[g];
         const half2 bias = as_h2(zb[g]);
         const uint32_t words[4] = {wv[g].x, wv[g].y, wv[g].z, wv[g].w};
   #pragma unroll
@@ -144,10 +183,16 @@ __global__ void __launch_bounds__(THREADS) moe_wna16_kslice_rdna2_kernel(
                 as_h2(((words[q] >> (4 * j)) & 0x000F000Fu) | 0x64006400u),
                 bias);
       }
-      if (c + 1 < kpb) wload(p0 + (c + 1) * KW + kq * 32, wv, sc, zb);
+      if (c + 1 < kpb) {
+        wload(p0 + (c + 1) * KW + kq * 32, wv, zb);
+  #pragma unroll
+        for (int g = 0; g < NG; g++)
+          snext[g] = __half2float(sS[sbase[g] + (c + 1) * cstep]);
+      }
       const int ko = c * KW;
   #pragma unroll
       for (int t = 0; t < T; t++) {
+        if (!((valid >> t) & 1u)) continue;
         half2 a[16];
   #pragma unroll
         for (int q = 0; q < 4; q++) {
@@ -184,7 +229,7 @@ __global__ void __launch_bounds__(THREADS) moe_wna16_kslice_rdna2_kernel(
     }
   #pragma unroll
   for (int g = 0; g < NG; g++) {
-    const int c = blockIdx.y * 32 * NG + (wave * NG + g) * 4 + cg;
+    const int c = blockIdx.y * COLS + (wave * NG + g) * 4 + cg;
     if (c >= N) continue;
   #pragma unroll
     for (int t = 0; t < T; t++) {
@@ -198,22 +243,21 @@ __global__ void __launch_bounds__(THREADS) moe_wna16_kslice_rdna2_kernel(
 #else  // non-RDNA2 device pass: empty stub for symbol parity.
 
 template <int T, int NG, bool MUL_W, bool ZP>
-__global__ void moe_wna16_kslice_rdna2_kernel(const __half*, const uint8_t*,
-                                              const __half*, const uint8_t*,
-                                              __half*, const int*, const int*,
-                                              const int*, const float*,
-                                              const int, const int, const int,
-                                              const int, const int, const int,
-                                              const int, const int, const int) {
-}
+__global__ void moe_wna16_kslice_rdna2_kernel(
+    const __half*, const uint8_t*, const __half*, const uint8_t*, __half*,
+    const int*, const int*, const int*, const float*, const int, const int,
+    const int, const int, const int, const int, const int, const int, const int,
+    const int) {}
 
 #endif  // __HIP__RDNA2__ || !__HIP_DEVICE_COMPILE__
 
 // Largest K per phase that divides K, is a multiple of 256 and keeps the T x
 // kp fp16 activation tile within LDS_ELEMS; 0 if none.
-static int phase_k(int K, int T) {
+static int phase_k(int K, int T, int group_size = 32) {
   for (int kp = K; kp >= KW; kp -= KW)
-    if (K % kp == 0 && T * kp <= LDS_ELEMS) return kp;
+    if (K % kp == 0 && T * kp <= LDS_ELEMS &&
+        COLS * (kp / group_size) <= SCALE_ELEMS)
+      return kp;
   return 0;
 }
 
@@ -257,9 +301,10 @@ void moe_wna16_kslice_rdna2(torch::Tensor& output, const torch::Tensor& a,
   const int E = w.size(0), N = w.size(1), K = w.size(2) * 2;
   const int groups = scales.size(2);
   TORCH_CHECK(scales.size(0) == E && scales.size(1) == N && groups > 0 &&
-                  K % groups == 0 && (K / groups) % 32 == 0,
-              "moe_wna16_kslice_rdna2 needs group sizes that are multiples "
-              "of 32");
+                  K % groups == 0 && (K / groups) % 32 == 0 &&
+                  ((K / groups) & (K / groups - 1)) == 0 && K / groups <= KW,
+              "moe_wna16_kslice_rdna2 needs power-of-two group sizes from 32 "
+              "to 256");
   TORCH_CHECK(moe_wna16_kslice_rdna2_supported(K, block_m),
               "moe_wna16_kslice_rdna2 needs block_m 8 or 16 and K % 256 == 0");
   TORCH_CHECK(a.dim() == 2 && a.size(1) == K && a.stride(1) == 1 &&
@@ -284,15 +329,16 @@ void moe_wna16_kslice_rdna2(torch::Tensor& output, const torch::Tensor& a,
   const cudaStream_t stream = at::cuda::getCurrentCUDAStream();
   const int group_size = K / groups;
   constexpr int NG = 4;
-  const int kp = phase_k(K, block_m);
-  const dim3 grid(expert_ids.numel(), (N + 32 * NG - 1) / (32 * NG));
+  const int kp = phase_k(K, block_m, group_size);
+  const dim3 grid(expert_ids.numel(), (N + COLS - 1) / COLS);
 #define VLLM_KSLICE_LAUNCH(T, MW, Z)                                          \
   moe_wna16_kslice_rdna2_kernel<T, NG, MW, Z><<<grid, THREADS, 0, stream>>>(  \
       (const __half*)a.data_ptr(), w.data_ptr<uint8_t>(),                     \
       (const __half*)scales.data_ptr(), zp, (__half*)output.data_ptr(),       \
       sorted_ids.data_ptr<int>(), expert_ids.data_ptr<int>(),                 \
       num_tokens_post_padded.data_ptr<int>(), topk_weights.data_ptr<float>(), \
-      num_valid, top_k, N, K, group_size, E, a.stride(0), N, kp)
+      num_valid, top_k, N, K, group_size, E, a.stride(0), N, kp,              \
+      (int)sorted_ids.numel())
 #define VLLM_KSLICE_BY_FLAGS(T)            \
   if (mul_routed_weight) {                 \
     if (zp)                                \
