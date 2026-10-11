@@ -31,6 +31,8 @@ from .model import (
     Glm5NextDecoderLayer,
     Glm5NextMLAAttention,
     Glm5NextMoE,
+    _keep_fp8_attn_proj,
+    _store_fp8_attn_projs,
     _try_load_fp8_attn_proj,
     _try_load_fp8_indexer_wk,
     get_spec_layer_idx_from_weight_name,
@@ -439,4 +441,6 @@ class Glm5NextMTP(nn.Module, DeepseekV2MixtureOfExperts):
                     f"MTP speculative decoding layer {layer_idx} weights "
                     f"missing from checkpoint."
                 )
+        if _keep_fp8_attn_proj():
+            _store_fp8_attn_projs(self)
         return loaded_params

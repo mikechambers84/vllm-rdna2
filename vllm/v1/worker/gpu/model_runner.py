@@ -404,6 +404,9 @@ class GPUModelRunner(LoRAModelRunnerMixin):
                     )
             if envs.VLLM_UVA_INPUT_EMBEDDINGS:
                 offload_input_embeddings(self.model)
+                # Under PP the drafter holds its own copy of the embedding.
+                if isinstance(self.speculator, DraftModelSpeculator):
+                    offload_input_embeddings(self.speculator.model)
         time_after_load = time.perf_counter()
 
         self.model_memory_usage = m.consumed_memory
