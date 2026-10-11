@@ -198,6 +198,12 @@ __global__ void __launch_bounds__(THREADS) moe_int8_gemm_rdna2_kernel(
   #pragma unroll
     for (int j = 0; j < TN; j++) acc[i][j] = 0;
 
+  // An expert's padding rows close its last tile (moe_align_block_size):
+  // waves whose 2 * RM rows are all padding stage operands but skip the
+  // dot products (a tile of ~BM / 2 routed rows does half the math).
+  const int valid_rows =
+      __syncthreads_count(tid < BM && sorted_ids[row0 + tid] < num_valid);
+  const bool live = tid / 32 * 2 * RM < valid_rows;
   const int stages = K / BK;
   load(0);
   store(0);
@@ -205,32 +211,34 @@ __global__ void __launch_bounds__(THREADS) moe_int8_gemm_rdna2_kernel(
   for (int s = 0; s < stages; s++) {
     const int cur = s & 1;
     if (s + 1 < stages) load((s + 1) * BK);
+    if (live) {  // wave-uniform
   #pragma unroll UNR
-    for (int k4 = 0; k4 < K4; k4++) {
-      int a[RM], w[TN];
+      for (int k4 = 0; k4 < K4; k4++) {
+        int a[RM], w[TN];
   #pragma unroll
-      for (int i = 0; i < RM; i += 4) {
-        const int4 v =
-            *reinterpret_cast<const int4*>(&sA[cur][k4][ty * RM + i]);
-        a[i] = v.x;
-        a[i + 1] = v.y;
-        a[i + 2] = v.z;
-        a[i + 3] = v.w;
+        for (int i = 0; i < RM; i += 4) {
+          const int4 v =
+              *reinterpret_cast<const int4*>(&sA[cur][k4][ty * RM + i]);
+          a[i] = v.x;
+          a[i + 1] = v.y;
+          a[i + 2] = v.z;
+          a[i + 3] = v.w;
+        }
+  #pragma unroll
+        for (int j = 0; j < TN; j += 4) {
+          const int4 v =
+              *reinterpret_cast<const int4*>(&sW[cur][k4][j * 16 + tx * 4]);
+          w[j] = v.x;
+          w[j + 1] = v.y;
+          w[j + 2] = v.z;
+          w[j + 3] = v.w;
+        }
+  #pragma unroll
+        for (int i = 0; i < RM; i++)
+  #pragma unroll
+          for (int j = 0; j < TN; j++)
+            acc[i][j] = __builtin_amdgcn_sdot4(a[i], w[j], acc[i][j], false);
       }
-  #pragma unroll
-      for (int j = 0; j < TN; j += 4) {
-        const int4 v =
-            *reinterpret_cast<const int4*>(&sW[cur][k4][j * 16 + tx * 4]);
-        w[j] = v.x;
-        w[j + 1] = v.y;
-        w[j + 2] = v.z;
-        w[j + 3] = v.w;
-      }
-  #pragma unroll
-      for (int i = 0; i < RM; i++)
-  #pragma unroll
-        for (int j = 0; j < TN; j++)
-          acc[i][j] = __builtin_amdgcn_sdot4(a[i], w[j], acc[i][j], false);
     }
     if (s + 1 < stages) {
       store(cur ^ 1);
