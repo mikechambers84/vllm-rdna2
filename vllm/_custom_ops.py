@@ -2724,6 +2724,61 @@ def bmm_skinny_rdna2(x: torch.Tensor, w: torch.Tensor, out: torch.Tensor) -> Non
     torch.ops._rocm_C.bmm_skinny_rdna2(x, w, out)
 
 
+_GROUPED_TOPK_SCORING = {"sigmoid": 1, "softmax": 2}
+
+
+def grouped_topk_rdna2_supported(
+    num_experts: int = 1,
+    topk: int = 1,
+    num_expert_group: int = 1,
+    topk_group: int = 1,
+    scoring_func: str = "sigmoid",
+) -> bool:
+    """Whether grouped_topk_rdna2 is built and takes this routing shape."""
+    return (
+        hasattr(torch.ops._rocm_C, "grouped_topk_rdna2")
+        and num_experts <= 512
+        and topk <= 32
+        and 1 <= num_expert_group <= 32
+        and num_experts % num_expert_group == 0
+        and 1 <= topk_group <= num_expert_group
+        and topk <= topk_group * (num_experts // num_expert_group)
+        and scoring_func in _GROUPED_TOPK_SCORING
+    )
+
+
+def grouped_topk_rdna2(
+    logits: torch.Tensor,
+    bias: torch.Tensor | None,
+    topk: int,
+    num_expert_group: int,
+    topk_group: int,
+    scoring_func: str,
+    renormalize: bool,
+    routed_scaling_factor: float,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """RDNA2 grouped top-k MoE routing in one kernel; returns fp32 weights and
+    int32 expert ids [T, topk] (in selection order)."""
+    weights = torch.empty(
+        (logits.shape[0], topk), dtype=torch.float32, device=logits.device
+    )
+    ids = torch.empty((logits.shape[0], topk), dtype=torch.int32, device=logits.device)
+    if bias is not None and bias.dtype != torch.float32:
+        bias = bias.float()
+    torch.ops._rocm_C.grouped_topk_rdna2(
+        logits,
+        bias,
+        weights,
+        ids,
+        num_expert_group,
+        topk_group,
+        _GROUPED_TOPK_SCORING[scoring_func],
+        renormalize,
+        routed_scaling_factor,
+    )
+    return weights, ids
+
+
 def paged_mqa_logits_rdna2(
     q: torch.Tensor,
     kv_cache: torch.Tensor,

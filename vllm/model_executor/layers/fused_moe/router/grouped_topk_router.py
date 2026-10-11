@@ -238,10 +238,38 @@ class GroupedTopk(CustomOp):
                 e_score_correction_bias,
                 self.num_fused_shared_experts,
             )
-        else:
-            return self.forward_native(
-                hidden_states, gating_output, e_score_correction_bias
+        if self._use_rdna2(gating_output):
+            return ops.grouped_topk_rdna2(
+                gating_output,
+                e_score_correction_bias,
+                self.topk,
+                self.num_expert_group,
+                self.topk_group,
+                self.scoring_func,
+                self.renormalize,
+                self.routed_scaling_factor,
             )
+        return self.forward_native(
+            hidden_states, gating_output, e_score_correction_bias
+        )
+
+    def _use_rdna2(self, gating_output: torch.Tensor) -> bool:
+        """gfx1030's one-kernel routing (grouped_topk_rdna2)."""
+        from vllm.platforms.rocm import on_gfx1030
+
+        return (
+            on_gfx1030()
+            and self.num_fused_shared_experts == 0
+            and gating_output.dim() == 2
+            and gating_output.stride(1) == 1
+            and ops.grouped_topk_rdna2_supported(
+                gating_output.shape[1],
+                self.topk,
+                self.num_expert_group,
+                self.topk_group,
+                self.scoring_func,
+            )
+        )
 
 
 class GroupedTopKRouter(BaseRouter):

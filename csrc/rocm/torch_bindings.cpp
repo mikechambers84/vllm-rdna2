@@ -224,6 +224,12 @@ TORCH_LIBRARY_EXPAND(TORCH_EXTENSION_NAME, rocm_ops) {
       "bool mul_routed_weight, int block_m) -> ()");
   rocm_ops.impl("moe_wna16_kslice_rdna2", torch::kCUDA,
                 &moe_wna16_kslice_rdna2);
+  // MoE routing (grouped top-k with correction bias) in one kernel.
+  rocm_ops.def(
+      "grouped_topk_rdna2(Tensor logits, Tensor? bias, Tensor! topk_weights, "
+      "Tensor! topk_ids, int n_group, int topk_group, int scoring, "
+      "bool renormalize, float scale) -> ()");
+  rocm_ops.impl("grouped_topk_rdna2", torch::kCUDA, &grouped_topk_rdna2);
   // Batched GEMV for a few rows (MLA absorption products in decode).
   rocm_ops.def("bmm_skinny_rdna2(Tensor x, Tensor w, Tensor! out) -> ()");
   rocm_ops.impl("bmm_skinny_rdna2", torch::kCUDA, &bmm_skinny_rdna2);

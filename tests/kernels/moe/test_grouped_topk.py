@@ -399,3 +399,85 @@ def test_grouped_topk_single_group_nonfinite_scores(
 
     torch.testing.assert_close(actual_ids, expected_ids)
     torch.testing.assert_close(actual_values, expected_values, atol=2e-5, rtol=0)
+
+
+def _rdna2_grouped_topk_available() -> bool:
+    if not current_platform.is_rocm():
+        return False
+    from vllm import _custom_ops as ops
+
+    return ops.grouped_topk_rdna2_supported()
+
+
+@pytest.mark.skipif(
+    not _rdna2_grouped_topk_available(), reason="gfx1030 HIP routing kernel"
+)
+@pytest.mark.parametrize("n_token", [1, 5, 64])
+@pytest.mark.parametrize(
+    "n_expert,topk,num_expert_group,topk_group",
+    [(16, 2, 8, 2), (256, 8, 8, 4), (288, 8, 1, 1), (512, 22, 1, 1), (60, 4, 1, 1)],
+)
+@pytest.mark.parametrize("scoring_func", ["softmax", "sigmoid"])
+@pytest.mark.parametrize("renormalize", [True, False])
+@pytest.mark.parametrize(
+    "input_dtype,use_bias",
+    [
+        (torch.float32, True),
+        (torch.float32, False),
+        (torch.bfloat16, True),
+        (torch.float16, True),
+    ],
+)
+def test_grouped_topk_rdna2(
+    n_token: int,
+    n_expert: int,
+    topk: int,
+    num_expert_group: int,
+    topk_group: int,
+    scoring_func: str,
+    renormalize: bool,
+    input_dtype: torch.dtype,
+    use_bias: bool,
+):
+    """The gfx1030 routing kernel picks the same experts with the same weights
+    as the torch grouped top-k (compared in expert-id order)."""
+    from vllm import _custom_ops as ops
+    from vllm.model_executor.layers.fused_moe.router.grouped_topk_router import (
+        grouped_topk,
+    )
+
+    set_random_seed(0)
+    logits = torch.randn((n_token, n_expert), dtype=input_dtype, device="cuda")
+    bias = (
+        torch.randn((n_expert,), dtype=torch.float32, device="cuda")
+        if use_bias
+        else None
+    )
+    # The kernel scores in fp32 whatever the logits' dtype.
+    ref_w, ref_ids = grouped_topk(
+        hidden_states=logits,
+        gating_output=logits.float(),
+        topk=topk,
+        renormalize=renormalize,
+        num_expert_group=num_expert_group,
+        topk_group=topk_group,
+        scoring_func=scoring_func,
+        routed_scaling_factor=2.5,
+        e_score_correction_bias=bias,
+    )
+    w, ids = ops.grouped_topk_rdna2(
+        logits,
+        bias,
+        topk,
+        num_expert_group,
+        topk_group,
+        scoring_func,
+        renormalize,
+        2.5,
+    )
+    ref_ids, order = ref_ids.sort(dim=-1)
+    ids, order2 = ids.sort(dim=-1)
+    torch.testing.assert_close(ids, ref_ids, atol=0, rtol=0)
+    torch.testing.assert_close(
+        w.gather(1, order2), ref_w.gather(1, order), atol=1e-5, rtol=1e-5
+    )
