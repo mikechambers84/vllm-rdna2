@@ -404,6 +404,20 @@ def _get_kv_b_proj_input_dtype(
     return weight_dtype
 
 
+@functools.cache
+def _on_gfx1030() -> bool:
+    if not current_platform.is_rocm():
+        return False
+    from vllm.platforms.rocm import on_gfx1030
+
+    return on_gfx1030()
+
+
+def _use_rdna2_bmm(x: torch.Tensor, w: torch.Tensor) -> bool:
+    """gfx1030 runs the decode-sized absorption products as a batched GEMV."""
+    return _on_gfx1030() and ops.bmm_skinny_rdna2_supported(x, w)
+
+
 def split_kv_b_proj(
     kv_b_proj: nn.Module,
     out_dtype: torch.dtype,
@@ -1097,7 +1111,12 @@ class MLAAttention(nn.Module, AttentionLayerBase):
                     # contiguous; a NoPE model (qk_rope_head_dim == 0) then
                     # needs no concat at all.
                     mqa_ql_nope = mqa_q_nope.new_empty((B, N, L))
-                    torch.bmm(mqa_q_nope, W_UK_T, out=mqa_ql_nope.transpose(0, 1))
+                    if _use_rdna2_bmm(mqa_q_nope, W_UK_T):
+                        ops.bmm_skinny_rdna2(
+                            mqa_q_nope, W_UK_T, mqa_ql_nope.transpose(0, 1)
+                        )
+                    else:
+                        torch.bmm(mqa_q_nope, W_UK_T, out=mqa_ql_nope.transpose(0, 1))
 
             if fp8_attention and self.impl.supports_quant_query_input:
                 assert mqa_ql_nope.shape[0] == mqa_q_pe.shape[0]
@@ -1414,6 +1433,8 @@ class MLAAttention(nn.Module, AttentionLayerBase):
                 True,
                 self.impl._w_scale,  # type: ignore[attr-defined]
             )
+        elif _use_rdna2_bmm(x, self.W_UV):
+            ops.bmm_skinny_rdna2(x, self.W_UV, out.transpose(0, 1))
         else:
             # Multiply + Transpose (N, B, L) x (N, L, V)->(N, B, V)->(B, N, V)
             torch.bmm(x, self.W_UV, out=out.transpose(0, 1))

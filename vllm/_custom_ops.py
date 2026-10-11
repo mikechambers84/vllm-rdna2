@@ -2286,11 +2286,13 @@ def moe_wna16_decode_rdna2(
     act: torch.Tensor,
     w13_zeros: torch.Tensor | None = None,
     w2_zeros: torch.Tensor | None = None,
+    swiglu_limit: float = 0.0,
 ) -> None:
     """RDNA2 W4A16 fused-MoE decode (SiLU, int4 with group size a multiple of
     32, optional ``[E, N/2, K/G]`` zero points) into ``output``, on the
     uint8-packed ``[E, N, K/2]`` weights of the Triton WNA16 backend; ``act`` is
-    a ``[M * topk, I]`` workspace."""
+    a ``[M * topk, I]`` workspace. ``swiglu_limit`` > 0 clamps the activation to
+    silu(min(gate, L)) * clamp(up, -L, L)."""
     torch.ops._rocm_C.moe_wna16_decode_rdna2(
         output,
         x,
@@ -2303,6 +2305,7 @@ def moe_wna16_decode_rdna2(
         w13_zeros,
         w2_zeros,
         act,
+        swiglu_limit,
     )
 
 
@@ -2363,6 +2366,38 @@ def moe_fp8_gemm_rdna2(
         scales,
         block_n,
         block_k,
+        sorted_ids,
+        expert_ids,
+        num_tokens_post_padded,
+        topk_weights,
+        top_k,
+        mul_routed_weight,
+        block_m,
+    )
+
+
+def moe_wna16_kslice_rdna2(
+    output: torch.Tensor,
+    a: torch.Tensor,
+    w: torch.Tensor,
+    scales: torch.Tensor,
+    zeros: torch.Tensor | None,
+    sorted_ids: torch.Tensor,
+    expert_ids: torch.Tensor,
+    num_tokens_post_padded: torch.Tensor,
+    topk_weights: torch.Tensor,
+    top_k: int,
+    mul_routed_weight: bool,
+    block_m: int,
+) -> None:
+    """RDNA2 W4A16 MoE GEMM with moe_wna16_skinny_rdna2's contract for block_m
+    8 or 16 and K % 256 == 0; lane octets split K so weight loads coalesce."""
+    torch.ops._rocm_C.moe_wna16_kslice_rdna2(
+        output,
+        a,
+        w,
+        scales,
+        zeros,
         sorted_ids,
         expert_ids,
         num_tokens_post_padded,
@@ -2668,6 +2703,161 @@ def decode_attention_rdna2(
         softcap,
         sinks,
     )
+
+
+def bmm_skinny_rdna2_supported(x: torch.Tensor, w: torch.Tensor) -> bool:
+    """Whether bmm_skinny_rdna2 takes x [N, B, K] @ w [N, K, C]."""
+    return (
+        x.dtype == w.dtype == torch.float16
+        and x.dim() == 3
+        and x.shape[1] <= 8
+        and x.shape[2] <= 512
+        and x.stride(2) == 1
+        and w.is_contiguous()
+        and w.shape[2] % 8 == 0
+    )
+
+
+def bmm_skinny_rdna2(x: torch.Tensor, w: torch.Tensor, out: torch.Tensor) -> None:
+    """RDNA2 batched GEMV ``out[n] = x[n] @ w[n]`` for at most 8 rows per
+    batch (``out`` [N, B, C] with contiguous rows, any N / B strides)."""
+    torch.ops._rocm_C.bmm_skinny_rdna2(x, w, out)
+
+
+def paged_mqa_logits_rdna2(
+    q: torch.Tensor,
+    kv_cache: torch.Tensor,
+    weights: torch.Tensor,
+    context_lens: torch.Tensor,
+    block_tables: torch.Tensor,
+    max_len: int,
+    out: torch.Tensor | None = None,
+) -> torch.Tensor:
+    """RDNA2 indexer logits for decode / MTP: ``scale[t] * sum_h w[r, h] *
+    relu(q[r, h] . k[t])`` over the paged fp8 cache, -inf past each row's
+    context; returns [B * next_n, max_len] fp32 with no host sync."""
+    rows = q.shape[0] * q.shape[1]
+    if out is None:
+        out = torch.empty(rows, max_len, dtype=torch.float32, device=q.device)
+    torch.ops._rocm_C.paged_mqa_logits_rdna2(
+        q.view(torch.uint8),
+        kv_cache.view(torch.uint8),
+        weights.contiguous(),
+        context_lens.to(torch.int32).contiguous(),
+        block_tables.to(torch.int32),
+        out,
+        max_len,
+    )
+    return out
+
+
+def sparse_mla_attn_rdna2(
+    q: torch.Tensor,
+    kv: torch.Tensor,
+    indices: torch.Tensor,
+    indptr: torch.Tensor,
+    out: torch.Tensor,
+    scale: float,
+) -> None:
+    """RDNA2 rope-free sparse MLA attention: ``out[t, h] = softmax(scale *
+    q[t, h] . kv[s]) . kv[s]`` over the slots ``s`` in ``indices[indptr[t]:
+    indptr[t + 1]]`` (K = V = the 512-wide latent rows of ``kv``). With few
+    tokens the key lists are split over workgroups and merged."""
+    num_tokens, num_heads = q.shape[:2]
+    nseg = max(1, min(16, 128 // max(1, num_tokens * num_heads // 32)))
+    part_o = part_ml = None
+    if nseg > 1:
+        part_o = q.new_empty(
+            num_tokens * nseg * num_heads * q.shape[-1], dtype=torch.float32
+        )
+        part_ml = q.new_empty(num_tokens * nseg * num_heads * 2, dtype=torch.float32)
+    torch.ops._rocm_C.sparse_mla_attn_rdna2(
+        q, kv, indices, indptr, out, part_o, part_ml, nseg, scale
+    )
+
+
+def mhc_rdna2_supported(residual: torch.Tensor) -> bool:
+    """Whether the RDNA2 mHC kernels take this [..., hc_mult, hidden] residual."""
+    return (
+        residual.dtype in (torch.float16, torch.bfloat16)
+        and residual.shape[-2] == 4
+        and residual.shape[-1] in (2048, 4096, 6144, 8192)
+    )
+
+
+def mhc_rdna2(
+    residual: torch.Tensor,
+    fn: torch.Tensor,
+    hc_scale: torch.Tensor,
+    hc_base: torch.Tensor,
+    rms_eps: float,
+    hc_pre_eps: float,
+    hc_sinkhorn_eps: float,
+    hc_post_mult_value: float,
+    sinkhorn_repeat: int,
+    norm_weight: torch.Tensor | None = None,
+    norm_eps: float = 0.0,
+    x: torch.Tensor | None = None,
+    post_layer_mix: torch.Tensor | None = None,
+    comb_res_mix: torch.Tensor | None = None,
+) -> tuple[torch.Tensor | None, torch.Tensor, torch.Tensor, torch.Tensor]:
+    """RDNA2 mHC seam in one kernel per token. With ``x`` / ``post_layer_mix``
+    / ``comb_res_mix`` the post step first mixes them into a new residual;
+    the pre step then returns ``(residual_cur or None, post_mix [..., 4, 1],
+    comb_mix [..., 4, 4], layer_input [..., H])``, ``layer_input``
+    RMS-normalized by ``norm_weight`` when given."""
+    residual = residual.contiguous()
+    outer = residual.shape[:-2]
+    hc_mult, hidden = residual.shape[-2:]
+    residual_out = torch.empty_like(residual) if x is not None else None
+    post_mix = residual.new_empty(*outer, hc_mult, 1, dtype=torch.float32)
+    comb_mix = residual.new_empty(*outer, hc_mult, hc_mult, dtype=torch.float32)
+    layer_input = residual.new_empty(*outer, hidden)
+    partial = residual.new_empty(
+        hidden // 64 * layer_input.numel() // hidden * 25, dtype=torch.float32
+    )
+    torch.ops._rocm_C.mhc_rdna2(
+        residual,
+        x.contiguous() if x is not None else None,
+        post_layer_mix.contiguous() if post_layer_mix is not None else None,
+        comb_res_mix.contiguous() if comb_res_mix is not None else None,
+        fn,
+        hc_scale,
+        hc_base,
+        norm_weight,
+        residual_out,
+        post_mix,
+        comb_mix,
+        layer_input,
+        partial,
+        rms_eps,
+        hc_pre_eps,
+        hc_sinkhorn_eps,
+        hc_post_mult_value,
+        sinkhorn_repeat,
+        norm_eps,
+    )
+    return residual_out, post_mix, comb_mix, layer_input
+
+
+def mhc_post_rdna2(
+    x: torch.Tensor,
+    residual: torch.Tensor,
+    post_layer_mix: torch.Tensor,
+    comb_res_mix: torch.Tensor,
+) -> torch.Tensor:
+    """RDNA2 mHC post step: ``einsum('...ij,...ih->...jh', comb, residual) +
+    post * x`` in ``residual``'s dtype."""
+    residual = residual.contiguous()
+    out = torch.empty_like(residual)
+    torch.ops._rocm_C.mhc_post_rdna2(
+        x.contiguous(),
+        residual,
+        post_layer_mix.contiguous(),
+        comb_res_mix.contiguous(),
+        out,
+    )
+    return out
 
 
 def gdn_post_conv_rdna2(

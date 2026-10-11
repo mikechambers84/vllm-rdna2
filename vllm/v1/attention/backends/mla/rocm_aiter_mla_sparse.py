@@ -2,6 +2,7 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
 from dataclasses import dataclass
+from importlib.util import find_spec
 from typing import TYPE_CHECKING, ClassVar
 
 import numpy as np
@@ -451,7 +452,9 @@ class ROCMAiterMLASparseMetadataBuilder(
         # gfx942 has no persistent+LSE kernel, and its metadata heuristic
         # terminates for HY-V4's TP1 H64 shape. The Triton sparse MLA kernel
         # never reads the persistent metadata either.
-        self._use_persistent_metadata = all(
+        # Without the aiter package (gfx1030) every batch runs the Triton
+        # kernel, so the persistent metadata is never built.
+        self._use_persistent_metadata = find_spec("aiter") is not None and all(
             getattr(attention_context[name].impl, "sinks", None) is None
             and not getattr(attention_context[name].impl, "use_aiter_sparse_mla", False)
             for name in layer_names
@@ -488,6 +491,12 @@ class ROCMAiterMLASparseMetadataBuilder(
         self.paged_kv_indptr = torch.zeros(
             [max_num_batched_tokens + 1], dtype=torch.int32, device=device
         )
+
+        self._prev_req_extent: int = 0
+        self._prev_indices_extent: int = 0
+        self._prev_metadata_key: tuple | None = None
+        if not self._use_persistent_metadata:
+            return
 
         # ----- Persistent MLA metadata buffers -----
         # The aiter sparse decode kernel supports a "persistent" path that
@@ -550,10 +559,6 @@ class ROCMAiterMLASparseMetadataBuilder(
             dtype=reduce_partial_map_type,
             device=device,
         )
-
-        self._prev_req_extent: int = 0
-        self._prev_indices_extent: int = 0
-        self._prev_metadata_key: tuple | None = None
 
     def _sparse_decode_max_split(self, max_seq_len: int) -> int:
         """Cap ``max_split_per_batch`` for the aiter sparse-MLA decode reduce.

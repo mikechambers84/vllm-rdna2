@@ -19,15 +19,27 @@ def _has_tilelang_mhc() -> bool:
     if current_platform.is_cuda():
         return True
     if current_platform.is_rocm():
-        from vllm.platforms.rocm import on_gfx942
+        from vllm.platforms.rocm import on_gfx942, on_gfx1030
 
         # TileLang MHC currently produces incorrect results on gfx942. Keep
         # gfx942 on the existing torch/triton fallbacks until that path is fixed.
-        return not on_gfx942()
+        # Its kernels are bf16-only, and gfx1030 runs these models in fp16.
+        return not (on_gfx942() or on_gfx1030())
     return False
 
 
 HAS_TILELANG_MHC = _has_tilelang_mhc()
+
+
+def _use_rdna2_mhc(residual: torch.Tensor) -> bool:
+    if not current_platform.is_rocm():
+        return False
+    from vllm import _custom_ops as ops
+    from vllm.platforms.rocm import on_gfx1030
+
+    return on_gfx1030() and ops.mhc_rdna2_supported(residual)
+
+
 HAS_AITER_MHC = is_aiter_found_and_supported()
 
 
@@ -164,6 +176,23 @@ class MHCPreOp(CustomOp):
         norm_weight: torch.Tensor | None = None,
         norm_eps: float = 0.0,
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        if _use_rdna2_mhc(residual):
+            from vllm import _custom_ops as ops
+
+            _, post_mix, comb_mix, layer_input = ops.mhc_rdna2(
+                residual,
+                fn,
+                hc_scale,
+                hc_base,
+                rms_eps,
+                hc_pre_eps,
+                hc_sinkhorn_eps,
+                hc_post_mult_value,
+                sinkhorn_repeat,
+                norm_weight,
+                norm_eps,
+            )
+            return post_mix, comb_mix, layer_input
         if _aiter_mhc_supported(
             residual,
             norm_weight,
@@ -592,6 +621,10 @@ class MHCPostOp(CustomOp):
         post_layer_mix: torch.Tensor,
         comb_res_mix: torch.Tensor,
     ) -> torch.Tensor:
+        if _use_rdna2_mhc(residual):
+            from vllm import _custom_ops as ops
+
+            return ops.mhc_post_rdna2(x, residual, post_layer_mix, comb_res_mix)
         if _aiter_mhc_supported(residual, None, supports_norm=True):
             return torch.ops.vllm.mhc_post_aiter(
                 x,
@@ -836,6 +869,27 @@ class MHCFusedPostPreOp(CustomOp):
         norm_weight: torch.Tensor | None = None,
         norm_eps: float = 0.0,
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+        if _use_rdna2_mhc(residual):
+            from vllm import _custom_ops as ops
+
+            residual_cur, post_mix, comb_mix, layer_input = ops.mhc_rdna2(
+                residual,
+                fn,
+                hc_scale,
+                hc_base,
+                rms_eps,
+                hc_pre_eps,
+                hc_sinkhorn_eps,
+                hc_post_mult_value,
+                sinkhorn_repeat,
+                norm_weight,
+                norm_eps,
+                x=x,
+                post_layer_mix=post_layer_mix,
+                comb_res_mix=comb_res_mix,
+            )
+            assert residual_cur is not None
+            return residual_cur, post_mix, comb_mix, layer_input
         if HAS_AITER_MHC_FUSED and _aiter_mhc_supported(
             residual,
             norm_weight,

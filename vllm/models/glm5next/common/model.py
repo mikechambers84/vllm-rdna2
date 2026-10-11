@@ -37,6 +37,7 @@ from vllm.model_executor.layers.mamba.mamba_utils import (
     MambaStateShapeCalculator,
 )
 from vllm.model_executor.layers.mhc import (
+    HAS_TILELANG_MHC,
     MHCFusedPostPreOp,
     MHCPostOp,
     MHCPreOp,
@@ -456,7 +457,7 @@ class Glm5NextDecoderLayer(nn.Module):
             self.mhc_post_op = MHCPostOp()
             self.mhc_fused_post_pre_op = MHCFusedPostPreOp()
 
-            if vllm_config.kernel_config.enable_jit_warmup:
+            if vllm_config.kernel_config.enable_jit_warmup and HAS_TILELANG_MHC:
                 from vllm.model_executor.kernels.mhc.tilelang_kernels import (
                     _HC_PRENORM_GEMM_TILELANG_KERNEL,
                     _MHC_FUSED_TILELANG_KERNEL,
@@ -751,6 +752,17 @@ class Glm5NextModel(nn.Module):
     def embed_input_ids(self, input_ids: torch.Tensor) -> torch.Tensor:
         return self.embed_tokens(input_ids)
 
+    def make_empty_intermediate_tensors(
+        self, batch_size: int, dtype: torch.dtype, device: torch.device
+    ) -> IntermediateTensors:
+        # mHC models pass all hc_mult residual streams between PP ranks.
+        shape: tuple[int, ...] = (batch_size, self.config.hidden_size)
+        if self.config.mhc:
+            shape = (batch_size, self.config.hc_mult, self.config.hidden_size)
+        return IntermediateTensors(
+            {"hidden_states": torch.zeros(shape, dtype=dtype, device=device)}
+        )
+
     def forward(
         self,
         input_ids: torch.Tensor | None,
@@ -768,11 +780,12 @@ class Glm5NextModel(nn.Module):
             post = None
             comb = None
         else:
+            # The previous rank sends complete hidden states (mHC: all
+            # residual streams, its last hc_post applied), so the first layer
+            # here starts from a standalone pre.
             assert intermediate_tensors is not None
             hidden_states = intermediate_tensors["hidden_states"]
-            residual = intermediate_tensors["residual"]
-            # post/comb (deferred mHC hc_post state) are not propagated across
-            # PP ranks; the receiving rank's first mHC layer uses standalone pre.
+            residual = None
             post = None
             comb = None
 
@@ -786,14 +799,14 @@ class Glm5NextModel(nn.Module):
             )
 
         if not get_pp_group().is_last_rank:
-            # PP is gated off for GLM-5.3-Flash (no make_empty_intermediate_tensors),
-            # so this branch is not exercised. post/comb are the deferred
-            # hc_post state of this rank's last mHC layer; a future PP path
-            # would need to propagate them, but for now they are dropped (the
-            # receiving rank's first layer would fall back to standalone pre).
-            return IntermediateTensors(
-                {"hidden_states": hidden_states, "residual": residual}
-            )
+            if post is not None:
+                # Apply this rank's deferred hc_post: send the full streams.
+                hidden_states = self._active_layers[-1].hc_post(
+                    hidden_states, residual, post, comb
+                )
+            if self.is_sequence_parallel:
+                hidden_states = sp_all_gather(hidden_states)[:full_num_tokens]
+            return IntermediateTensors({"hidden_states": hidden_states})
 
         if self.is_sequence_parallel:
             hidden_states = sp_all_gather(hidden_states)[:full_num_tokens]
@@ -981,6 +994,8 @@ class Glm5NextModel(nn.Module):
                     )
                     weight_loader(param, loaded_weight, **kwargs)
             loaded_params.add(name)
+        if _keep_fp8_attn_proj():
+            _store_fp8_attn_projs(self)
         return loaded_params
 
 
@@ -1008,6 +1023,9 @@ class Glm5NextForCausalLM(
             self.lm_head = PPMissingLayer()
         self.logits_processor = LogitsProcessor(
             self.config.vocab_size, scale=_LOGIT_SCALE
+        )
+        self.make_empty_intermediate_tensors = (
+            self.model.make_empty_intermediate_tensors
         )
 
     def embed_input_ids(self, input_ids: torch.Tensor) -> torch.Tensor:
@@ -1165,10 +1183,9 @@ class Glm5NextForConditionalGeneration(
             )
 
         self.set_moe_parameters()
-
-        # Glm5NextForCausalLM does not implement make_empty_intermediate_tensors,
-        # so pipeline parallelism is gated off (consistent with the text-only
-        # model) and we intentionally do not alias it here.
+        self.make_empty_intermediate_tensors = (
+            self.language_model.make_empty_intermediate_tensors
+        )
 
     def set_moe_parameters(self) -> None:
         self.moe_mlp_layers = [
@@ -1236,6 +1253,8 @@ def _try_load_fp8_indexer_wk(name, tensor, buf, params_dict, loaded_params):
     if not is_weight and not is_scale:
         return False
     layer_prefix = name.rsplit(".wk.", 1)[0]
+    if f"{layer_prefix}.wk_weights_proj.weight" not in params_dict:
+        return True  # a layer of another pipeline-parallel rank
     entry = buf.setdefault(layer_prefix, {})
     entry["weight" if is_weight else "scale"] = tensor
     if "weight" not in entry or "scale" not in entry:
@@ -1330,6 +1349,8 @@ def _try_load_fp8_attn_proj(
     layer_prefix = name.rsplit(suffix, 1)[0]
     target_w = f"{layer_prefix}.{target_base}.weight"
     target_s = f"{layer_prefix}.{target_base}.weight_scale_inv"
+    if target_w not in params_dict:
+        return True  # a layer of another pipeline-parallel rank
     # If the model actually kept this projection in FP8, let the normal path
     # handle it (it has a weight_scale_inv param).
     if target_s in params_dict:
@@ -1360,4 +1381,45 @@ def _try_load_fp8_attn_proj(
     else:
         param.weight_loader(param, weight_bf16, shard_id)
     loaded_params.add(target_w)
+    if _keep_fp8_attn_proj() and not (is_kva and kv_a_pad_size > 0):
+        # Kept for _store_fp8_attn_projs, which swaps in the FP8 weights.
+        if not hasattr(param, "fp8_block_shards"):
+            param.fp8_block_shards = {}
+        param.fp8_block_shards[shard_id] = (weight_fp8, scale_inv)
     return True
+
+
+def _keep_fp8_attn_proj() -> bool:
+    """gfx1030 computes with the block-FP8 attention projections directly."""
+    if not current_platform.is_rocm():
+        return False
+    from vllm.platforms.rocm import on_gfx1030
+
+    return on_gfx1030() and hasattr(torch.ops._rocm_C, "gemm_w8_rdna2")
+
+
+def _store_fp8_attn_projs(model: nn.Module) -> None:
+    """Replace the dequantized FP8 attention projections with their
+    checkpoint FP8 weights where every shard of a layer arrived."""
+    from vllm.model_executor.kernels.linear.rdna2_w8a16 import fp8_block_weight
+
+    for module in model.modules():
+        param = getattr(module, "weight", None)
+        shards = getattr(param, "fp8_block_shards", None)
+        if param is None or not shards:
+            continue
+        del param.fp8_block_shards
+        sizes = getattr(module, "output_sizes", None)
+        order = list(range(len(sizes))) if sizes and None not in shards else [None]
+        if any(s not in shards for s in order):
+            continue
+        weight = torch.cat([shards[s][0] for s in order])
+        scale = torch.cat([shards[s][1] for s in order])
+        if weight.shape != param.shape or any(
+            d % b for d, b in zip(weight.shape, scale.shape)
+        ):
+            continue
+        block_n = weight.shape[0] // scale.shape[0]
+        block_k = weight.shape[1] // scale.shape[1]
+        if all(shards[s][0].shape[0] % block_n == 0 for s in order):
+            fp8_block_weight(module, weight, scale, block_n, block_k)

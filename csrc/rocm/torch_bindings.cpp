@@ -134,7 +134,7 @@ TORCH_LIBRARY_EXPAND(TORCH_EXTENSION_NAME, rocm_ops) {
   rocm_ops.def(
       "moe_wna16_decode_rdna2(Tensor! output, Tensor x, Tensor topk_ids, "
       "Tensor topk_weights, Tensor w13, Tensor s13, Tensor w2, Tensor s2, "
-      "Tensor? z13, Tensor? z2, Tensor! act) -> ()");
+      "Tensor? z13, Tensor? z2, Tensor! act, float swiglu_limit=0.0) -> ()");
   rocm_ops.impl("moe_wna16_decode_rdna2", torch::kCUDA,
                 &moe_wna16_decode_rdna2);
   // Grouped W4A16 GEMM for fused-MoE prefill on the Triton WNA16 layout.
@@ -216,6 +216,44 @@ TORCH_LIBRARY_EXPAND(TORCH_EXTENSION_NAME, rocm_ops) {
       "Tensor v_cache, Tensor sel, Tensor tok2req, Tensor block_table, "
       "float scale, Tensor? k_scale=None, Tensor? v_scale=None) -> ()");
   rocm_ops.impl("qsa_decode_rdna2", torch::kCUDA, &qsa_decode_rdna2);
+  // W4A16 fused-MoE GEMM at a few rows per expert, K split over lane octets.
+  rocm_ops.def(
+      "moe_wna16_kslice_rdna2(Tensor! output, Tensor a, Tensor w, "
+      "Tensor scales, Tensor? zeros, Tensor sorted_ids, Tensor expert_ids, "
+      "Tensor num_tokens_post_padded, Tensor topk_weights, int top_k, "
+      "bool mul_routed_weight, int block_m) -> ()");
+  rocm_ops.impl("moe_wna16_kslice_rdna2", torch::kCUDA,
+                &moe_wna16_kslice_rdna2);
+  // Batched GEMV for a few rows (MLA absorption products in decode).
+  rocm_ops.def("bmm_skinny_rdna2(Tensor x, Tensor w, Tensor! out) -> ()");
+  rocm_ops.impl("bmm_skinny_rdna2", torch::kCUDA, &bmm_skinny_rdna2);
+  // Sparse-attention indexer: paged fp8 MQA logits for decode / MTP.
+  rocm_ops.def(
+      "paged_mqa_logits_rdna2(Tensor q, Tensor kv_cache, Tensor weights, "
+      "Tensor context_lens, Tensor block_tables, Tensor! out, int max_len) "
+      "-> ()");
+  rocm_ops.impl("paged_mqa_logits_rdna2", torch::kCUDA,
+                &paged_mqa_logits_rdna2);
+  // Rope-free sparse MLA attention over ragged key lists (GLM-5.3-Flash DSA).
+  rocm_ops.def(
+      "sparse_mla_attn_rdna2(Tensor q, Tensor kv, Tensor indices, "
+      "Tensor indptr, Tensor! out, Tensor(a!)? part_o, Tensor(b!)? part_ml, "
+      "int nseg, float scale) -> ()");
+  rocm_ops.impl("sparse_mla_attn_rdna2", torch::kCUDA, &sparse_mla_attn_rdna2);
+  // mHC seam (post mix, pre mix logits + Sinkhorn, layer input + RMS norm)
+  // in one kernel per token.
+  rocm_ops.def(
+      "mhc_rdna2(Tensor residual, Tensor? x, Tensor? post_layer_mix, "
+      "Tensor? comb_res_mix, Tensor fn, Tensor hc_scale, Tensor hc_base, "
+      "Tensor? norm_weight, Tensor(a!)? residual_out, Tensor! post_mix, "
+      "Tensor! comb_mix, Tensor! layer_input, Tensor! partial, float rms_eps, "
+      "float hc_pre_eps, float hc_sinkhorn_eps, float hc_post_mult_value, "
+      "int sinkhorn_repeat, float norm_eps) -> ()");
+  rocm_ops.impl("mhc_rdna2", torch::kCUDA, &mhc_rdna2);
+  rocm_ops.def(
+      "mhc_post_rdna2(Tensor x, Tensor residual, Tensor post_layer_mix, "
+      "Tensor comb_res_mix, Tensor! out) -> ()");
+  rocm_ops.impl("mhc_post_rdna2", torch::kCUDA, &mhc_post_rdna2);
   // Gated DeltaNet prefill: post-conv1d q/k/v split, l2 norm and gating.
   rocm_ops.def(
       "gdn_post_conv_rdna2(Tensor conv_output, Tensor a, Tensor b, "

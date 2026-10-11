@@ -102,13 +102,49 @@ def relayout_weight(layer: torch.nn.Module) -> None:
 
 def weight_from_kmajor(layer: torch.nn.Module) -> torch.Tensor:
     """The [N, K] weight of a layer stored K-major (relayout_weight: exact;
-    quantize_weight: the dequantized int8 weights it computes with)."""
+    quantize_weight / fp8_block_weight: the dequantized 8-bit weights it
+    computes with)."""
     w = layer.kmajor_weight
     n = w.size(1)
     weight = w.permute(1, 0, 2).reshape(n, -1)
     if layer.kmajor_scale is None:
         return weight
-    return weight.view(torch.int8).float() * layer.kmajor_scale.view(n, 1)
+    if weight.dtype == torch.float8_e4m3fn:
+        weight = weight.float()
+    else:
+        weight = weight.view(torch.int8).float()
+    weight = weight * layer.kmajor_scale.view(n, 1)
+    block_scale = getattr(layer, "kmajor_block_scale", None)
+    if block_scale is not None:
+        block_n, block_k = layer.kmajor_block
+        b = block_scale.t().float().repeat_interleave(block_n, dim=0)[:n]
+        weight = weight * b.repeat_interleave(block_k, dim=1)[:, : weight.shape[1]]
+    return weight
+
+
+def fp8_block_weight(
+    layer: torch.nn.Module,
+    weight: torch.Tensor,
+    scale: torch.Tensor,
+    block_n: int,
+    block_k: int,
+) -> None:
+    """Store a block-FP8 [N, K] e4m3fn weight with fp32 scales
+    [ceil(N / block_n), ceil(K / block_k)] K-major in place of layer.weight,
+    computed with as the checkpoint stores it."""
+    from vllm.model_executor.kernels.linear.scaled_mm.rdna2 import (
+        _split_block_scales,
+    )
+
+    device = layer.weight.device
+    channel, block_scale = _split_block_scales(
+        scale.to(device), block_n, weight.shape[0]
+    )
+    layer.kmajor_weight = kmajor_w8(weight.to(device))
+    layer.kmajor_scale = channel
+    layer.kmajor_block_scale = block_scale
+    layer.kmajor_block = (block_n, block_k)
+    _drop_weight(layer, layer.weight.data)
 
 
 def quantize_weight(layer: torch.nn.Module) -> None:
@@ -241,6 +277,8 @@ def apply_rdna2_kmajor(
             rows,
         )
         return out.to(torch.bfloat16)
+    block_scale = getattr(layer, "kmajor_block_scale", None)
+    block_n, block_k = getattr(layer, "kmajor_block", (1, 0))
     if rows is not None:
         # The kernel takes whole dwords of 4 output channels.
         n = min(-(-rows // 4) * 4, weight.shape[1])
@@ -249,7 +287,16 @@ def apply_rdna2_kmajor(
             bias = bias[:n]
         if scale is not None:
             scale = scale[:n]
+        if block_scale is not None:
+            block_scale = block_scale[:, : -(-n // block_n)].contiguous()
     out = rdna2_w8_linear(
-        x, weight, scale, bias=bias, act_quant_min_rows=act_quant_min_rows(weight)
+        x,
+        weight,
+        scale,
+        block_scale,
+        block_n,
+        block_k,
+        bias=bias,
+        act_quant_min_rows=act_quant_min_rows(weight),
     )
     return out if rows is None else out[..., :rows]

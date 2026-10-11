@@ -255,7 +255,7 @@ class Indexer(nn.Module):
         # Keep the checkpoint name ``index_kpool_compress_gate`` without a
         # ``.weight`` suffix. F.linear consumes its [head_dim, hidden_size] shape.
         self.index_kpool_compress_gate = nn.Parameter(
-            torch.empty(self.head_dim, hidden_size, dtype=torch.bfloat16)
+            torch.empty(self.head_dim, hidden_size)
         )
 
         # no tensor parallel, just replicated

@@ -108,7 +108,7 @@ void moe_wna16_decode_rdna2(torch::Tensor& output, const torch::Tensor& x,
                             const torch::Tensor& w2, const torch::Tensor& s2,
                             const std::optional<torch::Tensor>& z13,
                             const std::optional<torch::Tensor>& z2,
-                            torch::Tensor& act);
+                            torch::Tensor& act, double swiglu_limit);
 
 void moe_wna16_gemm_rdna2(torch::Tensor& output, const torch::Tensor& a,
                           const torch::Tensor& w, const torch::Tensor& scales,
@@ -199,6 +199,47 @@ void qsa_decode_rdna2(torch::Tensor& out, const torch::Tensor& q,
                       const torch::Tensor& block_table, double scale,
                       const std::optional<torch::Tensor>& k_scale,
                       const std::optional<torch::Tensor>& v_scale);
+
+void moe_wna16_kslice_rdna2(torch::Tensor& output, const torch::Tensor& a,
+                            const torch::Tensor& w, const torch::Tensor& scales,
+                            const std::optional<torch::Tensor>& zeros,
+                            const torch::Tensor& sorted_ids,
+                            const torch::Tensor& expert_ids,
+                            const torch::Tensor& num_tokens_post_padded,
+                            const torch::Tensor& topk_weights, int64_t top_k,
+                            bool mul_routed_weight, int64_t block_m);
+
+void bmm_skinny_rdna2(const torch::Tensor& x, const torch::Tensor& w,
+                      torch::Tensor& out);
+
+void paged_mqa_logits_rdna2(const torch::Tensor& q,
+                            const torch::Tensor& kv_cache,
+                            const torch::Tensor& weights,
+                            const torch::Tensor& context_lens,
+                            const torch::Tensor& block_tables,
+                            torch::Tensor& out, int64_t max_len);
+
+void sparse_mla_attn_rdna2(const torch::Tensor& q, const torch::Tensor& kv,
+                           const torch::Tensor& indices,
+                           const torch::Tensor& indptr, torch::Tensor& out,
+                           const std::optional<torch::Tensor>& part_o,
+                           const std::optional<torch::Tensor>& part_ml,
+                           int64_t nseg, double scale);
+
+void mhc_rdna2(
+    const torch::Tensor& residual, const std::optional<torch::Tensor>& x,
+    const std::optional<torch::Tensor>& post_layer_mix,
+    const std::optional<torch::Tensor>& comb_res_mix, const torch::Tensor& fn,
+    const torch::Tensor& hc_scale, const torch::Tensor& hc_base,
+    const std::optional<torch::Tensor>& norm_weight,
+    std::optional<torch::Tensor> residual_out, torch::Tensor& post_mix,
+    torch::Tensor& comb_mix, torch::Tensor& layer_input, torch::Tensor& partial,
+    double rms_eps, double hc_pre_eps, double hc_sinkhorn_eps,
+    double hc_post_mult_value, int64_t sinkhorn_repeat, double norm_eps);
+
+void mhc_post_rdna2(const torch::Tensor& x, const torch::Tensor& residual,
+                    const torch::Tensor& post_layer_mix,
+                    const torch::Tensor& comb_res_mix, torch::Tensor& out);
 
 void gdn_post_conv_rdna2(const torch::Tensor& conv_output,
                          const torch::Tensor& a, const torch::Tensor& b,

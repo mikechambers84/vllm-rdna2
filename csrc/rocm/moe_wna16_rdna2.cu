@@ -18,6 +18,8 @@
 // Weights are dequantized to exact integers (OR into the 1024.0 mantissa)
 // and the group scale is applied to the fp32 partial dot, as Exllama does.
 // A zero point z adds (8 - z) * sum(activations) per 32-weight chunk.
+// swiglu_limit L > 0 clamps the activation: silu(min(gate, L)) *
+// clamp(up, -L, L).
 
 #include <torch/all.h>
 #include <c10/cuda/CUDAGuard.h>
@@ -113,11 +115,15 @@ __device__ __forceinline__ void stage_row(__half* dst, const __half* src,
 }
 
 template <bool ZP>
-__global__ void __launch_bounds__(WAVES* WARP32) gate_up_silu_kernel(
-    const __half* __restrict__ x, const int32_t* __restrict__ topk_ids,
-    const uint32_t* __restrict__ w13, const __half* __restrict__ s13,
-    const uint8_t* __restrict__ z13, __half* __restrict__ act, const int E,
-    const int H, const int I, const int topk, const int ldx, const int gsub) {
+__global__ void __launch_bounds__(WAVES* WARP32)
+    gate_up_silu_kernel(const __half* __restrict__ x,
+                        const int32_t* __restrict__ topk_ids,
+                        const uint32_t* __restrict__ w13,
+                        const __half* __restrict__ s13,
+                        const uint8_t* __restrict__ z13,
+                        __half* __restrict__ act, const int E, const int H,
+                        const int I, const int topk, const int ldx,
+                        const int gsub, const float lim) {
   extern __shared__ __align__(16) __half sx[];
   const int pair = blockIdx.y;
   const long e = topk_ids[pair];
@@ -149,7 +155,11 @@ __global__ void __launch_bounds__(WAVES* WARP32) gate_up_silu_kernel(
   }
   #pragma unroll
   for (int r = 0; r < R1; r++) {
-    const float gate = wave_sum(acc[0][r]), up = wave_sum(acc[1][r]);
+    float gate = wave_sum(acc[0][r]), up = wave_sum(acc[1][r]);
+    if (lim > 0.f) {
+      gate = fminf(gate, lim);
+      up = fminf(fmaxf(up, -lim), lim);
+    }
     if (lane == 0 && j0 + r < I)
       act[(long)pair * I + j0 + r] =
           __float2half(gate / (1.f + __expf(-gate)) * up);
@@ -206,7 +216,7 @@ __global__ void gate_up_silu_kernel(const __half*, const int32_t*,
                                     const uint32_t*, const __half*,
                                     const uint8_t*, __half*, const int,
                                     const int, const int, const int, const int,
-                                    const int) {}
+                                    const int, const float) {}
 template <bool ZP>
 __global__ void down_sum_kernel(const __half*, const int32_t*, const float*,
                                 const uint32_t*, const __half*, const uint8_t*,
@@ -225,6 +235,7 @@ __global__ void down_sum_kernel(const __half*, const int32_t*, const float*,
 // of 32), optional zero points z13 [E, I, H/G] and z2 [E, H/2, I/G] uint8
 // (two columns per byte; absent = 8), act a [M * topk, I] fp16 workspace.
 // The activations are staged in LDS: H and topk * I at most 32768.
+// swiglu_limit > 0 clamps gate and up before silu(gate) * up.
 void moe_wna16_decode_rdna2(torch::Tensor& output, const torch::Tensor& x,
                             const torch::Tensor& topk_ids,
                             const torch::Tensor& topk_weights,
@@ -232,7 +243,7 @@ void moe_wna16_decode_rdna2(torch::Tensor& output, const torch::Tensor& x,
                             const torch::Tensor& w2, const torch::Tensor& s2,
                             const std::optional<torch::Tensor>& z13,
                             const std::optional<torch::Tensor>& z2,
-                            torch::Tensor& act) {
+                            torch::Tensor& act, double swiglu_limit) {
   using namespace vllm::moe_wna16_rdna2;
   TORCH_CHECK(
       x.dtype() == torch::kFloat16 && output.dtype() == torch::kFloat16 &&
@@ -291,7 +302,8 @@ void moe_wna16_decode_rdna2(torch::Tensor& output, const torch::Tensor& x,
          H * sizeof(__half), stream>>>(                                       \
           (const __half*)x.data_ptr(), topk_ids.data_ptr<int32_t>(),          \
           (const uint32_t*)w13.data_ptr(), (const __half*)s13.data_ptr(),     \
-          z13p, (__half*)act.data_ptr(), E, H, I, topk, x.stride(0), gsub);   \
+          z13p, (__half*)act.data_ptr(), E, H, I, topk, x.stride(0), gsub,    \
+          (float)swiglu_limit);                                               \
   down_sum_kernel<ZPV><<<dim3((H + WAVES * R2 - 1) / (WAVES * R2), M), block, \
                          topk * I * sizeof(__half), stream>>>(                \
       (const __half*)act.data_ptr(), topk_ids.data_ptr<int32_t>(),            \

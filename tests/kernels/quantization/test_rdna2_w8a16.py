@@ -171,6 +171,39 @@ def test_kmajor_layers_give_mla_their_weights(monkeypatch, env):
         assert err < 1e-2
 
 
+@pytest.mark.skipif(not on_gfx1030(), reason="gfx1030 only")
+@pytest.mark.parametrize("num_tokens", [1, 8, 300])
+def test_block_fp8_weight_replaces_dequantized_weight(num_tokens):
+    """fp8_block_weight swaps a layer's dequantized weight for the block-FP8
+    checkpoint weight: the layer computes the block-dequantized product, the
+    unquantized method leaves it alone, and MLA's weight helper rebuilds it."""
+    from vllm.model_executor.kernels.linear.rdna2_w8a16 import fp8_block_weight
+    from vllm.model_executor.layers.linear import UnquantizedLinearMethod
+    from vllm.model_executor.layers.quantization.utils.quant_utils import (
+        get_and_maybe_dequant_weights,
+    )
+
+    torch.manual_seed(0)
+    n, k, bn, bk = 2048, 1536, 128, 128
+    w8 = (torch.randn(n, k, device="cuda") * 0.5).to(torch.float8_e4m3fn)
+    scale = torch.rand(n // bn, k // bk, device="cuda") * 1e-2 + 1e-3
+    ref_w = w8.float() * scale.repeat_interleave(bn, 0).repeat_interleave(bk, 1)
+    layer = torch.nn.Module()
+    layer.weight = torch.nn.Parameter(ref_w.half(), requires_grad=False)
+    layer.quant_method = UnquantizedLinearMethod()
+    fp8_block_weight(layer, w8, scale, bn, bk)
+    layer.quant_method.process_weights_after_loading(layer)
+    assert layer.weight.numel() == 0
+    assert layer.kmajor_weight.dtype == torch.float8_e4m3fn
+
+    x = torch.randn(num_tokens, k, device="cuda", dtype=torch.float16)
+    out = layer.quant_method.apply(layer, x).float()
+    ref = x.float() @ ref_w.T
+    assert ((out - ref).norm() / ref.norm()).item() < 2e-3
+    rebuilt = get_and_maybe_dequant_weights(layer, torch.float32)
+    torch.testing.assert_close(rebuilt, ref_w, rtol=2e-3, atol=1e-6)
+
+
 def _lm_head(vocab: int, hidden: int):
     from vllm.model_executor.layers.vocab_parallel_embedding import ParallelLMHead
 
