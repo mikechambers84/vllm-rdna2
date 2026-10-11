@@ -225,6 +225,12 @@ void paged_mqa_logits_rdna2(const torch::Tensor& q,
                             const torch::Tensor& block_tables,
                             torch::Tensor& out, int64_t max_len);
 
+void mqa_logits_rdna2(const torch::Tensor& q16, const torch::Tensor& k,
+                      const torch::Tensor& k_scale,
+                      const torch::Tensor& weights,
+                      const torch::Tensor& cu_seqlen_ks,
+                      const torch::Tensor& cu_seqlen_ke, torch::Tensor& out);
+
 void sparse_mla_attn_rdna2(const torch::Tensor& q, const torch::Tensor& kv,
                            const torch::Tensor& indices,
                            const torch::Tensor& indptr, torch::Tensor& out,

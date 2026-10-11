@@ -13,6 +13,13 @@
 // widened exactly to fp16 (x 2^-8) into k2-major LDS tiles, each thread dots
 // one key with H / 4 heads by v_dot2_f32_f16 (head operands are wave
 // broadcasts), and the four head groups are summed through LDS.
+//
+// mqa_logits_rdna2 is the prefill form (fp8_mqa_logits_torch over the gathered
+// keys of a chunk, whose [H, rows, keys] fp32 intermediate reached GBs at long
+// context): each lane widens one key into registers once, then the wave walks
+// the rows of its block and their heads, the fp16 query of each (row, head)
+// coming through scalar loads (a wave-uniform operand of v_dot2_f32_f16);
+// rows whose key range misses the wave's 32 keys only store -inf.
 
 #include <torch/all.h>
 #include <c10/cuda/CUDAGuard.h>
@@ -20,6 +27,8 @@
 
 #include <hip/hip_runtime.h>
 #include <hip/hip_fp16.h>
+
+#include <algorithm>
 
 #include "rdna2_fp8.cuh"
 
@@ -150,7 +159,75 @@ __global__ void __launch_bounds__(THREADS) paged_mqa_logits_rdna2_kernel(
   }
 }
 
+static constexpr int PF_KEYS = THREADS;  // keys per prefill workgroup
+
+// q16 [M, H, 128] fp16 (the fp8 query widened exactly), k [N, 128] fp8 e4m3fn,
+// k_scale [N], w [M, H] -> out[r, n] for n < N; rows r0 .. r0 + rows of this
+// block.
+__global__ void __launch_bounds__(THREADS) mqa_logits_rdna2_kernel(
+    const __half* __restrict__ q16, const uint8_t* __restrict__ k,
+    const float* __restrict__ k_scale, const float* __restrict__ w,
+    const int* __restrict__ ks, const int* __restrict__ ke,
+    float* __restrict__ out, const int M, const int N, const int H,
+    const long out_stride, const int rows) {
+  const int lane = threadIdx.x % 32;
+  const int n0 = blockIdx.x * PF_KEYS +
+                 __builtin_amdgcn_readfirstlane(threadIdx.x / 32) * 32;
+  const int n = n0 + lane;
+  if (n0 >= N) return;
+  uint32_t kh[D2];  // this lane's key, fp16 pairs x 2^-8
+  float sc = 0.f;
+  if (n < N) {
+    const uint4* kp = reinterpret_cast<const uint4*>(k + (long)n * D);
+  #pragma unroll
+    for (int i = 0; i < D / 16; i++) {
+      const uint4 v = kp[i];
+      const uint32_t u[4] = {v.x, v.y, v.z, v.w};
+  #pragma unroll
+      for (int e = 0; e < 4; e++) {
+        kh[i * 8 + 2 * e] = as_u32(rdna2::fp8x2_to_half2(u[e], rdna2::FP8_LO));
+        kh[i * 8 + 2 * e + 1] =
+            as_u32(rdna2::fp8x2_to_half2(u[e], rdna2::FP8_HI));
+      }
+    }
+    sc = k_scale[n] * 256.f;  // the key's 2^-8
+  } else {
+  #pragma unroll
+    for (int d = 0; d < D2; d++) kh[d] = 0u;
+  }
+  const int r0 = blockIdx.y * rows, r1 = min(M, r0 + rows);
+  for (int r = r0; r < r1; r++) {
+    const int lo = ks[r], hi = ke[r];
+    float v = -INFINITY;
+    if (n0 < hi && n0 + 32 > lo) {
+      const uint32_t* qr =
+          reinterpret_cast<const uint32_t*>(q16 + (long)r * H * D);
+      const float* wr = w + (long)r * H;
+      float acc = 0.f;
+      for (int h = 0; h < H; h++) {
+        float p0 = 0.f, p1 = 0.f;
+  #pragma unroll
+        for (int d = 0; d < D2; d += 2) {
+          p0 = __builtin_amdgcn_fdot2(as_h2(qr[h * D2 + d]), as_h2(kh[d]), p0,
+                                      false);
+          p1 = __builtin_amdgcn_fdot2(as_h2(qr[h * D2 + d + 1]),
+                                      as_h2(kh[d + 1]), p1, false);
+        }
+        acc += fmaxf(p0 + p1, 0.f) * wr[h];
+      }
+      if (n >= lo && n < hi) v = acc * sc;
+    }
+    if (n < N) out[r * out_stride + n] = v;
+  }
+}
+
 #else  // non-RDNA2 device pass: empty stub for symbol parity.
+
+__global__ void mqa_logits_rdna2_kernel(const __half*, const uint8_t*,
+                                        const float*, const float*, const int*,
+                                        const int*, float*, const int,
+                                        const int, const int, const long,
+                                        const int) {}
 
 template <int H, bool CTX_PER_ROW>
 __global__ void paged_mqa_logits_rdna2_kernel(const uint8_t*, const uint8_t*,
@@ -225,4 +302,51 @@ void paged_mqa_logits_rdna2(const torch::Tensor& q,
       VLLM_PMQA(64, false);
   }
 #undef VLLM_PMQA
+}
+
+// q16 [M, H, 128] fp16 (contiguous; the fp8 query widened exactly), k [N, 128]
+// fp8 e4m3fn (contiguous), k_scale fp32 [N], weights fp32 [M, H], row key
+// ranges cu_seqlen_ks / cu_seqlen_ke int32 [M] -> out fp32 [M, N] (-inf
+// outside each row's range).
+void mqa_logits_rdna2(const torch::Tensor& q16, const torch::Tensor& k,
+                      const torch::Tensor& k_scale,
+                      const torch::Tensor& weights,
+                      const torch::Tensor& cu_seqlen_ks,
+                      const torch::Tensor& cu_seqlen_ke, torch::Tensor& out) {
+  using namespace vllm::indexer_rdna2;
+  TORCH_CHECK(q16.scalar_type() == at::kHalf && q16.dim() == 3 &&
+                  q16.size(2) == D && q16.is_contiguous(),
+              "mqa_logits_rdna2: contiguous fp16 q [M, H, 128]");
+  const int M = q16.size(0), H = q16.size(1), N = k.size(0);
+  TORCH_CHECK(k.element_size() == 1 && k.dim() == 2 && k.size(1) == D &&
+                  k.is_contiguous(),
+              "mqa_logits_rdna2: contiguous fp8 k [N, 128]");
+  TORCH_CHECK(k_scale.scalar_type() == at::kFloat && k_scale.is_contiguous() &&
+                  k_scale.numel() == N,
+              "mqa_logits_rdna2: fp32 k_scale [N]");
+  TORCH_CHECK(weights.scalar_type() == at::kFloat && weights.is_contiguous() &&
+                  weights.numel() == (long)M * H,
+              "mqa_logits_rdna2: weights fp32 [M, H]");
+  TORCH_CHECK(cu_seqlen_ks.scalar_type() == at::kInt &&
+                  cu_seqlen_ke.scalar_type() == at::kInt &&
+                  cu_seqlen_ks.is_contiguous() &&
+                  cu_seqlen_ke.is_contiguous() && cu_seqlen_ks.numel() == M &&
+                  cu_seqlen_ke.numel() == M,
+              "mqa_logits_rdna2: int32 cu_seqlen_ks / cu_seqlen_ke [M]");
+  TORCH_CHECK(out.scalar_type() == at::kFloat && out.dim() == 2 &&
+                  out.size(0) == M && out.size(1) >= N && out.stride(1) == 1,
+              "mqa_logits_rdna2: out fp32 [M, N]");
+  if (M == 0 || N == 0) return;
+  const at::cuda::OptionalCUDAGuard device_guard(device_of(q16));
+  const cudaStream_t stream = at::cuda::getCurrentCUDAStream();
+  const int kb = (N + PF_KEYS - 1) / PF_KEYS;
+  // Enough workgroups to fill the GPU; each widens its keys once per block.
+  const int rb = std::max(1, std::min(M, 2048 / kb));
+  const int rows = (M + rb - 1) / rb;
+  const dim3 grid(kb, (M + rows - 1) / rows);
+  mqa_logits_rdna2_kernel<<<grid, THREADS, 0, stream>>>(
+      (const __half*)q16.data_ptr(), (const uint8_t*)k.data_ptr(),
+      k_scale.data_ptr<float>(), weights.data_ptr<float>(),
+      cu_seqlen_ks.data_ptr<int>(), cu_seqlen_ke.data_ptr<int>(),
+      out.data_ptr<float>(), M, N, H, out.stride(0), rows);
 }

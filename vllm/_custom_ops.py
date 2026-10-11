@@ -2811,6 +2811,31 @@ def paged_mqa_logits_rdna2(
     return out
 
 
+def mqa_logits_rdna2(
+    q: torch.Tensor,
+    k: torch.Tensor,
+    k_scale: torch.Tensor,
+    weights: torch.Tensor,
+    cu_seqlen_ks: torch.Tensor,
+    cu_seqlen_ke: torch.Tensor,
+) -> torch.Tensor:
+    """RDNA2 indexer logits for prefill: ``k_scale[n] * sum_h w[m, h] *
+    relu(q[m, h] . k[n])`` for fp8 q [M, H, 128] and gathered fp8 keys
+    [N, 128], -inf outside [cu_seqlen_ks[m], cu_seqlen_ke[m]); returns
+    [M, N] fp32."""
+    out = torch.empty(q.shape[0], k.shape[0], dtype=torch.float32, device=q.device)
+    torch.ops._rocm_C.mqa_logits_rdna2(
+        q.to(torch.float16).contiguous(),
+        k.view(torch.uint8),
+        k_scale.reshape(-1).contiguous(),
+        weights.contiguous(),
+        cu_seqlen_ks.to(torch.int32).contiguous(),
+        cu_seqlen_ke.to(torch.int32).contiguous(),
+        out,
+    )
+    return out
+
+
 def sparse_mla_attn_rdna2(
     q: torch.Tensor,
     kv: torch.Tensor,

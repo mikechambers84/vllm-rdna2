@@ -868,6 +868,24 @@ def mqa_logits_module():
     return None
 
 
+def _rdna2_mqa_logits_supported(q: torch.Tensor, k_fp8: torch.Tensor) -> bool:
+    """gfx1030's HIP prefill indexer-logits kernel: 128 fp8 dims."""
+    if not current_platform.is_rocm():
+        return False
+    from vllm.platforms.rocm import on_gfx1030
+
+    return (
+        on_gfx1030()
+        and q.dim() == 3
+        and q.shape[2] == 128
+        and q.dtype == torch.float8_e4m3fn
+        and k_fp8.dim() == 2
+        and k_fp8.shape[1] == 128
+        and k_fp8.dtype in (torch.float8_e4m3fn, torch.uint8)
+        and k_fp8.is_contiguous()
+    )
+
+
 def rocm_fp8_mqa_logits(
     q: torch.Tensor,
     kv: tuple[torch.Tensor, torch.Tensor],
@@ -896,6 +914,13 @@ def rocm_fp8_mqa_logits(
     from vllm._aiter_ops import rocm_aiter_ops
 
     k_fp8, scale = kv
+
+    if _rdna2_mqa_logits_supported(q, k_fp8):
+        from vllm import _custom_ops as ops
+
+        return ops.mqa_logits_rdna2(
+            q, k_fp8, scale, weights, cu_seqlen_ks, cu_seqlen_ke
+        )
 
     if _ON_GFX942 and rocm_aiter_ops.is_enabled():
         from aiter.ops.flydsl import flydsl_fp8_mqa_logits
