@@ -1,5 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+from collections.abc import Callable
 from functools import partial
 
 import torch
@@ -162,6 +163,54 @@ def grouped_topk(
     return topk_weights.to(torch.float32), topk_ids.to(torch.int32)
 
 
+def use_rdna2_grouped_topk(
+    gating_output: torch.Tensor,
+    topk: int,
+    num_expert_group: int,
+    topk_group: int,
+    scoring_func: str,
+    num_fused_shared_experts: int = 0,
+) -> bool:
+    """gfx1030's one-kernel routing (grouped_topk_rdna2) for this shape."""
+    if not current_platform.is_rocm():
+        return False
+    from vllm.platforms.rocm import on_gfx1030
+
+    return (
+        on_gfx1030()
+        and num_fused_shared_experts == 0
+        and gating_output.dim() == 2
+        and gating_output.stride(1) == 1
+        and ops.grouped_topk_rdna2_supported(
+            gating_output.shape[1], topk, num_expert_group, topk_group, scoring_func
+        )
+    )
+
+
+def rdna2_grouped_topk(
+    hidden_states: torch.Tensor,
+    gating_output: torch.Tensor,
+    topk: int,
+    renormalize: bool,
+    num_expert_group: int = 0,
+    topk_group: int = 0,
+    scoring_func: str = "softmax",
+    routed_scaling_factor: float = 1.0,
+    e_score_correction_bias: torch.Tensor | None = None,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """grouped_topk on gfx1030's routing kernel (same arguments)."""
+    return ops.grouped_topk_rdna2(
+        gating_output,
+        e_score_correction_bias,
+        topk,
+        num_expert_group,
+        topk_group,
+        scoring_func,
+        renormalize,
+        routed_scaling_factor,
+    )
+
+
 # --8<-- [start:grouped_topk]
 @CustomOp.register("grouped_topk")
 class GroupedTopk(CustomOp):
@@ -238,37 +287,27 @@ class GroupedTopk(CustomOp):
                 e_score_correction_bias,
                 self.num_fused_shared_experts,
             )
-        if self._use_rdna2(gating_output):
-            return ops.grouped_topk_rdna2(
+        if use_rdna2_grouped_topk(
+            gating_output,
+            self.topk,
+            self.num_expert_group,
+            self.topk_group,
+            self.scoring_func,
+            self.num_fused_shared_experts,
+        ):
+            return rdna2_grouped_topk(
+                hidden_states,
                 gating_output,
-                e_score_correction_bias,
                 self.topk,
+                self.renormalize,
                 self.num_expert_group,
                 self.topk_group,
                 self.scoring_func,
-                self.renormalize,
                 self.routed_scaling_factor,
+                e_score_correction_bias,
             )
         return self.forward_native(
             hidden_states, gating_output, e_score_correction_bias
-        )
-
-    def _use_rdna2(self, gating_output: torch.Tensor) -> bool:
-        """gfx1030's one-kernel routing (grouped_topk_rdna2)."""
-        from vllm.platforms.rocm import on_gfx1030
-
-        return (
-            on_gfx1030()
-            and self.num_fused_shared_experts == 0
-            and gating_output.dim() == 2
-            and gating_output.stride(1) == 1
-            and ops.grouped_topk_rdna2_supported(
-                gating_output.shape[1],
-                self.topk,
-                self.num_expert_group,
-                self.topk_group,
-                self.scoring_func,
-            )
         )
 
 
@@ -354,6 +393,7 @@ class GroupedTopKRouter(BaseRouter):
             return topk_weights, topk_ids
 
         # Select grouped_topk implementation
+        grouped_topk_impl: Callable[..., tuple[torch.Tensor, torch.Tensor]]
         if rocm_aiter_ops.is_fused_moe_enabled():
             if not rocm_aiter_ops.is_fusion_moe_shared_experts_enabled():
                 assert self.num_fused_shared_experts == 0
@@ -361,6 +401,15 @@ class GroupedTopKRouter(BaseRouter):
                 rocm_aiter_grouped_topk,
                 num_fused_shared_experts=self.num_fused_shared_experts,
             )
+        elif use_rdna2_grouped_topk(
+            router_logits,
+            self.top_k,
+            self.num_expert_group,
+            self.topk_group,
+            self.scoring_func,
+            self.num_fused_shared_experts,
+        ):
+            grouped_topk_impl = rdna2_grouped_topk
         else:
             grouped_topk_impl = grouped_topk
 

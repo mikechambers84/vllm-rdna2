@@ -481,3 +481,37 @@ def test_grouped_topk_rdna2(
     torch.testing.assert_close(
         w.gather(1, order2), ref_w.gather(1, order), atol=1e-5, rtol=1e-5
     )
+
+
+@pytest.mark.skipif(
+    not _rdna2_grouped_topk_available(), reason="gfx1030 HIP routing kernel"
+)
+def test_grouped_topk_router_uses_rdna2_kernel(monkeypatch: pytest.MonkeyPatch):
+    """GLM-style routing (288 experts, one group, bias) through
+    GroupedTopKRouter reaches the gfx1030 kernel, not the compiled torch
+    grouped_topk."""
+    from vllm import _custom_ops as ops
+
+    calls = []
+    kernel = ops.grouped_topk_rdna2
+
+    def spy(*args, **kwargs):
+        calls.append(1)
+        return kernel(*args, **kwargs)
+
+    monkeypatch.setattr(ops, "grouped_topk_rdna2", spy)
+    set_random_seed(0)
+    logits = torch.randn((4, 288), dtype=torch.float32, device="cuda")
+    bias = torch.randn((288,), dtype=torch.float32, device="cuda")
+    router = GroupedTopKRouter(
+        top_k=8,
+        global_num_experts=288,
+        num_expert_group=1,
+        topk_group=1,
+        renormalize=True,
+        scoring_func="sigmoid",
+        routed_scaling_factor=2.5,
+        e_score_correction_bias=bias,
+    )
+    weights, ids = router._compute_routing(logits, logits, None)
+    assert calls and ids.shape == (4, 8) and weights.dtype == torch.float32
