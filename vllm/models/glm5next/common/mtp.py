@@ -7,6 +7,7 @@ import torch
 import torch.nn as nn
 
 from vllm.config import VllmConfig
+from vllm.distributed import get_pp_group
 from vllm.model_executor.layers.fused_moe import (
     fused_moe_make_expert_params_mapping,
 )
@@ -324,6 +325,16 @@ class Glm5NextMTP(nn.Module, DeepseekV2MixtureOfExperts):
             # prefix to match.
             if name.startswith("model.language_model."):
                 name = name.replace("model.language_model.", "model.", 1)
+            if name == "model.embed_tokens.weight" and get_pp_group().world_size > 1:
+                # The checkpoint has no MTP copy of the input embedding and the
+                # drafter's pipeline stage lacks the target's, so load it here
+                # (maybe_share_target_embed shares it only without PP).
+                param = params_dict[name]
+                getattr(param, "weight_loader", default_weight_loader)(
+                    param, loaded_weight
+                )
+                loaded_params.add(name)
+                continue
             spec_layer = get_spec_layer_idx_from_weight_name(self.config, name)
             if spec_layer is None:
                 continue
