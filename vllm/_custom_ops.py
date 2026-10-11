@@ -2792,10 +2792,13 @@ def paged_mqa_logits_rdna2(
     block_tables: torch.Tensor,
     max_len: int,
     out: torch.Tensor | None = None,
+    shuffled: bool = True,
 ) -> torch.Tensor:
     """RDNA2 indexer logits for decode / MTP: ``scale[t] * sum_h w[r, h] *
-    relu(q[r, h] . k[t])`` over the paged fp8 cache, -inf past each row's
-    context; returns [B * next_n, max_len] fp32 with no host sync."""
+    relu(q[r, h] . k[t])`` over the paged fp8 cache (``shuffled``: values in
+    16-token x 16-byte tiles, as the indexer cache writers store blocks of more
+    than one entry), -inf past each row's context; returns [B * next_n,
+    max_len] fp32 with no host sync."""
     rows = q.shape[0] * q.shape[1]
     if out is None:
         out = torch.empty(rows, max_len, dtype=torch.float32, device=q.device)
@@ -2807,6 +2810,7 @@ def paged_mqa_logits_rdna2(
         block_tables.to(torch.int32),
         out,
         max_len,
+        shuffled,
     )
     return out
 

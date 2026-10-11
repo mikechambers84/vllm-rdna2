@@ -238,8 +238,8 @@ TORCH_LIBRARY_EXPAND(TORCH_EXTENSION_NAME, rocm_ops) {
   // Sparse-attention indexer: paged fp8 MQA logits for decode / MTP.
   rocm_ops.def(
       "paged_mqa_logits_rdna2(Tensor q, Tensor kv_cache, Tensor weights, "
-      "Tensor context_lens, Tensor block_tables, Tensor! out, int max_len) "
-      "-> ()");
+      "Tensor context_lens, Tensor block_tables, Tensor! out, int max_len, "
+      "bool shuffled) -> ()");
   rocm_ops.impl("paged_mqa_logits_rdna2", torch::kCUDA,
                 &paged_mqa_logits_rdna2);
   // Sparse-attention indexer: fp8 MQA logits for prefill (gathered keys).

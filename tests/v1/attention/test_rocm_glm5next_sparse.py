@@ -376,10 +376,22 @@ def test_paged_mqa_logits_reference_mtp_rows_match_single_rows(ctx_per_row):
     torch.testing.assert_close(mtp, single)
 
 
+def _shuffle_fp8_cache(cache, block_size):
+    """The indexer cache writers' layout for blocks of more than one entry:
+    each block's values in 16-token tiles of eight 16 x 16-byte groups."""
+    flat = cache.reshape(cache.shape[0], -1)
+    vals = flat[:, : block_size * 128].reshape(-1, block_size // 16, 16, 8, 16)
+    vals = vals.permute(0, 1, 3, 2, 4).reshape(cache.shape[0], -1)
+    return torch.cat([vals, flat[:, block_size * 128 :]], dim=1).reshape(cache.shape)
+
+
 @pytest.mark.skipif(not _on_gfx1030(), reason="gfx1030 HIP kernel")
+@pytest.mark.parametrize("shuffled", [False, True])
 @pytest.mark.parametrize("block_size", [64, 160])
 @pytest.mark.parametrize("next_n,ctx_per_row", [(1, True), (2, True), (2, False)])
-def test_rdna2_paged_mqa_logits_matches_torch(block_size, next_n, ctx_per_row):
+def test_rdna2_paged_mqa_logits_matches_torch(
+    block_size, next_n, ctx_per_row, shuffled
+):
     from vllm import _custom_ops as ops
     from vllm.v1.attention.ops.rocm_aiter_mla_sparse import (
         fp8_paged_mqa_logits_torch,
@@ -405,7 +417,13 @@ def test_rdna2_paged_mqa_logits_matches_torch(block_size, next_n, ctx_per_row):
         t.cuda() for t in (q, weights, context_lens, block_tables)
     )
     out = ops.paged_mqa_logits_rdna2(
-        q, cache, weights, context_lens, block_tables, max_len
+        q,
+        _shuffle_fp8_cache(cache, block_size) if shuffled else cache,
+        weights,
+        context_lens,
+        block_tables,
+        max_len,
+        shuffled=shuffled,
     )
     ref = fp8_paged_mqa_logits_torch(
         q, cache, weights, context_lens, block_tables, max_len

@@ -223,7 +223,7 @@ void paged_mqa_logits_rdna2(const torch::Tensor& q,
                             const torch::Tensor& weights,
                             const torch::Tensor& context_lens,
                             const torch::Tensor& block_tables,
-                            torch::Tensor& out, int64_t max_len);
+                            torch::Tensor& out, int64_t max_len, bool shuffled);
 
 void mqa_logits_rdna2(const torch::Tensor& q16, const torch::Tensor& k,
                       const torch::Tensor& k_scale,

@@ -728,6 +728,8 @@ def rocm_fp8_paged_mqa_logits(
             block_tables,
             max_model_len,
             out=out_logits,
+            shuffled=kv_cache_fp8.shape[1] > 1
+            and not _indexer_k_is_c4a_block_flat(compress_ratio),
         )
 
     # C4A only: Flash/DSv3.2 also skip insert but still write SHUFFLE.
