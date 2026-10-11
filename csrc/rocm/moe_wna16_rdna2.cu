@@ -16,15 +16,12 @@
 //     (deterministic; gfx1030 has no global float atomics).
 //   v2 (no zero points, H and I multiples of 1024): gate_up_v2 as above with
 //     software-pipelined loads, and down_v2 per (token, expert) pair into fp32
-//     partials that sum_pairs adds up per token in a fixed order. Steady
-//     clocks, GLM-5.3-Flash shapes, weights streamed from DRAM: 1 token 345 ->
-//     303 us, 2-8 tokens -8 to -9% (down -22 to -25%).
-//
-// Weights are dequantized to exact integers (OR into the 1024.0 mantissa)
-// and the group scale is applied to the fp32 partial dot, as Exllama does.
-// A zero point z adds (8 - z) * sum(activations) per 32-weight chunk.
-// swiglu_limit L > 0 clamps the activation: silu(min(gate, L)) *
-// clamp(up, -L, L).
+//     partials that sum_pairs adds up per token in a fixed order; both dot
+//     through group_dot_fast (half the VALU work per weight: at the 120 W cap
+//     the weight stream alone holds the shader clock near 600-750 MHz, so the
+//     instruction count sets the bandwidth). GLM-5.3-Flash shapes, weights
+//     from DRAM: 1 token 345 -> 280 us, 3 tokens 1050 -> 809, 8 tokens 2984 ->
+//     2049 (~400-450 GB/s).
 
 #include <torch/all.h>
 #include <c10/cuda/CUDAGuard.h>
@@ -214,6 +211,60 @@ __global__ void __launch_bounds__(WAVES* WARP32)
   }
 }
 
+// Activations for group_dot_fast: each 8-value chunk reordered to (x0, x4,
+// x1, x5, x2, x6, x3, x7), the pairs the nibble masks below produce, placed as
+// in stage_row; asum[g] = sum of group g's 32 activations.
+__device__ __forceinline__ void stage_row_fast(__half* dst, float* asum,
+                                               const __half* src, int K) {
+  const int groups = K / GROUP;
+  const half2 one = __halves2half2(__float2half(1.f), __float2half(1.f));
+  for (int k = threadIdx.x * 8; k < K; k += blockDim.x * 8) {
+    const int g = k / GROUP, c = k % GROUP / 8;
+    const uint4 v = *reinterpret_cast<const uint4*>(src + k);
+    uint4 o;
+    o.x = __byte_perm(v.x, v.z, 0x5410);
+    o.y = __byte_perm(v.x, v.z, 0x7632);
+    o.z = __byte_perm(v.y, v.w, 0x5410);
+    o.w = __byte_perm(v.y, v.w, 0x7632);
+    *reinterpret_cast<uint4*>(dst + (c * groups + g) * 8) = o;
+    const half2* h = reinterpret_cast<const half2*>(&v);
+    float sum = 0.f;
+  #pragma unroll
+    for (int j = 0; j < 4; j++)
+      sum = __builtin_amdgcn_fdot2(h[j], one, sum, false);
+    // The 4 chunks of a group are 4 consecutive lanes (K % 1024 == 0).
+    sum += __shfl_xor(sum, 1);
+    sum += __shfl_xor(sum, 2);
+    if (c == 0) asum[g] = sum;
+  }
+}
+
+__device__ __forceinline__ float fdot2_bits(uint32_t a, uint32_t b, float c) {
+  return __builtin_amdgcn_fdot2(*reinterpret_cast<const half2*>(&a),
+                                *reinterpret_cast<const half2*>(&b), c, false);
+}
+
+// One 32-weight group's dot against stage_row_fast activations with the
+// weights left as 1024 + (q + 8) in fp16 (one mask-and-or per pair, no bias
+// subtraction): the caller subtracts 1032 * asum. About half the VALU work
+// of group_dot, which matters at the 120 W cap, where streaming the weights
+// alone holds the shader clock near 600-750 MHz.
+__device__ __forceinline__ float group_dot_fast(const int4 wv, const __half* a,
+                                                int cstride) {
+  float part = 0.f;
+  #pragma unroll
+  for (int w = 0; w < 4; w++) {
+    const uint32_t q = reinterpret_cast<const uint32_t*>(&wv)[w];
+    const uint4 av = *reinterpret_cast<const uint4*>(a + w * cstride);
+    const uint32_t m = 0x000F000Fu, magic = 0x64006400u;
+    part = fdot2_bits(av.x, (q & m) | magic, part);
+    part = fdot2_bits(av.y, ((q >> 4) & m) | magic, part);
+    part = fdot2_bits(av.z, ((q >> 8) & m) | magic, part);
+    part = fdot2_bits(av.w, ((q >> 12) & m) | magic, part);
+  }
+  return part;
+}
+
 // v2 decode kernels: no per-row bounds branches (the launcher requires the
 // rows to tile the workgroups), scales kept as raw 16-bit values in 32-bit
 // registers (packing two halves forced a wait on every scale load), and the
@@ -255,7 +306,8 @@ __global__ void __launch_bounds__(WAVES* WARP32)
   const int pair = blockIdx.y;
   const long e = topk_ids[pair];
   const int steps = e >= 0 && e < E ? H / (GROUP * WARP32) : 0;
-  stage_row(sx, x + (long)(pair / topk) * ldx, H);
+  float* sasum = reinterpret_cast<float*>(sx + H);  // after the [H] row
+  stage_row_fast(sx, sasum, x + (long)(pair / topk) * ldx, H);
   __syncthreads();
   const int lane = threadIdx.x % WARP32, wave = threadIdx.x / WARP32;
   const int j0 = (blockIdx.x * WAVES + wave) * R1;
@@ -276,10 +328,11 @@ __global__ void __launch_bounds__(WAVES* WARP32)
     if (it + 1 < steps) load_rows(nxt, wrow, srow, g + WARP32, gsub);
     // Keep the next step's loads ahead of this step's math.
     asm volatile("" ::: "memory");
+    const float off = 1032.f * sasum[g];
   #pragma unroll
     for (int r = 0; r < ROWS; r++)
-      acc[r] +=
-          group_dot(cur.w[r], sx + g * 8, groups * 8) * raw_half(cur.s[r]);
+      acc[r] += (group_dot_fast(cur.w[r], sx + g * 8, groups * 8) - off) *
+                raw_half(cur.s[r]);
     cur = nxt;
   }
   #pragma unroll
@@ -304,11 +357,12 @@ __global__ void __launch_bounds__(WAVES* WARP32)
                    const uint32_t* __restrict__ w2,
                    const __half* __restrict__ s2, float* __restrict__ part,
                    const int E, const int H, const int I, const int gsub) {
-  extern __shared__ __align__(16) __half sa[];  // [I]
+  extern __shared__ __align__(16) __half sa[];  // [I] + asum[I / 32]
   const int pair = blockIdx.y;
   const long e = topk_ids[pair];
   const int steps = e >= 0 && e < E ? I / (GROUP * WARP32) : 0;
-  stage_row(sa, act + (long)pair * I, I);
+  float* sasum = reinterpret_cast<float*>(sa + I);
+  stage_row_fast(sa, sasum, act + (long)pair * I, I);
   __syncthreads();
   const int lane = threadIdx.x % WARP32, wave = threadIdx.x / WARP32;
   const int n0 = (blockIdx.x * WAVES + wave) * R2;
@@ -329,10 +383,11 @@ __global__ void __launch_bounds__(WAVES* WARP32)
     if (it + 1 < steps) load_rows(nxt, wrow, srow, g + WARP32, gsub);
     // Keep the next step's loads ahead of this step's math.
     asm volatile("" ::: "memory");
+    const float off = 1032.f * sasum[g];
   #pragma unroll
     for (int r = 0; r < R2; r++)
-      acc[r] +=
-          group_dot(cur.w[r], sa + g * 8, groups * 8) * raw_half(cur.s[r]);
+      acc[r] += (group_dot_fast(cur.w[r], sa + g * 8, groups * 8) - off) *
+                raw_half(cur.s[r]);
     cur = nxt;
   }
   const float wk = topk_weights[pair];
@@ -470,13 +525,14 @@ void moe_wna16_decode_rdna2(torch::Tensor& output, const torch::Tensor& x,
     torch::Tensor part =
         torch::empty({(long)M * topk, H}, x.options().dtype(torch::kFloat32));
     gate_up_v2_kernel<<<dim3(I / (WAVES * R1), M * topk), block,
-                        H * sizeof(__half), stream>>>(
+                        H * sizeof(__half) + H / GROUP * sizeof(float),
+                        stream>>>(
         (const __half*)x.data_ptr(), topk_ids.data_ptr<int32_t>(),
         (const uint32_t*)w13.data_ptr(), (const __half*)s13.data_ptr(),
         (__half*)act.data_ptr(), E, H, I, topk, x.stride(0), gsub,
         (float)swiglu_limit);
     down_v2_kernel<<<dim3(H / (WAVES * R2), M * topk), block,
-                     I * sizeof(__half), stream>>>(
+                     I * sizeof(__half) + I / GROUP * sizeof(float), stream>>>(
         (const __half*)act.data_ptr(), topk_ids.data_ptr<int32_t>(),
         topk_weights.data_ptr<float>(), (const uint32_t*)w2.data_ptr(),
         (const __half*)s2.data_ptr(), part.data_ptr<float>(), E, H, I, gsub);
