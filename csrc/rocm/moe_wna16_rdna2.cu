@@ -14,6 +14,11 @@
 //   down_sum: one workgroup per token and 8*R output rows; each wave sums
 //     topk_weight * (W2[e] row . act) over the token's experts in registers
 //     (deterministic; gfx1030 has no global float atomics).
+//   v2 (no zero points, H and I multiples of 1024): gate_up_v2 as above with
+//     software-pipelined loads, and down_v2 per (token, expert) pair into fp32
+//     partials that sum_pairs adds up per token in a fixed order. Steady
+//     clocks, GLM-5.3-Flash shapes, weights streamed from DRAM: 1 token 345 ->
+//     303 us, 2-8 tokens -8 to -9% (down -22 to -25%).
 //
 // Weights are dequantized to exact integers (OR into the 1024.0 mantissa)
 // and the group scale is applied to the fp32 partial dot, as Exllama does.
@@ -38,8 +43,8 @@ namespace moe_wna16_rdna2 {
 static constexpr int WARP32 = 32;
 static constexpr int WAVES = 8;
 static constexpr int GROUP = 32;
-static constexpr int R1 = 2;  // output columns per wave, gate_up_silu
-static constexpr int R2 = 4;  // output rows per wave, down_sum
+static constexpr int R1 = 2;  // output columns per wave, gate_up_silu (v2)
+static constexpr int R2 = 4;  // output rows per wave, down_sum / down_v2
 
 #if defined(__HIP__RDNA2__) || !defined(__HIP_DEVICE_COMPILE__)
 
@@ -209,6 +214,146 @@ __global__ void __launch_bounds__(WAVES* WARP32)
   }
 }
 
+// v2 decode kernels: no per-row bounds branches (the launcher requires the
+// rows to tile the workgroups), scales kept as raw 16-bit values in 32-bit
+// registers (packing two halves forced a wait on every scale load), and the
+// next 32-group step's loads issued before the current step's math, so a wave
+// keeps 2 * rows weight words in flight instead of one. No zero points.
+template <int ROWS>
+struct RowLoads {
+  int4 w[ROWS];
+  uint32_t s[ROWS];
+};
+
+template <int ROWS>
+__device__ __forceinline__ void load_rows(RowLoads<ROWS>& v,
+                                          const uint32_t* const (&wrow)[ROWS],
+                                          const __half* const (&srow)[ROWS],
+                                          int g, int gsub) {
+  #pragma unroll
+  for (int r = 0; r < ROWS; r++) {
+    v.w[r] = *reinterpret_cast<const int4*>(wrow[r] + g * 4);
+    v.s[r] = reinterpret_cast<const uint16_t*>(srow[r])[g / gsub];
+  }
+}
+
+__device__ __forceinline__ float raw_half(uint32_t s) {
+  return __half2float(__ushort_as_half((unsigned short)s));
+}
+
+// gate_up_silu v2: wave rows = gate j0 .. j0 + R1 - 1 and the matching up
+// rows.
+__global__ void __launch_bounds__(WAVES* WARP32)
+    gate_up_v2_kernel(const __half* __restrict__ x,
+                      const int32_t* __restrict__ topk_ids,
+                      const uint32_t* __restrict__ w13,
+                      const __half* __restrict__ s13, __half* __restrict__ act,
+                      const int E, const int H, const int I, const int topk,
+                      const int ldx, const int gsub, const float lim) {
+  extern __shared__ __align__(16) __half sx[];
+  constexpr int ROWS = 2 * R1;
+  const int pair = blockIdx.y;
+  const long e = topk_ids[pair];
+  const int steps = e >= 0 && e < E ? H / (GROUP * WARP32) : 0;
+  stage_row(sx, x + (long)(pair / topk) * ldx, H);
+  __syncthreads();
+  const int lane = threadIdx.x % WARP32, wave = threadIdx.x / WARP32;
+  const int j0 = (blockIdx.x * WAVES + wave) * R1;
+  const int words = H / 8, groups = H / GROUP, sgroups = groups / gsub;
+  const uint32_t* wrow[ROWS];
+  const __half* srow[ROWS];
+  #pragma unroll
+  for (int r = 0; r < ROWS; r++) {
+    const long row = e * 2 * I + (r / R1) * I + j0 + r % R1;
+    wrow[r] = w13 + row * words;
+    srow[r] = s13 + row * sgroups;
+  }
+  float acc[ROWS] = {};
+  RowLoads<ROWS> cur, nxt;
+  if (steps > 0) load_rows(cur, wrow, srow, lane, gsub);
+  for (int it = 0; it < steps; it++) {
+    const int g = lane + WARP32 * it;
+    if (it + 1 < steps) load_rows(nxt, wrow, srow, g + WARP32, gsub);
+    // Keep the next step's loads ahead of this step's math.
+    asm volatile("" ::: "memory");
+  #pragma unroll
+    for (int r = 0; r < ROWS; r++)
+      acc[r] +=
+          group_dot(cur.w[r], sx + g * 8, groups * 8) * raw_half(cur.s[r]);
+    cur = nxt;
+  }
+  #pragma unroll
+  for (int r = 0; r < R1; r++) {
+    float gate = wave_sum(acc[r]), up = wave_sum(acc[R1 + r]);
+    if (lim > 0.f) {
+      gate = fminf(gate, lim);
+      up = fminf(fmaxf(up, -lim), lim);
+    }
+    if (lane == 0)
+      act[(long)pair * I + j0 + r] =
+          __float2half(gate / (1.f + __expf(-gate)) * up);
+  }
+}
+
+// down v2 per (token, expert) pair: part[pair, n] = topk_weight * (W2[e] row
+// n . act[pair]) for the wave's R2 rows; summed per token by sum_pairs.
+__global__ void __launch_bounds__(WAVES* WARP32)
+    down_v2_kernel(const __half* __restrict__ act,
+                   const int32_t* __restrict__ topk_ids,
+                   const float* __restrict__ topk_weights,
+                   const uint32_t* __restrict__ w2,
+                   const __half* __restrict__ s2, float* __restrict__ part,
+                   const int E, const int H, const int I, const int gsub) {
+  extern __shared__ __align__(16) __half sa[];  // [I]
+  const int pair = blockIdx.y;
+  const long e = topk_ids[pair];
+  const int steps = e >= 0 && e < E ? I / (GROUP * WARP32) : 0;
+  stage_row(sa, act + (long)pair * I, I);
+  __syncthreads();
+  const int lane = threadIdx.x % WARP32, wave = threadIdx.x / WARP32;
+  const int n0 = (blockIdx.x * WAVES + wave) * R2;
+  const int words = I / 8, groups = I / GROUP, sgroups = groups / gsub;
+  const uint32_t* wrow[R2];
+  const __half* srow[R2];
+  #pragma unroll
+  for (int r = 0; r < R2; r++) {
+    const long row = e * H + n0 + r;
+    wrow[r] = w2 + row * words;
+    srow[r] = s2 + row * sgroups;
+  }
+  float acc[R2] = {};
+  RowLoads<R2> cur, nxt;
+  if (steps > 0) load_rows(cur, wrow, srow, lane, gsub);
+  for (int it = 0; it < steps; it++) {
+    const int g = lane + WARP32 * it;
+    if (it + 1 < steps) load_rows(nxt, wrow, srow, g + WARP32, gsub);
+    // Keep the next step's loads ahead of this step's math.
+    asm volatile("" ::: "memory");
+  #pragma unroll
+    for (int r = 0; r < R2; r++)
+      acc[r] +=
+          group_dot(cur.w[r], sa + g * 8, groups * 8) * raw_half(cur.s[r]);
+    cur = nxt;
+  }
+  const float wk = topk_weights[pair];
+  #pragma unroll
+  for (int r = 0; r < R2; r++) {
+    const float v = wave_sum(acc[r]);
+    if (lane == 0) part[(long)pair * H + n0 + r] = v * wk;
+  }
+}
+
+// out[t, n] = sum over the token's topk pairs of part[pair, n], in order.
+__global__ void sum_pairs_kernel(const float* __restrict__ part,
+                                 __half* __restrict__ out, const int H,
+                                 const int topk, const int ldo) {
+  const int t = blockIdx.y, n = blockIdx.x * blockDim.x + threadIdx.x;
+  if (n >= H) return;
+  float v = 0.f;
+  for (int k = 0; k < topk; k++) v += part[((long)t * topk + k) * H + n];
+  out[(long)t * ldo + n] = __float2half(v);
+}
+
 #else  // non-RDNA2 device pass: empty stubs for symbol parity.
 
 template <bool ZP>
@@ -222,6 +367,15 @@ __global__ void down_sum_kernel(const __half*, const int32_t*, const float*,
                                 const uint32_t*, const __half*, const uint8_t*,
                                 __half*, const int, const int, const int,
                                 const int, const int, const int) {}
+__global__ void gate_up_v2_kernel(const __half*, const int32_t*,
+                                  const uint32_t*, const __half*, __half*,
+                                  const int, const int, const int, const int,
+                                  const int, const int, const float) {}
+__global__ void down_v2_kernel(const __half*, const int32_t*, const float*,
+                               const uint32_t*, const __half*, float*,
+                               const int, const int, const int, const int) {}
+__global__ void sum_pairs_kernel(const float*, __half*, const int, const int,
+                                 const int) {}
 
 #endif  // __HIP__RDNA2__ || !__HIP_DEVICE_COMPILE__
 
@@ -310,7 +464,26 @@ void moe_wna16_decode_rdna2(torch::Tensor& output, const torch::Tensor& x,
       topk_weights.data_ptr<float>(), (const uint32_t*)w2.data_ptr(),         \
       (const __half*)s2.data_ptr(), z2p, (__half*)output.data_ptr(), E, H, I, \
       topk, output.stride(0), gsub)
-  if (zp) {
+  const int step = GROUP * WARP32;
+  if (!zp && H % step == 0 && I % step == 0 && I % (WAVES * R1) == 0 &&
+      H % (WAVES * R2) == 0) {
+    torch::Tensor part =
+        torch::empty({(long)M * topk, H}, x.options().dtype(torch::kFloat32));
+    gate_up_v2_kernel<<<dim3(I / (WAVES * R1), M * topk), block,
+                        H * sizeof(__half), stream>>>(
+        (const __half*)x.data_ptr(), topk_ids.data_ptr<int32_t>(),
+        (const uint32_t*)w13.data_ptr(), (const __half*)s13.data_ptr(),
+        (__half*)act.data_ptr(), E, H, I, topk, x.stride(0), gsub,
+        (float)swiglu_limit);
+    down_v2_kernel<<<dim3(H / (WAVES * R2), M * topk), block,
+                     I * sizeof(__half), stream>>>(
+        (const __half*)act.data_ptr(), topk_ids.data_ptr<int32_t>(),
+        topk_weights.data_ptr<float>(), (const uint32_t*)w2.data_ptr(),
+        (const __half*)s2.data_ptr(), part.data_ptr<float>(), E, H, I, gsub);
+    sum_pairs_kernel<<<dim3((H + 255) / 256, M), 256, 0, stream>>>(
+        part.data_ptr<float>(), (__half*)output.data_ptr(), H, topk,
+        output.stride(0));
+  } else if (zp) {
     VLLM_MOE_DECODE_LAUNCH(true);
   } else {
     VLLM_MOE_DECODE_LAUNCH(false);
