@@ -1016,6 +1016,32 @@ class DeepseekV32IndexerMetadataBuilder(AttentionMetadataBuilder):
             )
         self.indexer_decode_block_table_buffer: torch.Tensor | None = None
         self._max_num_batched_tokens = scheduler_config.max_num_batched_tokens
+        self._page_offsets: torch.Tensor | None = None
+
+    def _pages_per_kernel_block(self) -> int:
+        """Storage pages per block-table entry when the group's kernel blocks
+        are coarser than the pages the compressed cache is viewed in (the kpool
+        indexer's ``storage_block_size`` under a hybrid group block that no
+        kernel split divides), else 1."""
+        kernel_block_size = self.kernel_block_size
+        page = self.kv_cache_spec.block_size
+        if (
+            self.compress_ratio > 1
+            and kernel_block_size is not None
+            and kernel_block_size > page
+            and kernel_block_size % page == 0
+        ):
+            return kernel_block_size // page
+        return 1
+
+    def _split_block_table(self, block_table: torch.Tensor, pages: int) -> torch.Tensor:
+        """Kernel block b becomes storage pages b * pages + j, the order in
+        which the cache view splits each block."""
+        if self._page_offsets is None or self._page_offsets.numel() != pages:
+            self._page_offsets = torch.arange(
+                pages, dtype=block_table.dtype, device=block_table.device
+            )
+        return (block_table[:, :, None] * pages + self._page_offsets).flatten(1)
 
     def _dcp_localize_decode_seq_lens(
         self,
@@ -1310,6 +1336,8 @@ class DeepseekV32IndexerMetadataBuilder(AttentionMetadataBuilder):
             ):
                 factor = self.kv_cache_spec.block_size // kernel_block_size
                 indexer_block_table = (block_table[:, ::factor] // factor).contiguous()
+            elif (pages := self._pages_per_kernel_block()) > 1:
+                indexer_block_table = self._split_block_table(block_table, pages)
             padded_num_tokens = num_tokens
             local_slot_mapping = slot_mapping
             if self.use_pcp:
@@ -1597,6 +1625,17 @@ class DeepseekV32IndexerMetadataBuilder(AttentionMetadataBuilder):
                         compressed
                     )
                     block_table = self.indexer_decode_block_table_buffer[:rows, :cols]
+                elif (pages := self._pages_per_kernel_block()) > 1:
+                    rows, cols = block_table.shape[0], block_table.shape[1] * pages
+                    if self.indexer_decode_block_table_buffer is None:
+                        self.indexer_decode_block_table_buffer = torch.zeros(
+                            (self._max_num_batched_tokens, cols),
+                            dtype=torch.int32,
+                            device=self.device,
+                        )
+                    buf = self.indexer_decode_block_table_buffer[:rows, :cols]
+                    buf.copy_(self._split_block_table(block_table, pages))
+                    block_table = buf
 
             # Flattening always returns a buffer view, including single-token
             # batches. Keep its address stable across varlen graph replays.
