@@ -71,6 +71,7 @@ from vllm.model_executor.models.interfaces import (
 from vllm.model_executor.models.utils import (
     AutoWeightsLoader,
     PPMissingLayer,
+    StageMissingLayer,
     init_vllm_registered_model,
     is_pp_missing_parameter,
     make_layers,
@@ -1158,21 +1159,27 @@ class Glm5NextForConditionalGeneration(
             multimodal_config.is_multimodal_pruning_enabled()
         )
 
-        with self._mark_tower_model(vllm_config, {"image", "video"}):
-            self.visual = Glm5NextVisionTransformer(
-                config.text_config,
-                config.vision_config,
-                norm_eps=_VISION_RMS_NORM_EPS,
-                # Vision tower ships BF16 weights in this fp8 checkpoint (no
-                # weight_scale_inv for visual.*), so it must NOT inherit the
-                # global fp8 quant_config -- doing so incorrectly quantizes
-                # the tower
-                # and yields NaN image features. Mirrors the MLA/KDA proj
-                # pattern (quant_config=None for BF16 submodules).
-                quant_config=None,
-                input_norm=build_mm_input_norm(self.model_config),
-                prefix=maybe_prefix(prefix, "visual"),
-            )
+        if get_pp_group().is_first_rank:
+            with self._mark_tower_model(vllm_config, {"image", "video"}):
+                self.visual = Glm5NextVisionTransformer(
+                    config.text_config,
+                    config.vision_config,
+                    norm_eps=_VISION_RMS_NORM_EPS,
+                    # Vision tower ships BF16 weights in this fp8 checkpoint (no
+                    # weight_scale_inv for visual.*), so it must NOT inherit the
+                    # global fp8 quant_config -- doing so incorrectly quantizes
+                    # the tower
+                    # and yields NaN image features. Mirrors the MLA/KDA proj
+                    # pattern (quant_config=None for BF16 submodules).
+                    quant_config=None,
+                    input_norm=build_mm_input_norm(self.model_config),
+                    prefix=maybe_prefix(prefix, "visual"),
+                )
+        else:
+            # Only the first pipeline stage runs the vision encoder (and a
+            # tower on every stage took ~1.1 GiB of each one's KV cache).
+            self.visual = StageMissingLayer("vision_tower")
+            self._tower_model_names = []
 
         with self._mark_language_model(vllm_config):
             self.language_model = init_vllm_registered_model(
