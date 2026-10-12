@@ -279,6 +279,9 @@ class MoERunner(MoERunnerInterface):
         # in a single launch.
         self._fse_fuse_gate = gate is not None and shared_expert_gate is not None
         self._combined_gate_weight: torch.Tensor | None = None
+        if gate is not None and shared_expert_gate is not None:
+            # The fused GEMM reads gate.weight as stored.
+            gate.weight_read_directly = True
 
         self._shared_experts: SharedExperts | None = None
         if shared_experts is not None:

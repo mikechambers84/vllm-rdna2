@@ -123,6 +123,10 @@ class Rdna2WNA16Experts(TritonWNA16Experts):
     # large experts from 3 to ~80 rows per expert (GLM-5.3-Flash: -20% at 3-8,
     # -16% at 28, ahead of 128-row tiles at 80, behind them at 113).
     MAX_KSLICE_ROWS_PER_EXPERT = 96
+    # Its 16-row tiles (one tile for most experts of a 384-token chunk, padding
+    # rows skipped) beat the 8-row ones from ~7 rows per expert: -9% at 10.7,
+    # -6 to -8% at 14-57; +7-9% at 2.7-5.3 (GLM-5.3-Flash, 140 W).
+    MIN_KSLICE_16_ROWS_PER_EXPERT = 7
 
     @staticmethod
     def _supports_current_device() -> bool:
@@ -290,7 +294,7 @@ class Rdna2WNA16Experts(TritonWNA16Experts):
                 rows_per_expert, w4a8, n * hidden_states.size(1)
             )
         if kslice:
-            block_m = 8
+            block_m = 16 if rows_per_expert >= self.MIN_KSLICE_16_ROWS_PER_EXPERT else 8
         elif skinny:
             w4a8, block_m = False, skinny
         elif w4a8:

@@ -7,12 +7,23 @@
 //   logits[r, t] = scale[t] * sum_h w[r, h] * relu(q[r, h] . k[t])
 // for t < limit(r), -inf for the other columns up to max_len. q [B, next_n, H,
 // 128] and the keys are fp8 e4m3fn; the paged cache holds per block
-// block_size x 128 fp8 values followed by block_size fp32 scales.
+// block_size x 128 fp8 values followed by block_size fp32 scales, the values
+// token-major or (SHUFFLE: what the indexer cache writers store in blocks of
+// more than one entry) in 16-token tiles of eight 16 x 16-byte dimension
+// groups, byte (t, d) at (t / 16) * 2048 + (d / 16) * 256 + (t % 16) * 16 +
+// d % 16.
 //
 // A workgroup (256 threads) takes 64 keys of one row: q and the keys are
 // widened exactly to fp16 (x 2^-8) into k2-major LDS tiles, each thread dots
 // one key with H / 4 heads by v_dot2_f32_f16 (head operands are wave
 // broadcasts), and the four head groups are summed through LDS.
+//
+// mqa_logits_rdna2 is the prefill form (fp8_mqa_logits_torch over the gathered
+// keys of a chunk, whose [H, rows, keys] fp32 intermediate reached GBs at long
+// context): each lane widens one key into registers once, then the wave walks
+// the rows of its block and their heads, the fp16 query of each (row, head)
+// coming through scalar loads (a wave-uniform operand of v_dot2_f32_f16);
+// rows whose key range misses the wave's 32 keys only store -inf.
 
 #include <torch/all.h>
 #include <c10/cuda/CUDAGuard.h>
@@ -20,6 +31,8 @@
 
 #include <hip/hip_runtime.h>
 #include <hip/hip_fp16.h>
+
+#include <algorithm>
 
 #include "rdna2_fp8.cuh"
 
@@ -48,7 +61,7 @@ __device__ __forceinline__ uint32_t as_u32(half2 h) {
 
 // CTX_PER_ROW: context_lens holds one limit per row [B, next_n]; otherwise
 // one per sequence [B] and row j of next_n sees limit - next_n + j + 1 keys.
-template <int H, bool CTX_PER_ROW>
+template <int H, bool CTX_PER_ROW, bool SHUFFLE>
 __global__ void __launch_bounds__(THREADS) paged_mqa_logits_rdna2_kernel(
     const uint8_t* __restrict__ q, const uint8_t* __restrict__ cache,
     const float* __restrict__ w, const int* __restrict__ ctx,
@@ -93,9 +106,16 @@ __global__ void __launch_bounds__(THREADS) paged_mqa_logits_rdna2_kernel(
       const long blk = block_tables[b * bt_stride + t / block_size];
       const uint8_t* base = cache + blk * cache_sb;
       const int off = t % block_size;
-      const uint8_t* kp = base + (long)off * D + part * 32;
-      v0 = *reinterpret_cast<const uint4*>(kp);
-      v1 = *reinterpret_cast<const uint4*>(kp + 16);
+      if constexpr (SHUFFLE) {
+        const uint8_t* kp =
+            base + (off / 16) * 16 * D + part * 512 + (off % 16) * 16;
+        v0 = *reinterpret_cast<const uint4*>(kp);
+        v1 = *reinterpret_cast<const uint4*>(kp + 256);
+      } else {
+        const uint8_t* kp = base + (long)off * D + part * 32;
+        v0 = *reinterpret_cast<const uint4*>(kp);
+        v1 = *reinterpret_cast<const uint4*>(kp + 16);
+      }
       if (part == 0)
         sc = *reinterpret_cast<const float*>(base + (long)block_size * D +
                                              off * 4);
@@ -150,9 +170,77 @@ __global__ void __launch_bounds__(THREADS) paged_mqa_logits_rdna2_kernel(
   }
 }
 
+static constexpr int PF_KEYS = THREADS;  // keys per prefill workgroup
+
+// q16 [M, H, 128] fp16 (the fp8 query widened exactly), k [N, 128] fp8 e4m3fn,
+// k_scale [N], w [M, H] -> out[r, n] for n < N; rows r0 .. r0 + rows of this
+// block.
+__global__ void __launch_bounds__(THREADS) mqa_logits_rdna2_kernel(
+    const __half* __restrict__ q16, const uint8_t* __restrict__ k,
+    const float* __restrict__ k_scale, const float* __restrict__ w,
+    const int* __restrict__ ks, const int* __restrict__ ke,
+    float* __restrict__ out, const int M, const int N, const int H,
+    const long out_stride, const int rows) {
+  const int lane = threadIdx.x % 32;
+  const int n0 = blockIdx.x * PF_KEYS +
+                 __builtin_amdgcn_readfirstlane(threadIdx.x / 32) * 32;
+  const int n = n0 + lane;
+  if (n0 >= N) return;
+  uint32_t kh[D2];  // this lane's key, fp16 pairs x 2^-8
+  float sc = 0.f;
+  if (n < N) {
+    const uint4* kp = reinterpret_cast<const uint4*>(k + (long)n * D);
+  #pragma unroll
+    for (int i = 0; i < D / 16; i++) {
+      const uint4 v = kp[i];
+      const uint32_t u[4] = {v.x, v.y, v.z, v.w};
+  #pragma unroll
+      for (int e = 0; e < 4; e++) {
+        kh[i * 8 + 2 * e] = as_u32(rdna2::fp8x2_to_half2(u[e], rdna2::FP8_LO));
+        kh[i * 8 + 2 * e + 1] =
+            as_u32(rdna2::fp8x2_to_half2(u[e], rdna2::FP8_HI));
+      }
+    }
+    sc = k_scale[n] * 256.f;  // the key's 2^-8
+  } else {
+  #pragma unroll
+    for (int d = 0; d < D2; d++) kh[d] = 0u;
+  }
+  const int r0 = blockIdx.y * rows, r1 = min(M, r0 + rows);
+  for (int r = r0; r < r1; r++) {
+    const int lo = ks[r], hi = ke[r];
+    float v = -INFINITY;
+    if (n0 < hi && n0 + 32 > lo) {
+      const uint32_t* qr =
+          reinterpret_cast<const uint32_t*>(q16 + (long)r * H * D);
+      const float* wr = w + (long)r * H;
+      float acc = 0.f;
+      for (int h = 0; h < H; h++) {
+        float p0 = 0.f, p1 = 0.f;
+  #pragma unroll
+        for (int d = 0; d < D2; d += 2) {
+          p0 = __builtin_amdgcn_fdot2(as_h2(qr[h * D2 + d]), as_h2(kh[d]), p0,
+                                      false);
+          p1 = __builtin_amdgcn_fdot2(as_h2(qr[h * D2 + d + 1]),
+                                      as_h2(kh[d + 1]), p1, false);
+        }
+        acc += fmaxf(p0 + p1, 0.f) * wr[h];
+      }
+      if (n >= lo && n < hi) v = acc * sc;
+    }
+    if (n < N) out[r * out_stride + n] = v;
+  }
+}
+
 #else  // non-RDNA2 device pass: empty stub for symbol parity.
 
-template <int H, bool CTX_PER_ROW>
+__global__ void mqa_logits_rdna2_kernel(const __half*, const uint8_t*,
+                                        const float*, const float*, const int*,
+                                        const int*, float*, const int,
+                                        const int, const int, const long,
+                                        const int) {}
+
+template <int H, bool CTX_PER_ROW, bool SHUFFLE>
 __global__ void paged_mqa_logits_rdna2_kernel(const uint8_t*, const uint8_t*,
                                               const float*, const int*,
                                               const int*, float*, const int,
@@ -166,15 +254,17 @@ __global__ void paged_mqa_logits_rdna2_kernel(const uint8_t*, const uint8_t*,
 
 // q [B, next_n, H, 128] fp8 e4m3fn (contiguous; H in {32, 64}), kv_cache
 // [num_blocks, block_size, (1,) 132] uint8 (per block: block_size x 128 fp8
-// values, then block_size fp32 scales), weights [B * next_n, H] fp32,
-// context_lens int32 [B] or [B, next_n], block_tables [B, max_blocks] int32
+// values, token-major or shuffled, then block_size fp32 scales), weights [B *
+// next_n, H] fp32, context_lens int32 [B] or [B, next_n], block_tables [B,
+// max_blocks] int32
 // -> out [B * next_n, >= max_len] fp32.
 void paged_mqa_logits_rdna2(const torch::Tensor& q,
                             const torch::Tensor& kv_cache,
                             const torch::Tensor& weights,
                             const torch::Tensor& context_lens,
                             const torch::Tensor& block_tables,
-                            torch::Tensor& out, int64_t max_len) {
+                            torch::Tensor& out, int64_t max_len,
+                            bool shuffled) {
   using namespace vllm::indexer_rdna2;
   TORCH_CHECK(q.dim() == 4 && q.size(3) == D && q.is_contiguous() &&
                   q.element_size() == 1,
@@ -185,8 +275,9 @@ void paged_mqa_logits_rdna2(const torch::Tensor& q,
                   kv_cache.size(-1) == D + 4,
               "paged_mqa_logits_rdna2: contiguous uint8 cache [..., 132]");
   const int block_size = kv_cache.size(1);
-  TORCH_CHECK(block_size % 4 == 0,
-              "paged_mqa_logits_rdna2: block_size % 4 == 0 (16-byte rows)");
+  TORCH_CHECK(block_size % (shuffled ? 16 : 4) == 0,
+              "paged_mqa_logits_rdna2: block_size a multiple of 16 (shuffled "
+              "tiles) or 4 (16-byte scale rows)");
   TORCH_CHECK(weights.scalar_type() == at::kFloat && weights.is_contiguous() &&
                   weights.numel() == (long)B * next_n * H,
               "paged_mqa_logits_rdna2: weights fp32 [B * next_n, H]");
@@ -207,22 +298,76 @@ void paged_mqa_logits_rdna2(const torch::Tensor& q,
   const cudaStream_t stream = at::cuda::getCurrentCUDAStream();
   const dim3 grid(rows, (max_len + TT - 1) / TT);
   const long cache_sb = (long)block_size * (D + 4);
-#define VLLM_PMQA(HH, PR)                                                      \
-  paged_mqa_logits_rdna2_kernel<HH, PR><<<grid, THREADS, 0, stream>>>(         \
+#define VLLM_PMQA(HH, PR, SH)                                                  \
+  paged_mqa_logits_rdna2_kernel<HH, PR, SH><<<grid, THREADS, 0, stream>>>(     \
       (const uint8_t*)q.data_ptr(), (const uint8_t*)kv_cache.data_ptr(),       \
       weights.data_ptr<float>(), context_lens.data_ptr<int>(),                 \
       block_tables.data_ptr<int>(), out.data_ptr<float>(), next_n, block_size, \
       cache_sb, block_tables.stride(0), out.stride(0), (int)max_len)
-  if (H == 32) {
-    if (per_row)
-      VLLM_PMQA(32, true);
-    else
-      VLLM_PMQA(32, false);
-  } else {
-    if (per_row)
-      VLLM_PMQA(64, true);
-    else
-      VLLM_PMQA(64, false);
+#define VLLM_PMQA_ROWS(HH, SH) \
+  if (per_row)                 \
+    VLLM_PMQA(HH, true, SH);   \
+  else                         \
+    VLLM_PMQA(HH, false, SH);
+#define VLLM_PMQA_LAYOUT(HH)  \
+  if (shuffled) {             \
+    VLLM_PMQA_ROWS(HH, true)  \
+  } else {                    \
+    VLLM_PMQA_ROWS(HH, false) \
   }
+  if (H == 32) {
+    VLLM_PMQA_LAYOUT(32)
+  } else {
+    VLLM_PMQA_LAYOUT(64)
+  }
+#undef VLLM_PMQA_LAYOUT
+#undef VLLM_PMQA_ROWS
 #undef VLLM_PMQA
+}
+
+// q16 [M, H, 128] fp16 (contiguous; the fp8 query widened exactly), k [N, 128]
+// fp8 e4m3fn (contiguous), k_scale fp32 [N], weights fp32 [M, H], row key
+// ranges cu_seqlen_ks / cu_seqlen_ke int32 [M] -> out fp32 [M, N] (-inf
+// outside each row's range).
+void mqa_logits_rdna2(const torch::Tensor& q16, const torch::Tensor& k,
+                      const torch::Tensor& k_scale,
+                      const torch::Tensor& weights,
+                      const torch::Tensor& cu_seqlen_ks,
+                      const torch::Tensor& cu_seqlen_ke, torch::Tensor& out) {
+  using namespace vllm::indexer_rdna2;
+  TORCH_CHECK(q16.scalar_type() == at::kHalf && q16.dim() == 3 &&
+                  q16.size(2) == D && q16.is_contiguous(),
+              "mqa_logits_rdna2: contiguous fp16 q [M, H, 128]");
+  const int M = q16.size(0), H = q16.size(1), N = k.size(0);
+  TORCH_CHECK(k.element_size() == 1 && k.dim() == 2 && k.size(1) == D &&
+                  k.is_contiguous(),
+              "mqa_logits_rdna2: contiguous fp8 k [N, 128]");
+  TORCH_CHECK(k_scale.scalar_type() == at::kFloat && k_scale.is_contiguous() &&
+                  k_scale.numel() == N,
+              "mqa_logits_rdna2: fp32 k_scale [N]");
+  TORCH_CHECK(weights.scalar_type() == at::kFloat && weights.is_contiguous() &&
+                  weights.numel() == (long)M * H,
+              "mqa_logits_rdna2: weights fp32 [M, H]");
+  TORCH_CHECK(cu_seqlen_ks.scalar_type() == at::kInt &&
+                  cu_seqlen_ke.scalar_type() == at::kInt &&
+                  cu_seqlen_ks.is_contiguous() &&
+                  cu_seqlen_ke.is_contiguous() && cu_seqlen_ks.numel() == M &&
+                  cu_seqlen_ke.numel() == M,
+              "mqa_logits_rdna2: int32 cu_seqlen_ks / cu_seqlen_ke [M]");
+  TORCH_CHECK(out.scalar_type() == at::kFloat && out.dim() == 2 &&
+                  out.size(0) == M && out.size(1) >= N && out.stride(1) == 1,
+              "mqa_logits_rdna2: out fp32 [M, N]");
+  if (M == 0 || N == 0) return;
+  const at::cuda::OptionalCUDAGuard device_guard(device_of(q16));
+  const cudaStream_t stream = at::cuda::getCurrentCUDAStream();
+  const int kb = (N + PF_KEYS - 1) / PF_KEYS;
+  // Enough workgroups to fill the GPU; each widens its keys once per block.
+  const int rb = std::max(1, std::min(M, 2048 / kb));
+  const int rows = (M + rb - 1) / rb;
+  const dim3 grid(kb, (M + rows - 1) / rows);
+  mqa_logits_rdna2_kernel<<<grid, THREADS, 0, stream>>>(
+      (const __half*)q16.data_ptr(), (const uint8_t*)k.data_ptr(),
+      k_scale.data_ptr<float>(), weights.data_ptr<float>(),
+      cu_seqlen_ks.data_ptr<int>(), cu_seqlen_ke.data_ptr<int>(),
+      out.data_ptr<float>(), M, N, H, out.stride(0), rows);
 }

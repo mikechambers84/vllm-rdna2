@@ -168,3 +168,19 @@ def test_rocm_fp32_router_gemm_rejects_unsupported_configs(
         on_gfx950=on_gfx950,
     )
     assert not gate.allow_fp32_router_gemm
+
+
+def test_fp16_gate_on_rocm_may_take_kmajor_relayout(monkeypatch):
+    # Only the ReplicatedLinear tier runs (fp16 weight), and it follows a
+    # K-major relayout on gfx1030.
+    gate = _make_gate(monkeypatch, is_rocm=True, params_dtype=torch.float16)
+    assert gate.allow_kmajor_relayout
+
+
+def test_gate_read_by_a_specialized_tier_keeps_its_layout(monkeypatch):
+    # bf16 -> fp32 torch.mm reads gate.weight directly.
+    gate = _make_gate(monkeypatch, is_rocm=True, params_dtype=torch.bfloat16)
+    assert gate.allow_cublas_router_gemm and not gate.allow_kmajor_relayout
+    fused = _make_gate(monkeypatch, is_rocm=True, params_dtype=torch.float16)
+    fused.weight_read_directly = True  # MoERunner fusing a shared-expert gate
+    assert not fused.allow_kmajor_relayout

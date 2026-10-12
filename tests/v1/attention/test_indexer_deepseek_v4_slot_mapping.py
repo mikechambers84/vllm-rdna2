@@ -453,6 +453,48 @@ def test_indexer_builder_deepseek_v4_compressed_slot_mapping_uses_num_states():
     torch.testing.assert_close(valid_slots, expected)
 
 
+@pytest.mark.parametrize(
+    "kernel_block_size,expected_pages", [(1024, 4), (256, 1), (64, 1), (None, 1)]
+)
+def test_indexer_splits_coarse_kernel_blocks_into_storage_pages(
+    kernel_block_size, expected_pages
+):
+    """A compressed indexer cache viewed in storage pages (kpool: 256 tokens)
+    under a group whose kernel blocks are coarser (a hybrid model's block, no
+    kernel split): each block-table entry b covers pages b * 4 + j, so cache
+    writes (slot mapping) and the prefill gather / decode reads (which index
+    pages) agree with the cache view."""
+    builder = SimpleNamespace(
+        kernel_block_size=kernel_block_size,
+        kv_cache_spec=SimpleNamespace(block_size=256),
+        compress_ratio=4,
+        _page_offsets=None,
+    )
+    pages = DeepseekV32IndexerMetadataBuilder._pages_per_kernel_block(builder)
+    assert pages == expected_pages
+    if pages == 1:
+        return
+    device = torch.device("cuda")
+    block_table = torch.tensor([[2, 5]], dtype=torch.int32, device=device)
+    split = DeepseekV32IndexerMetadataBuilder._split_block_table(
+        builder, block_table, pages
+    )
+    assert split.tolist() == [[8, 9, 10, 11, 20, 21, 22, 23]]
+    # 1000 computed tokens + 48 new: compressed positions 250..261 cross the
+    # 1024-token block boundary at 256 (block 2 -> block 5).
+    slots = get_compressed_slot_mapping(
+        48,
+        torch.zeros(48, dtype=torch.int64, device=device),
+        torch.tensor([0, 48], dtype=torch.int32, device=device),
+        torch.tensor([1048], dtype=torch.int32, device=device),
+        split,
+        64,
+        4,
+    )
+    expected = [11 * 64 + p for p in range(58, 64)] + [20 * 64 + p for p in range(6)]
+    assert slots[slots >= 0].tolist() == expected
+
+
 @pytest.mark.parametrize("compress_ratio", [1, 4])
 def test_indexer_prefill_budget_matches_compressed_workspace(compress_ratio):
     """The chunker budget is in compressed rows, like the K-gather workspace."""

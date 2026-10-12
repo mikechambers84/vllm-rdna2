@@ -114,6 +114,33 @@ def test_unquantized_linear_stores_kmajor_fp16_weights(monkeypatch, num_tokens):
 
 
 @pytest.mark.skipif(not on_gfx1030(), reason="gfx1030 only")
+@pytest.mark.parametrize("allow", [False, True])
+def test_kept_weights_take_only_the_lossless_relayout(monkeypatch, allow):
+    """Layers that keep their unquantized weight (routers) are never stored as
+    int8, but take the exact K-major layout when they allow it."""
+    from vllm.model_executor.layers.linear import UnquantizedLinearMethod
+
+    monkeypatch.setenv("VLLM_ROCM_KMAJOR_UNQUANTIZED", "1")
+    monkeypatch.setenv("VLLM_ROCM_W8A16_UNQUANTIZED", "1")
+    layer = torch.nn.Module()
+    weight = torch.randn(288, 4096, dtype=torch.float16, device="cuda") * 0.02
+    layer.weight = torch.nn.Parameter(weight.clone(), requires_grad=False)
+    layer.keep_unquantized_weight = True
+    layer.allow_kmajor_relayout = allow
+    method = UnquantizedLinearMethod()
+    method.process_weights_after_loading(layer)
+    if allow:
+        assert torch.equal(_from_kmajor(layer.kmajor_weight), weight)
+        x = torch.randn(384, 4096, dtype=torch.float16, device="cuda")
+        ref = torch.nn.functional.linear(x.float(), weight.float())
+        out = method.apply(layer, x)
+        assert ((out.float() - ref).norm() / ref.norm()).item() < 1e-3
+    else:
+        assert not hasattr(layer, "kmajor_weight")
+        assert torch.equal(layer.weight, weight)
+
+
+@pytest.mark.skipif(not on_gfx1030(), reason="gfx1030 only")
 @pytest.mark.parametrize("num_tokens", [1, 40, 900])
 def test_unquantized_linear_stores_kmajor_bf16_weights_as_fp16(monkeypatch, num_tokens):
     """VLLM_ROCM_KMAJOR_UNQUANTIZED with a bf16 layer: the weight is stored

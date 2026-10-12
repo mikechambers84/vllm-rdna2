@@ -376,10 +376,22 @@ def test_paged_mqa_logits_reference_mtp_rows_match_single_rows(ctx_per_row):
     torch.testing.assert_close(mtp, single)
 
 
+def _shuffle_fp8_cache(cache, block_size):
+    """The indexer cache writers' layout for blocks of more than one entry:
+    each block's values in 16-token tiles of eight 16 x 16-byte groups."""
+    flat = cache.reshape(cache.shape[0], -1)
+    vals = flat[:, : block_size * 128].reshape(-1, block_size // 16, 16, 8, 16)
+    vals = vals.permute(0, 1, 3, 2, 4).reshape(cache.shape[0], -1)
+    return torch.cat([vals, flat[:, block_size * 128 :]], dim=1).reshape(cache.shape)
+
+
 @pytest.mark.skipif(not _on_gfx1030(), reason="gfx1030 HIP kernel")
+@pytest.mark.parametrize("shuffled", [False, True])
 @pytest.mark.parametrize("block_size", [64, 160])
 @pytest.mark.parametrize("next_n,ctx_per_row", [(1, True), (2, True), (2, False)])
-def test_rdna2_paged_mqa_logits_matches_torch(block_size, next_n, ctx_per_row):
+def test_rdna2_paged_mqa_logits_matches_torch(
+    block_size, next_n, ctx_per_row, shuffled
+):
     from vllm import _custom_ops as ops
     from vllm.v1.attention.ops.rocm_aiter_mla_sparse import (
         fp8_paged_mqa_logits_torch,
@@ -405,7 +417,13 @@ def test_rdna2_paged_mqa_logits_matches_torch(block_size, next_n, ctx_per_row):
         t.cuda() for t in (q, weights, context_lens, block_tables)
     )
     out = ops.paged_mqa_logits_rdna2(
-        q, cache, weights, context_lens, block_tables, max_len
+        q,
+        _shuffle_fp8_cache(cache, block_size) if shuffled else cache,
+        weights,
+        context_lens,
+        block_tables,
+        max_len,
+        shuffled=shuffled,
     )
     ref = fp8_paged_mqa_logits_torch(
         q, cache, weights, context_lens, block_tables, max_len
@@ -413,6 +431,37 @@ def test_rdna2_paged_mqa_logits_matches_torch(block_size, next_n, ctx_per_row):
     finite = torch.isfinite(ref)
     assert torch.equal(finite, torch.isfinite(out))
     torch.testing.assert_close(out[finite], ref[finite], atol=1e-2, rtol=1e-3)
+
+
+@pytest.mark.skipif(not _on_gfx1030(), reason="gfx1030 HIP kernel")
+@pytest.mark.parametrize("rows,keys,heads", [(5, 700, 32), (40, 300, 64)])
+def test_rdna2_mqa_logits_matches_fp32_reference(rows, keys, heads):
+    """The prefill indexer logits (rocm_fp8_mqa_logits on gfx1030) equal the
+    fp32 sum over heads, with -inf outside each row's key range (empty and
+    partial ranges included)."""
+    from vllm.v1.attention.ops.rocm_aiter_mla_sparse import rocm_fp8_mqa_logits
+
+    g = torch.Generator().manual_seed(rows + keys)
+    q = (torch.randn(rows, heads, 128, generator=g) * 2).to(torch.float8_e4m3fn)
+    k = (torch.randn(keys, 128, generator=g) * 2).to(torch.float8_e4m3fn)
+    scale = torch.exp2(torch.randint(-6, 2, (keys,), generator=g).float())
+    weights = torch.randn(rows, heads, generator=g)
+    ke = torch.randint(0, keys + 1, (rows,), generator=g).int()
+    ks = (ke * torch.rand(rows, generator=g)).int()
+    score = torch.einsum("mhd,nd->mhn", q.float(), k.float()) * scale
+    ref = (score.relu() * weights[:, :, None]).sum(1)
+    cols = torch.arange(keys)
+    ref[(cols[None] < ks[:, None]) | (cols[None] >= ke[:, None])] = float("-inf")
+    out = rocm_fp8_mqa_logits(
+        q.cuda(),
+        (k.cuda(), scale.view(-1, 1).cuda()),
+        weights.cuda(),
+        ks.cuda(),
+        ke.cuda(),
+    ).cpu()
+    finite = torch.isfinite(ref)
+    assert torch.equal(finite, torch.isfinite(out))
+    torch.testing.assert_close(out[finite], ref[finite], atol=1e-3, rtol=1e-4)
 
 
 @pytest.mark.skipif(not _on_gfx1030(), reason="gfx1030 HIP kernel")

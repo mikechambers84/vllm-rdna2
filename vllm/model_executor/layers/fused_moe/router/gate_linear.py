@@ -158,6 +158,22 @@ class GateLinear(ReplicatedLinear):
                 and is_available()
             )
 
+    @property
+    def allow_kmajor_relayout(self) -> bool:
+        """The gfx1030 K-major fp16 layout is exact, so the gate may take it
+        when only the ReplicatedLinear tier (which follows it) can run."""
+        return (
+            self.is_unquantized
+            and self.bias is None
+            and not getattr(self, "weight_read_directly", False)
+            and not (
+                self.allow_ll_bf16_gemm
+                or self.allow_fp32_router_gemm
+                or self.allow_bf16x3_router_gemm
+                or self.allow_cublas_router_gemm
+            )
+        )
+
     def set_out_dtype(self, out_dtype: torch.dtype) -> None:
         """Set output dtype for the router logits after init.
 
