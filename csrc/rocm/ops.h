@@ -42,7 +42,7 @@ torch::Tensor w8a8_gemm_rdna2(const at::Tensor& a, const at::Tensor& w,
                               at::ScalarType out_dtype);
 
 torch::Tensor gemv_rdna2(const at::Tensor& a, const at::Tensor& w,
-                         const std::optional<at::Tensor>& bias);
+                         const std::optional<at::Tensor>& bias, bool out_fp32);
 
 torch::Tensor gemm_w8_rdna2(const at::Tensor& a, const at::Tensor& w,
                             const std::optional<at::Tensor>& scale,
@@ -211,6 +211,12 @@ void moe_wna16_kslice_rdna2(torch::Tensor& output, const torch::Tensor& a,
 
 void bmm_skinny_rdna2(const torch::Tensor& x, const torch::Tensor& w,
                       torch::Tensor& out);
+
+void grouped_topk_rdna2(const torch::Tensor& logits,
+                        const std::optional<torch::Tensor>& bias,
+                        torch::Tensor& topk_weights, torch::Tensor& topk_ids,
+                        int64_t n_group, int64_t topk_group, int64_t scoring,
+                        bool renormalize, double scale);
 
 void paged_mqa_logits_rdna2(const torch::Tensor& q,
                             const torch::Tensor& kv_cache,

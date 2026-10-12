@@ -14,17 +14,21 @@
 // in LDS once per tile of up to 256 tokens; eight lanes cover a token's 64
 // channels of all four streams (8 adjacent channels each) and reduce their
 // partials with lane shuffles. Splitting the 16K-long dot products over slices
-// keeps the whole GPU busy for a single decode token.
+// keeps the whole GPU busy for a single decode token. Waves without a token
+// skip the dot products, and up to 4 tokens (decode, MTP verify) every wave
+// takes the same tokens and a third of the 24 mix rows.
 //
 // mhc_finalize_rdna2_kernel, one workgroup per token:
 //   mixes = sum_slices partial * rsqrt(sum_slices sq / (4 H) + rms_eps)
 //   pre   = sigmoid(mixes[:4] s0 + b[:4]) + pre_eps
 //   post' = sigmoid(mixes[4:8] s1 + b[4:8]) * post_mult            (written)
 //   comb' = sinkhorn(softmax(mixes[8:] s2 + b[8:]))                (written)
+//           (16 lanes, DPP row / column sums, hardware reciprocals)
 //   y     = fp16(sum_i pre[i] res[i]), then optionally
 //   y     = fp16(y * rsqrt(mean(y^2) + norm_eps) * w)              (written)
 // Matches mhc_post_torch + mhc_pre_torch + rms_norm up to fp32 summation
-// order.
+// order and reciprocal rounding. One H = 4096 seam (post + pre + norm) at 1-3
+// tokens: 20 -> 9.5 us.
 
 #include <torch/all.h>
 #include <c10/cuda/CUDAGuard.h>
@@ -104,6 +108,17 @@ __device__ __forceinline__ float round1(float f) {
   }
 }
 
+// Lane exchange within a 16-lane DPP row (no LDS round trip, unlike
+// __shfl_xor): quad_perm [1, 0, 3, 2] = lane ^ 1, [2, 3, 0, 1] = lane ^ 2,
+// row_ror 4 / 8 rotate the row.
+template <int CTRL>
+__device__ __forceinline__ float dpp(float v) {
+  return __int_as_float(
+      __builtin_amdgcn_update_dpp(0, __float_as_int(v), CTRL, 0xF, 0xF, false));
+}
+static constexpr int DPP_XOR1 = 0xB1, DPP_XOR2 = 0x4E;
+static constexpr int DPP_ROR4 = 0x124, DPP_ROR8 = 0x128;
+
 __device__ __forceinline__ float wave_sum(float v) {
   for (int o = warpSize / 2; o > 0; o >>= 1) v += __shfl_xor(v, o);
   return v;
@@ -111,7 +126,11 @@ __device__ __forceinline__ float wave_sum(float v) {
 
 #if defined(__HIP__RDNA2__) || !defined(__HIP_DEVICE_COMPILE__)
 
-template <typename T, bool POST, bool PRE>
+// SMALL (T <= 32 / LPT = 4 tokens: decode and MTP verify): every wave takes
+// the same tokens and the mix rows k = wave, wave + 8, wave + 16, so the
+// slice's 24 dot products run on all 8 waves instead of one; wave 0 stores the
+// post-mixed residual and the square sums.
+template <typename T, bool POST, bool PRE, bool SMALL = false>
 __global__ void __launch_bounds__(THREADS) mhc_partial_rdna2_kernel(
     const T* __restrict__ res_in, const T* __restrict__ x,
     const float* __restrict__ post_in, const float* __restrict__ comb_in,
@@ -119,20 +138,32 @@ __global__ void __launch_bounds__(THREADS) mhc_partial_rdna2_kernel(
     float* __restrict__ partial, const int T_, const int H) {
   const int slice = blockIdx.x, tid = threadIdx.x;
   const int h0 = slice * CH;
-  const int g = tid % LPT, ts = tid / LPT;
+  const int wave = tid / warpSize;
+  const int g = tid % LPT, ts = SMALL ? tid % warpSize / LPT : tid / LPT;
   const int c0 = h0 + g * 8;
   __shared__ float4 sfn[PRE ? NMIX * HC * CH / 4 : 1];
   if constexpr (PRE) {
-    for (int idx = tid; idx < NMIX * HC * CH / 4; idx += THREADS) {
+    // All of a thread's fn words are loaded before any LDS store, so the
+    // workgroup waits for one DRAM round trip instead of six in a row.
+    constexpr int PER = NMIX * HC * CH / 4 / THREADS;
+    float4 w[PER];
+  #pragma unroll
+    for (int q = 0; q < PER; q++) {
+      const int idx = tid + q * THREADS;
       const int k = idx / (HC * CH / 4), rem = idx % (HC * CH / 4);
       const int i = rem / (CH / 4), c = rem % (CH / 4);
-      sfn[idx] = *reinterpret_cast<const float4*>(fn + ((long)k * HC + i) * H +
-                                                  h0 + c * 4);
+      w[q] = *reinterpret_cast<const float4*>(fn + ((long)k * HC + i) * H + h0 +
+                                              c * 4);
     }
+  #pragma unroll
+    for (int q = 0; q < PER; q++) sfn[tid + q * THREADS] = w[q];
     __syncthreads();
   }
   const int t_end = min(T_, (int)(blockIdx.y + 1) * TILE);
   for (int t0 = blockIdx.y * TILE; t0 < t_end; t0 += TPP) {
+    // A wave covers warpSize / LPT tokens; waves past the last token (7 of 8
+    // for a single decode token) skip the 24 dot products and their LDS reads.
+    if (!SMALL && t0 + wave * (warpSize / LPT) >= t_end) break;
     const int t = t0 + ts;
     const bool active = t < t_end;
     float r[HC][8];
@@ -164,9 +195,14 @@ __global__ void __launch_bounds__(THREADS) mhc_partial_rdna2_kernel(
         T* dst = res_out + (long)t * HC * H + c0;
   #pragma unroll
         for (int c = 0; c < HC; c++) {
-          round_store8(dst + c * H, o[c]);
+          if (SMALL && wave != 0) {
   #pragma unroll
-          for (int e = 0; e < 8; e++) r[c][e] = o[c][e];
+            for (int e = 0; e < 8; e++) r[c][e] = round1<T>(o[c][e]);
+          } else {
+            round_store8(dst + c * H, o[c]);
+  #pragma unroll
+            for (int e = 0; e < 8; e++) r[c][e] = o[c][e];
+          }
         }
       }
     } else {
@@ -188,9 +224,10 @@ __global__ void __launch_bounds__(THREADS) mhc_partial_rdna2_kernel(
   #pragma unroll
         for (int e = 0; e < 8; e++) sq += r[i][e] * r[i][e];
       for (int o = LPT / 2; o > 0; o >>= 1) sq += __shfl_xor(sq, o, LPT);
-      if (active && g == 0) p[NMIX] = sq;
+      if (active && g == 0 && (!SMALL || wave == 0)) p[NMIX] = sq;
+      constexpr int KSTEP = SMALL ? MAX_WAVES : 1;
   #pragma unroll
-      for (int k = 0; k < NMIX; k++) {
+      for (int k = SMALL ? wave : 0; k < NMIX; k += KSTEP) {
         float a = 0.f;
   #pragma unroll
         for (int i = 0; i < HC; i++) {
@@ -224,6 +261,20 @@ __global__ void __launch_bounds__(THREADS) mhc_finalize_rdna2_kernel(
   __shared__ float s_mix[NPART];
   __shared__ float s_pre[HC];
   __shared__ float red[MAX_WAVES];
+  // The residual and norm weights for y do not depend on the mixes: load them
+  // first so they arrive during the reductions and Sinkhorn.
+  const T* rt = res + (long)t * HC * H;
+  uint4 rraw[4][HC], wraw[4];
+  #pragma unroll
+  for (int j = 0; j < 4; j++) {
+    const int c = (j * THREADS + tid) * 8;
+    if (c < H) {
+  #pragma unroll
+      for (int i = 0; i < HC; i++)
+        rraw[j][i] = *reinterpret_cast<const uint4*>(rt + i * H + c);
+      if constexpr (NORM) wraw[j] = *reinterpret_cast<const uint4*>(norm_w + c);
+    }
+  }
   if (tid < NPART * RJ) {
     const int k = tid / RJ, j = tid % RJ;
     const float* pt = partial + (long)t * nslices * NPART + k;
@@ -258,22 +309,24 @@ __global__ void __launch_bounds__(THREADS) mhc_finalize_rdna2_kernel(
           post_mult / (1.f + expf(-(s_mix[HC + tid] * rs * hc_scale[1] +
                                     hc_base[HC + tid])));
     }
+    // Row sums over lanes l ^ 1, l ^ 2 and column sums over the row_ror 4 / 8
+    // rotations of the 16 lanes, all through DPP.
     float c = s_mix[2 * HC + tid] * rs * hc_scale[2] + hc_base[2 * HC + tid];
-    float mx = fmaxf(c, __shfl_xor(c, 1, HC));
-    mx = fmaxf(mx, __shfl_xor(mx, 2, HC));
+    float mx = fmaxf(c, dpp<DPP_XOR1>(c));
+    mx = fmaxf(mx, dpp<DPP_XOR2>(mx));
     c = expf(c - mx);
-    float s = c + __shfl_xor(c, 1, HC);
-    s += __shfl_xor(s, 2, HC);
-    c = c / s + sk_eps;
+    float s = c + dpp<DPP_XOR1>(c);
+    s += dpp<DPP_XOR2>(s);
+    c = c * __builtin_amdgcn_rcpf(s) + sk_eps;
     for (int it = 0; it < sk_repeat; it++) {
       if (it > 0) {
-        s = c + __shfl_xor(c, 1, HC);
-        s += __shfl_xor(s, 2, HC);
-        c /= s + sk_eps;
+        s = c + dpp<DPP_XOR1>(c);
+        s += dpp<DPP_XOR2>(s);
+        c *= __builtin_amdgcn_rcpf(s + sk_eps);
       }
-      s = c + __shfl_xor(c, 4, HC * HC);
-      s += __shfl_xor(s, 8, HC * HC);
-      c /= s + sk_eps;
+      s = c + dpp<DPP_ROR4>(c);
+      s += dpp<DPP_ROR8>(s);
+      c *= __builtin_amdgcn_rcpf(s + sk_eps);
     }
     comb_out[t * HC * HC + tid] = c;
   }
@@ -281,7 +334,6 @@ __global__ void __launch_bounds__(THREADS) mhc_finalize_rdna2_kernel(
   float pre[HC];
   #pragma unroll
   for (int i = 0; i < HC; i++) pre[i] = s_pre[i];
-  const T* rt = res + (long)t * HC * H;
   T* yt = y_out + (long)t * H;
   float sq = 0.f;
   // Each thread keeps at most 4 groups of 8 channels (H <= 8192).
@@ -294,7 +346,7 @@ __global__ void __launch_bounds__(THREADS) mhc_finalize_rdna2_kernel(
   #pragma unroll
     for (int i = 0; i < HC; i++) {
       float rv[8];
-      load8(rt + i * H + c, rv);
+      load8(reinterpret_cast<const T*>(&rraw[j][i]), rv);
   #pragma unroll
       for (int e = 0; e < 8; e++) acc[e] += pre[i] * rv[e];
     }
@@ -319,7 +371,7 @@ __global__ void __launch_bounds__(THREADS) mhc_finalize_rdna2_kernel(
     if (c >= H) break;
     if constexpr (NORM) {
       float w[8];
-      load8(norm_w + c, w);
+      load8(reinterpret_cast<const T*>(&wraw[j]), w);
   #pragma unroll
       for (int e = 0; e < 8; e++) y[j][e] = y[j][e] * inv * w[e];
     }
@@ -329,7 +381,7 @@ __global__ void __launch_bounds__(THREADS) mhc_finalize_rdna2_kernel(
 
 #else  // non-RDNA2 device pass: empty stubs for symbol parity.
 
-template <typename T, bool POST, bool PRE>
+template <typename T, bool POST, bool PRE, bool SMALL = false>
 __global__ void mhc_partial_rdna2_kernel(const T*, const T*, const float*,
                                          const float*, const float*, T*, float*,
                                          const int, const int) {}
@@ -349,9 +401,15 @@ void launch_partial(int T_, int H, cudaStream_t stream, const void* res_in,
                     const void* x, const float* post_in, const float* comb_in,
                     const float* fn, void* res_out, float* partial) {
   const dim3 grid(H / CH, (T_ + TILE - 1) / TILE);
-  mhc_partial_rdna2_kernel<T, POST, PRE>
-      <<<grid, THREADS, 0, stream>>>((const T*)res_in, (const T*)x, post_in,
-                                     comb_in, fn, (T*)res_out, partial, T_, H);
+  if (T_ <= 32 / LPT) {
+    mhc_partial_rdna2_kernel<T, POST, PRE, true><<<grid, THREADS, 0, stream>>>(
+        (const T*)res_in, (const T*)x, post_in, comb_in, fn, (T*)res_out,
+        partial, T_, H);
+  } else {
+    mhc_partial_rdna2_kernel<T, POST, PRE, false><<<grid, THREADS, 0, stream>>>(
+        (const T*)res_in, (const T*)x, post_in, comb_in, fn, (T*)res_out,
+        partial, T_, H);
+  }
 }
 
 template <typename T, bool NORM>

@@ -68,7 +68,7 @@ def _check_pre(got, ref):
     torch.testing.assert_close(y.float(), y_r.float(), atol=3e-2, rtol=2e-2)
 
 
-@pytest.mark.parametrize("t", [0, 1, 7, 130])
+@pytest.mark.parametrize("t", [0, 1, 3, 7, 130])
 @pytest.mark.parametrize("hidden", [2048, 4096])
 @pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
 @pytest.mark.parametrize("norm", [False, True])

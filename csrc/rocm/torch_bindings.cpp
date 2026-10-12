@@ -70,7 +70,9 @@ TORCH_LIBRARY_EXPAND(TORCH_EXTENSION_NAME, rocm_ops) {
       "Tensor? bias, ScalarType out_dtype) -> Tensor");
   rocm_ops.impl("w8a8_gemm_rdna2", torch::kCUDA, &w8a8_gemm_rdna2);
   // fp16/bf16 GEMV (M <= 8).
-  rocm_ops.def("gemv_rdna2(Tensor a, Tensor w, Tensor? bias) -> Tensor");
+  rocm_ops.def(
+      "gemv_rdna2(Tensor a, Tensor w, Tensor? bias, bool out_fp32=False) -> "
+      "Tensor");
   rocm_ops.impl("gemv_rdna2", torch::kCUDA, &gemv_rdna2);
   // GEMM on K-major int8 or fp8 e4m3fn weights (per-channel scales, fp8 also
   // with 2D block scales) with fp16/bf16 activations, or int8 weights with
@@ -224,6 +226,12 @@ TORCH_LIBRARY_EXPAND(TORCH_EXTENSION_NAME, rocm_ops) {
       "bool mul_routed_weight, int block_m) -> ()");
   rocm_ops.impl("moe_wna16_kslice_rdna2", torch::kCUDA,
                 &moe_wna16_kslice_rdna2);
+  // MoE routing (grouped top-k with correction bias) in one kernel.
+  rocm_ops.def(
+      "grouped_topk_rdna2(Tensor logits, Tensor? bias, Tensor! topk_weights, "
+      "Tensor! topk_ids, int n_group, int topk_group, int scoring, "
+      "bool renormalize, float scale) -> ()");
+  rocm_ops.impl("grouped_topk_rdna2", torch::kCUDA, &grouped_topk_rdna2);
   // Batched GEMV for a few rows (MLA absorption products in decode).
   rocm_ops.def("bmm_skinny_rdna2(Tensor x, Tensor w, Tensor! out) -> ()");
   rocm_ops.impl("bmm_skinny_rdna2", torch::kCUDA, &bmm_skinny_rdna2);
