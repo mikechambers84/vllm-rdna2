@@ -9,11 +9,8 @@ FP8, bf16 dot products), and runs most hot paths on slow fallbacks.
 
 This fork fixes the platform layer and adds hand-written HIP kernels built on
 what gfx1030 does have: `v_dot2_f32_f16`, `v_dot4_i32_i8`, wave32 and 64 KB of
-LDS. It is based on upstream commit `6e517b15c1`. The work landed in 19
-milestones, the `Merge branch 'gfx1030-mN'` commits on `main`. Each merge
-message lists what changed and the measurements behind it
-(`git log --first-parent main`). Everything was developed and tested on a host
-with 8x Radeon Pro V620 (32 GB each, PCIe only, no XGMI).
+LDS. It is based on upstream commit `6e517b15c1`. Everything was developed and
+tested on a host with 8x Radeon Pro V620 (32 GB each, PCIe only, no XGMI).
 
 ### What has been added and optimized
 
@@ -91,19 +88,18 @@ with 8x Radeon Pro V620 (32 GB each, PCIe only, no XGMI).
 
 ### Tested models
 
-The figures below are the latest measured in the milestone merge messages and
-the development notes, taken at 120-140 W power caps. Prefill is one 8192-token
-prompt with one output token (time to first token). Blank cells were not
-measured.
+The figures below were measured on V620s with 120-140 W power caps. Prefill is
+one 8192-token prompt with one output token (time to first token). Blank cells
+were not measured.
 
 | Model | GPUs | Decode, batch 1 | 8K-token prefill | Other |
 | --- | --- | --- | --- | --- |
-| Qwen3.8-27B W4A16 | 1 | 38.8 ms/token (M6) | 23.2 s, 353 tok/s (M6); 11.8 s, 694 tok/s with the W4A8 opt-in (M8) | throughput 321 tok/s, MTP chat 42 tok/s (M6); 3.8-5.1x stock vLLM (M1) |
-| Qwen3.8-27B W8A8 | 1 | | 11.7 s, 700 tok/s (M8) | throughput 454 tok/s (M8); 1.8-2.1x stock vLLM (M1) |
-| Qwen3.6-35B-A3B W4A16 | 1 | 14.3 ms/token (M6) | 3.0 s, 2730 tok/s (M7); 2.5 s, 3270 tok/s with the W4A8 opt-in (M9) | throughput 1738 tok/s (M7), 1970 with the K-major opt-in (M11); MTP chat 120 tok/s (M6) |
-| Qwen3.6-35B-A3B W8A8 | 2 (PP=2) | | 8K prompt + 256 output tokens: 6.7 s (M6) | throughput 2462 tok/s (M7) |
-| Qwen3.8-Flash-Next INT4 (fp8 KV, int8 / W4A8 opt-ins) | 4 (PP=4) | 21.5 ms/token (M13); 12.8 ms/token with MTP k=2 (M12) | 2.74 s, 2990 tok/s (M12) | batch-8 decode 34.2 ms/step (M13) |
-| GLM-5.3-Flash W4A16 | 8 (PP=8) | 58 ms/token (M15); 30.9 ms/token, 32 tok/s with MTP k=2 (M18) | 4.95 s, 1650 tok/s (M18) | 32K / 64K prefill 17.8 / 35.4 s (M18); batch-8 decode 188 ms/step (M15) |
+| Qwen3.8-27B W4A16 | 1 | 38.8 ms/token | 23.2 s, 353 tok/s; 11.8 s, 694 tok/s with the W4A8 opt-in | throughput 321 tok/s, MTP chat 42 tok/s; 3.8-5.1x stock vLLM |
+| Qwen3.8-27B W8A8 | 1 | | 11.7 s, 700 tok/s | throughput 454 tok/s; 1.8-2.1x stock vLLM |
+| Qwen3.6-35B-A3B W4A16 | 1 | 14.3 ms/token | 3.0 s, 2730 tok/s; 2.5 s, 3270 tok/s with the W4A8 opt-in | throughput 1738 tok/s, 1970 with the K-major opt-in; MTP chat 120 tok/s |
+| Qwen3.6-35B-A3B W8A8 | 2 (PP=2) | | 8K prompt + 256 output tokens: 6.7 s | throughput 2462 tok/s |
+| Qwen3.8-Flash-Next INT4 (fp8 KV, int8 / W4A8 opt-ins) | 4 (PP=4) | 21.5 ms/token; 12.8 ms/token with MTP k=2 | 2.74 s, 2990 tok/s | batch-8 decode 34.2 ms/step |
+| GLM-5.3-Flash W4A16 | 8 (PP=8) | 30.9 ms/token, 32 tok/s with MTP k=2 | 4.95 s, 1650 tok/s | 32K / 64K prefill 17.8 / 35.4 s |
 
 ### Building
 
@@ -147,8 +143,8 @@ After you change C++/HIP code, rebuild incrementally with CMake, as described in
 
 Use vLLM as usual. Pass `--dtype float16`, and use pipeline parallelism for
 models larger than one card. For example, GLM-5.3-Flash on eight cards with
-MTP, tool calling, reasoning, images and video (the M18 figures above use
-these settings):
+MTP, tool calling, reasoning, images and video (the GLM-5.3-Flash
+figures above use these settings):
 
 ```bash
 VLLM_ROCM_KMAJOR_UNQUANTIZED=1 VLLM_PP_LAYER_PARTITION=7,6,5,5,6,6,6,4 \
