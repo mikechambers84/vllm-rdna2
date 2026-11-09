@@ -14,7 +14,7 @@ output channel (weight-only, so the activations keep full precision) they
 stream half the bytes; K-major fp16 keeps them exact and runs batches of
 8-64 rows 1.6-4x faster than the GEMV / rocBLAS.
 
-All of these run ``gemm_w8_rdna2`` at every batch size: it widens 8-bit
+All of these run `gemm_w8_rdna2` at every batch size: it widens 8-bit
 weights in registers for fp16/bf16 activations (outrunning rocBLAS on fp16
 weights from decode to prefill), runs v_dot4 on int8 activations and
 v_dot2 on fp16 weights.
@@ -66,7 +66,7 @@ def use_rdna2_kmajor_fp16(weight: torch.Tensor, lm_head: bool = False) -> bool:
 
 
 def kmajor_w8(weight: torch.Tensor) -> torch.Tensor:
-    """8-bit weights [N, K] in the K-major layout of ``gemm_w8_rdna2``:
+    """8-bit weights [N, K] in the K-major layout of `gemm_w8_rdna2`:
     [K / 4, N, 4], four consecutive k of one output channel per dword."""
     n, k = weight.shape
     w = weight.view(torch.int8).reshape(n, k // 4, 4).transpose(0, 1)
@@ -74,7 +74,7 @@ def kmajor_w8(weight: torch.Tensor) -> torch.Tensor:
 
 
 def kmajor_w16(weight: torch.Tensor) -> torch.Tensor:
-    """fp16 weights [N, K] in the K-major layout of ``gemm_w8_rdna2``:
+    """fp16 weights [N, K] in the K-major layout of `gemm_w8_rdna2`:
     [K / 2, N, 2], two consecutive k of one output channel per dword."""
     n, k = weight.shape
     w = weight.view(torch.int32).t().contiguous()
@@ -234,9 +234,9 @@ def rdna2_w8_linear(
     out_dtype: torch.dtype | None = None,
     act_quant_min_rows: int = 0,
 ) -> torch.Tensor:
-    """X @ W^T (+ bias) for K-major 8-bit weights, as ``gemm_w8_rdna2`` (int8
+    """X @ W^T (+ bias) for K-major 8-bit weights, as `gemm_w8_rdna2` (int8
     X with its scale_a and out_dtype: W8A8). With int8 weights, batches of at
-    least ``act_quant_min_rows`` (> 0) rows quantize X per token and run W8A8."""
+    least `act_quant_min_rows` (> 0) rows quantize X per token and run W8A8."""
     return torch.ops.vllm.rdna2_w8_linear(
         x,
         weight,
@@ -265,7 +265,7 @@ def apply_rdna2_kmajor(
     bias: torch.Tensor | None,
     rows: int | None = None,
 ) -> torch.Tensor:
-    """Layer's K-major weight (its first ``rows`` output rows if given)
+    """Layer's K-major weight (its first `rows` output rows if given)
     applied to x."""
     weight, scale = layer.kmajor_weight, layer.kmajor_scale
     if weight.dtype == torch.float16 and x.dtype == torch.bfloat16:

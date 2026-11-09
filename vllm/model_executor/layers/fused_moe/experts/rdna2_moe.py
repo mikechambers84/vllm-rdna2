@@ -4,26 +4,26 @@
 weights.
 
 W4A16:
-Same weights as ``TritonWNA16Experts`` (``[E, N, K/2]`` uint8, N-first group
+Same weights as `TritonWNA16Experts` (`[E, N, K/2]` uint8, N-first group
 scales, optional N-packed zero points), int4 experts with a group size that is
 a multiple of 32, symmetric or with zero points, fp16 activations, SiLU:
-- up to ~2 routed rows per expert: ``moe_wna16_decode_rdna2`` (gate/up with
+- up to ~2 routed rows per expert: `moe_wna16_decode_rdna2` (gate/up with
   SiLU fused, then down with the top-k sum in registers; each token re-reads
   its experts), 5-7x tuned Triton at 1 token;
-- up to ~28 rows per expert: both routed GEMMs on ``moe_wna16_skinny_rdna2``
+- up to ~28 rows per expert: both routed GEMMs on `moe_wna16_skinny_rdna2`
   (lanes along N, weights streamed once per block of 4-16 rows), 1.4-2.5x the
   tiled GEMM at 4-24 rows;
-- beyond: ``moe_wna16_gemm_rdna2`` (16 * RM x 256 tiles), 1.8-2.2x Triton at
-  1024+ tokens, or with VLLM_ROCM_W4A8_PREFILL ``moe_w4a8_gemm_rdna2``
+- beyond: `moe_wna16_gemm_rdna2` (16 * RM x 256 tiles), 1.8-2.2x Triton at
+  1024+ tokens, or with VLLM_ROCM_W4A8_PREFILL `moe_w4a8_gemm_rdna2`
   (per-token int8 activations, experts re-quantized to int8 per channel),
   another 1.7-1.8x from 1K tokens.
 
-FP8: ``Rdna2Fp8Experts`` (weight-only, fp16 activations) on the same two kinds
+FP8: `Rdna2Fp8Experts` (weight-only, fp16 activations) on the same two kinds
 of kernels.
 
 bf16 activations run through the same fp16 kernels (gfx1030 has no bf16 dot
 instruction): converted on the way in and out, int4 group scales converted to
-fp16 at load (``convert_to_wna16_moe_kernel_format``).
+fp16 at load (`convert_to_wna16_moe_kernel_format`).
 """
 
 import torch
@@ -55,7 +55,7 @@ def rdna2_moe_kernel_available(op: str = "moe_wna16_decode_rdna2") -> bool:
 def _apply_bf16_as_fp16(
     apply, output: torch.Tensor, hidden_states: torch.Tensor, *args
 ):
-    """Run an experts ``apply`` on bf16 activations in fp16: hidden states
+    """Run an experts `apply` on bf16 activations in fp16: hidden states
     saturated to fp16's range, fp16 views of the bf16 workspaces, the result
     copied back into the bf16 output."""
     (
@@ -214,7 +214,7 @@ class Rdna2WNA16Experts(TritonWNA16Experts):
         cls, rows_per_expert: float, w4a8: bool, expert_elements: int = 0
     ) -> int:
         """Rows per workgroup of moe_wna16_skinny_rdna2, 0 to use the tiled
-        GEMMs instead. ``expert_elements``: N * K of one expert's gate_up."""
+        GEMMs instead. `expert_elements`: N * K of one expert's gate_up."""
         if w4a8:
             limit: float = cls.MAX_SKINNY_ROWS_PER_EXPERT_W4A8
         elif expert_elements >= cls.LARGE_EXPERT_ELEMENTS:
@@ -456,16 +456,16 @@ class Rdna2WNA16Experts(TritonWNA16Experts):
 
 class Rdna2Int8Experts(TritonExperts):
     """int8 W8A8 experts (per-channel weight scales) on the Triton weights
-    (``[E, N, K]`` int8, ``[E, N, 1]`` fp32 scales). Decode batches run on
-    ``moe_int8_decode_rdna2``, which dots the exactly converted int8 weights
+    (`[E, N, K]` int8, `[E, N, 1]` fp32 scales). Decode batches run on
+    `moe_int8_decode_rdna2`, which dots the exactly converted int8 weights
     with the fp16 activations (no activation quantization, so more accurate
     than the Triton W8A8 path): 7x tuned Triton at 1 token, 2.2x at 8, 1.5x at
     32 on a V620 (E=256, top-8), even near 64. With dynamic per-token
     activation scales, the two routed GEMMs of larger batches run with the
-    Triton W8A8 kernel's integer math on ``moe_int8_skinny_rdna2`` below 32
+    Triton W8A8 kernel's integer math on `moe_int8_skinny_rdna2` below 32
     routed rows per expert (lanes along N, weights streamed once per 16-row
     block; 1.25-1.34x Triton at 1-8 rows, 1.14x at 16) and on
-    ``moe_int8_gemm_rdna2`` from 32 (1.24x at 1024 tokens, 1.3x at 2048, 1.47x
+    `moe_int8_gemm_rdna2` from 32 (1.24x at 1024 tokens, 1.3x at 2048, 1.47x
     at 8192). Other batches take the Triton path."""
 
     MAX_DECODE_TOKENS = 32
@@ -703,12 +703,12 @@ class Rdna2Int8Experts(TritonExperts):
 class Rdna2Fp8Experts(TritonExperts):
     """FP8 (e4m3fn) experts with fp16 activations on gfx1030, which has no FP8
     instructions (the Triton FP8 path is unavailable there). Weights stay
-    ``[E, N, K]`` fp8 with per-expert ``[E]``, per-channel ``[E, N, 1]`` or 2D
-    block ``[E, N / bn, K / bk]`` fp32 scales and are widened exactly to fp16
+    `[E, N, K]` fp8 with per-expert `[E]`, per-channel `[E, N, 1]` or 2D
+    block `[E, N / bn, K / bk]` fp32 scales and are widened exactly to fp16
     inside the kernels; activations are never quantized. Batches with at most
     MAX_DECODE_ROWS_PER_EXPERT routed rows per expert (SiLU) run
-    ``moe_fp8_decode_rdna2``, the rest the two routed GEMMs on
-    ``moe_fp8_gemm_rdna2``."""
+    `moe_fp8_decode_rdna2`, the rest the two routed GEMMs on
+    `moe_fp8_gemm_rdna2`."""
 
     MAX_DECODE_ROWS_PER_EXPERT = 4
 

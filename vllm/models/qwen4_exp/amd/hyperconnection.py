@@ -5,10 +5,10 @@
 Implements the HyperConnection residual scheme proposed in
 "HyperConnections" (https://arxiv.org/abs/2409.19606). This AMD variant
 delays each HC combine to the following HC mix boundary. HC glue kernels,
-including fused combine+RMSNorm, live in ``ops/hc.py``; projections remain
+including fused combine+RMSNorm, live in `ops/hc.py`; projections remain
 standard vLLM Linear modules.
 
-Hidden states between layers have shape ``[..., HC*HS]`` with HS inner
+Hidden states between layers have shape `[..., HC*HS]` with HS inner
 (HC outer, HS inner — checkpoint-native layout).
 
 Typical usage inside a transformer decoder layer::
@@ -52,11 +52,11 @@ from .ops.hc import (
 class GatedResidual(nn.Module):
     """Gated HyperConnection with learnable low-rank mixing and injection.
 
-    ``combine_and_mix()`` runs the pre pipeline (grouped GemmaRMSNorm -> merged
+    `combine_and_mix()` runs the pre pipeline (grouped GemmaRMSNorm -> merged
     low-rank down+inject GEMM -> silu -> up GEMM -> sigmoid -> gated mean
     over the HC streams). When passed a pending block output and an injection,
     it fuses their residual combine with the RMSNorm. Final mixers use
-    ``use_combine=False`` and do not produce a new injection.
+    `use_combine=False` and do not produce a new injection.
 
     Weights: the norm owns the grouped GemmaRMSNorm affine; the projections
     are vLLM Linear modules (merged replicated linear for down+inject), so
@@ -72,7 +72,7 @@ class GatedResidual(nn.Module):
     ) -> None:
         super().__init__()
         self.config = config
-        self.lora_rank = config.hc_lowrank
+        self.hc_lowrank = config.hc_lowrank
         self.hc_count = config.hc_count
         self.hidden_size = config.hidden_size
         self.use_combine = use_combine
@@ -93,11 +93,11 @@ class GatedResidual(nn.Module):
         # -- vLLM Linear weights --------------------------------------------
         # The merged skinny-GEMM shape is physically padded to 16 rows for
         # alignment and efficient backend dispatch.
-        self.pad_size = (-(self.lora_rank + self.hc_count)) % 16 if use_combine else 0
+        self.pad_size = (-(self.hc_lowrank + self.hc_count)) % 16 if use_combine else 0
         if use_combine:
             self.input_mix_weight_down_block_inject = MergedColumnParallelLinear(
                 self.hyper_hidden_size,
-                [self.lora_rank, self.hc_count]
+                [self.hc_lowrank, self.hc_count]
                 + ([self.pad_size] if self.pad_size else []),
                 bias=False,
                 params_dtype=config.params_dtype,
@@ -109,7 +109,7 @@ class GatedResidual(nn.Module):
         else:
             self.input_mix_weight_down = ReplicatedLinear(
                 self.hyper_hidden_size,
-                self.lora_rank,
+                self.hc_lowrank,
                 bias=False,
                 params_dtype=config.params_dtype,
                 quant_config=None,
@@ -124,7 +124,7 @@ class GatedResidual(nn.Module):
             and self.lora_rank <= 512
         )
         self.input_mix_weight_up = ReplicatedLinear(
-            self.lora_rank,
+            self.hc_lowrank,
             self.hyper_hidden_size,
             bias=False,
             params_dtype=config.params_dtype,
@@ -145,14 +145,14 @@ class GatedResidual(nn.Module):
 
         if self.use_combine:
             # produce injection logits for combine
-            split_sizes = [self.lora_rank, self.hc_count, self.pad_size]
+            split_sizes = [self.hc_lowrank, self.hc_count, self.pad_size]
             down_and_injection = self.input_mix_weight_down_block_inject(xn)
-            lora, injection, _ = down_and_injection.split(split_sizes, dim=-1)
+            lowrank, injection, _ = down_and_injection.split(split_sizes, dim=-1)
         else:
-            lora = self.input_mix_weight_down(xn)
+            lowrank = self.input_mix_weight_down(xn)
             injection = None
 
-        block_input = self.gate_mix(lora, xn)
+        block_input = self.gate_mix(lowrank, xn)
 
         return hidden_states, block_input, injection
 
@@ -164,8 +164,8 @@ class GatedResidual(nn.Module):
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor | None]:
         """Consume a pending combine, then prepare the next block input.
 
-        ``hidden_states`` is the multi-stream state from before the pending
-        block's mix. Its combine with ``block_output`` is fused with this
+        `hidden_states` is the multi-stream state from before the pending
+        block's mix. Its combine with `block_output` is fused with this
         module's input RMSNorm.
         """
         hidden_states, xn = hc_combine_norm(
@@ -179,33 +179,33 @@ class GatedResidual(nn.Module):
 
         if self.use_combine:
             # produce injection logits for combine
-            split_sizes = [self.lora_rank, self.hc_count, self.pad_size]
+            split_sizes = [self.hc_lowrank, self.hc_count, self.pad_size]
             down_and_injection = self.input_mix_weight_down_block_inject(xn)
-            lora, injection, _ = down_and_injection.split(split_sizes, dim=-1)
+            lowrank, injection, _ = down_and_injection.split(split_sizes, dim=-1)
         else:
-            lora = self.input_mix_weight_down(xn)
+            lowrank = self.input_mix_weight_down(xn)
             injection = None
 
-        block_input = self.gate_mix(lora, xn)
+        block_input = self.gate_mix(lowrank, xn)
 
         return hidden_states, block_input, injection
 
-    def gate_mix(self, lora: torch.Tensor, xn: torch.Tensor) -> torch.Tensor:
+    def gate_mix(self, lowrank: torch.Tensor, xn: torch.Tensor) -> torch.Tensor:
         """Mean over the HC streams of xn gated by the up projection of
-        silu(lora / HC)."""
+        silu(lowrank / HC)."""
         up = self.input_mix_weight_up
         weight = getattr(up, "kmajor_weight", None)
         if self.fusable_up and weight is not None and weight.dtype == torch.int8:
             return hc_up_mix(
-                lora,
+                lowrank,
                 xn,
                 weight,
                 up.kmajor_scale,
                 self.hc_count,
                 act_quant_min_rows(weight),
             )
-        lora = hc_silu(lora, self.hc_count)
-        gate = up(lora)  # [M, D]
+        lowrank = hc_silu(lowrank, self.hc_count)
+        gate = up(lowrank)  # [M, D]
         return hc_gate_mix(xn, gate, self.hc_count)
 
     def combine(

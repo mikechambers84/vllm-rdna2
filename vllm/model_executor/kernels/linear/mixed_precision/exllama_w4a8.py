@@ -14,7 +14,7 @@ import torch
 
 from vllm import _custom_ops as ops
 from vllm.model_executor.kernels.linear.scaled_mm.triton import (
-    _triton_int8_scaled_mm_func,
+    _int8_scaled_mm_func,
 )
 from vllm.triton_utils import tl, triton
 
@@ -72,6 +72,4 @@ def w4a8_gemm(
         w_q, w_s, 1.0 / channel_scale, w8, k, n, GROUP=group_size, BK=64, BN=128
     )
     x_q, x_s, _ = ops.scaled_int8_quant(x.contiguous(), None, None, symmetric=True)
-    return _triton_int8_scaled_mm_func(
-        x_q, w8.t(), x_s, channel_scale.view(-1, 1), x.dtype
-    )
+    return _int8_scaled_mm_func(x_q, w8.t(), x_s, channel_scale.view(-1, 1), x.dtype)

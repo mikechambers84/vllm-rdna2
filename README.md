@@ -118,8 +118,10 @@ echo "triton==3.7.1+git0263a6a6.rocm7.14.0" > /tmp/vllm-overrides.txt
 uv pip install --index-strategy unsafe-best-match \
     --extra-index-url https://repo.amd.com/rocm/whl-multi-arch/ \
     --override /tmp/vllm-overrides.txt \
-    -r requirements/build/rocm.txt -r requirements/rocm.txt \
+    -r requirements/build/rock.txt -r requirements/rocm.txt \
     "amd-torch-device-gfx1030==2.12.0+rocm7.14.0" "rocm[devel]==7.14.0"
+# Unpack the SDK's headers and compilers (once per venv).
+rocm-sdk init
 
 # Point the build at the SDK inside the venv. Set these in every shell that
 # builds or runs vLLM.
@@ -232,7 +234,7 @@ vLLM is flexible and easy to use with:
 - Tool calling and reasoning parsers
 - OpenAI-compatible API server, plus Anthropic Messages API and gRPC support
 - Efficient multi-LoRA support for dense and MoE layers
-- Support for NVIDIA GPUs, AMD GPUs, Intel GPUs, and x86/ARM/PowerPC CPUs. Additionally, diverse hardware plugins such as Google TPUs, Intel Gaudi, IBM Spyre, Huawei Ascend, Rebellions NPU, Apple Silicon, MetaX GPU, and more.
+- Support for NVIDIA GPUs, AMD GPUs, Intel GPUs, and x86/ARM/PowerPC CPUs. Additionally, diverse hardware plugins such as Google TPUs, Intel Gaudi, IBM Spyre, Huawei Ascend, Rebellions NPU, Apple Silicon, MetaX GPU, Iluvatar CoreX GPU, and more.
 
 vLLM seamlessly supports 200+ model architectures on Hugging Face, including:
 
@@ -251,6 +253,7 @@ Install vLLM with [`uv`](https://docs.astral.sh/uv/) (recommended) or `pip`:
 
 ```bash
 uv pip install vllm
+vllm download-kernels  # precompiled kernels for faster startup
 ```
 
 Or [build from source](https://docs.vllm.ai/en/latest/getting_started/installation/gpu/index.html#build-wheel-from-source) for development.

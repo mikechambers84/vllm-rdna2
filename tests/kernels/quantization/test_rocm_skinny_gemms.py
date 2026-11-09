@@ -53,7 +53,7 @@ OPTIONS_WVSPLITK_FP8 = [
 
 DTYPES = [torch.bfloat16, torch.float16]
 
-# kWvSlots in csrc/rocm/skinny_gemms.cu; beyond it streams take overflow
+# kWvSlots in csrc/rocm/skinny_gemms_wvsplitkrc.cu; beyond it streams take overflow
 # workspaces.
 WVSPLITKRC_SLOTS = 8
 
@@ -101,6 +101,11 @@ NKM_FACTORS_WVSPLITK = [
     (1, 64, 8),
     (2, 128, 8),
     (4, 256, 8),
+    # K % 16 != 0: the gfx1150/gfx1151 rows fall back to A_CHUNK = 8
+    (1, 4096 + 8, 4096 + 1),
+    (5, 1000, 2048),
+    # Speculative-decode batch
+    (5, 2048, 2560),
 ]
 
 # N is bucketed up to its next ^2 (16/32/64/128) and the remainder is masked
@@ -488,7 +493,9 @@ def test_rocm_gemm_w8_rdna2_kernel(fmt, n, k, m, dtype, with_bias):
 @pytest.mark.skipif(not on_gfx1030(), reason="RDNA2 (gfx1030) kernel")
 def test_rocm_gemm_w8_rdna2_w8a8_kernel(n, k, m, out_dtype, per_token, with_bias):
     """int8 activations (W8A8) accumulate exactly in int32 and share
-    triton_scaled_mm's epilogue, so the results are identical."""
+    triton_scaled_mm's epilogue: identical results without a bias. With one,
+    Triton's compiled scaling can round the other way on exact fp16/bf16
+    ties (about 0.01% of elements), so those may differ by one ulp."""
     from vllm.model_executor.kernels.linear.rdna2_w8a16 import kmajor_w8
     from vllm.model_executor.layers.quantization.compressed_tensors.triton_scaled_mm import (  # noqa: E501
         triton_scaled_mm,
@@ -506,7 +513,8 @@ def test_rocm_gemm_w8_rdna2_w8a8_kernel(n, k, m, out_dtype, per_token, with_bias
     )
 
     ref = triton_scaled_mm(A, W.t(), scale_a, scale_b.view(m, 1), out_dtype, bias)
-    torch.testing.assert_close(out, ref, atol=0, rtol=0)
+    rtol = torch.finfo(out_dtype).eps if with_bias else 0
+    torch.testing.assert_close(out, ref, atol=0, rtol=rtol)
 
 
 @pytest.mark.parametrize("cfg", range(13))

@@ -2,13 +2,13 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 """gfx1030 dispatch for ExllamaLinearKernel's 4-bit layers, by row count.
 
-Up to RDNA2_MAX_ROWS rows run ``gemm_w4a16_exl_rdna2`` on Exllama's own
+Up to RDNA2_MAX_ROWS rows run `gemm_w4a16_exl_rdna2` on Exllama's own
 tensors (summed over the linear layers of eight 1.5B-70B models, 1.04-1.5x
 gptq_gemm at 1 row, 1.5-3x at 8-64 rows, 1.06-1.25x at 512, near parity by
 1024); larger batches run gptq_gemm's reconstruct + GEMM. With
 VLLM_ROCM_W4A8_PREFILL, batches of more than VLLM_ROCM_W4A8_MIN_ROWS rows run
 as W4A8 (per-token int8 activations): up to W4A8_REQUANT_MIN_ROWS rows
-``gemm_w4a8_exl_rdna2`` on the same 4-bit tensors (1.25-1.85x
+`gemm_w4a8_exl_rdna2` on the same 4-bit tensors (1.25-1.85x
 gemm_w4a16_exl_rdna2 at 8-256 rows), above it the int8 GEMM on the weight
 re-quantized per call (symmetric weights), which amortizes the
 re-quantization there and outruns the group-exact kernel.

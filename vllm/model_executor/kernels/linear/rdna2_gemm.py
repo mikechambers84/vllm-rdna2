@@ -6,12 +6,12 @@ rocBLAS's default Tensile solution is often 2-4x off the best one on gfx1030
 for 64-512 rows (e.g. 6 vs 20 TFLOPS for x [128, 2048] @ W [12288, 2048]^T)
 and up to 1.3x at prefill sizes. A table of benchmarked solution indices per
 weight shape and row bucket routes those GEMMs through
-``gemm_rocblas_rdna2``. Indices belong to one rocBLAS build, so a table records
+`gemm_rocblas_rdna2`. Indices belong to one rocBLAS build, so a table records
 its version. The shipped table covers the shapes of the models this fork was
 tuned on; VLLM_ROCM_RDNA2_GEMM_TUNE=1 tunes the other weight shapes of a model
 while it loads into VLLM_ROCM_RDNA2_GEMM_TABLE (also read at startup; "0" turns
-tuned solutions off), and ``python -m
-vllm.model_executor.kernels.linear.rdna2_gemm N,K ...`` tunes shapes offline.
+tuned solutions off), and `python -m
+vllm.model_executor.kernels.linear.rdna2_gemm N,K ...` tunes shapes offline.
 """
 
 import functools
@@ -127,8 +127,8 @@ def linear(
 def register(
     n: int, k: int, dtype: torch.dtype, weight: torch.Tensor | None = None
 ) -> None:
-    """Note a weight [n, k] (``weight`` itself, if it exists in that form) run
-    through ``linear``; with VLLM_ROCM_RDNA2_GEMM_TUNE, tune the shape now if
+    """Note a weight [n, k] (`weight` itself, if it exists in that form) run
+    through `linear`; with VLLM_ROCM_RDNA2_GEMM_TUNE, tune the shape now if
     no table has it."""
     if not (envs.VLLM_ROCM_RDNA2_GEMM_TUNE and available()):
         return

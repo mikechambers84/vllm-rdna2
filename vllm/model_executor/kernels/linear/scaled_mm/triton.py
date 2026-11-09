@@ -23,6 +23,8 @@ from .BlockScaledMMLinearKernel import (
 )
 from .cutlass import CutlassInt8ScaledMMLinearKernel
 from .ScaledMMLinearKernel import (
+    FP8ScaledMMLinearKernel,
+    FP8ScaledMMLinearLayerConfig,
     Int8ScaledMMLinearLayerConfig,
 )
 
@@ -74,7 +76,6 @@ class TritonInt8ScaledMMLinearKernel(CutlassInt8ScaledMMLinearKernel):
                     i_s_name,
                     torch.nn.Parameter(i_s.max(), requires_grad=False),
                 )
-                setattr(layer, i_zp_name, None)
             else:
                 input_zero_point = getattr(layer, i_zp_name)
 
@@ -113,11 +114,7 @@ class TritonInt8ScaledMMLinearKernel(CutlassInt8ScaledMMLinearKernel):
             if self.config.is_static_input_scheme:
                 # Fold azp into azp_adj for the per-tensor case
                 azp_adj = getattr(layer, i_zp_name) * azp_adj
-            setattr(
-                layer,
-                azp_adj_name,
-                torch.nn.Parameter(azp_adj, requires_grad=False),
-            )
+            replace_parameter(layer, azp_adj_name, azp_adj)
         else:
             setattr(layer, azp_adj_name, None)
 
@@ -134,7 +131,7 @@ class TritonInt8ScaledMMLinearKernel(CutlassInt8ScaledMMLinearKernel):
             x.contiguous(), i_s, i_zp, symmetric=symmetric
         )
 
-        out = torch.ops.vllm.triton_int8_scaled_mm(x_q, w_q, x_s, w_s, x.dtype, bias)
+        out = torch.ops.vllm.int8_scaled_mm_func(x_q, w_q, x_s, w_s, x.dtype, bias)
 
         if azp_adj is not None:
             # Asymmetric quantization: subtract the zero-point correction.
@@ -195,40 +192,44 @@ def _rdna2_w8a8_op(
     return None
 
 
-def _triton_int8_scaled_mm_func(
-    x_q: torch.Tensor,
-    w_q: torch.Tensor,
-    x_s: torch.Tensor,
-    w_s: torch.Tensor,
-    out_dtype: torch.dtype,
-    bias: torch.Tensor | None = None,
-) -> torch.Tensor:
-    rdna2_op = _rdna2_w8a8_op(x_q, w_q, x_s, w_s, out_dtype)
-    if rdna2_op is not None:
-        return rdna2_op(
-            x_q, w_q.t(), x_s.contiguous(), w_s.contiguous(), out_dtype, bias
+class TritonFP8ScaledMMLinearKernel(FP8ScaledMMLinearKernel):
+    @classmethod
+    def is_supported(
+        cls, compute_capability: int | None = None
+    ) -> tuple[bool, str | None]:
+        if not current_platform.is_cuda_alike():
+            return False, "requires ROCm or CUDA."
+        return True, None
+
+    @classmethod
+    def can_implement(cls, c: FP8ScaledMMLinearLayerConfig) -> tuple[bool, str | None]:
+        act_group = c.activation_quant_key.scale.group_shape
+        weight_group = c.weight_quant_key.scale.group_shape
+        if not (act_group.is_per_tensor() or act_group.is_per_token()):
+            return False, "requires per-tensor or per-token activation scales."
+        if not (
+            weight_group.is_per_tensor()
+            or weight_group.is_per_channel()
+            or weight_group.is_per_token()
+        ):
+            return False, "requires per-tensor, per-channel or per-token weight scales."
+        return True, None
+
+    def apply_scaled_mm(
+        self,
+        *,
+        A: torch.Tensor,
+        B: torch.Tensor,
+        out_dtype: torch.dtype,
+        As: torch.Tensor,
+        Bs: torch.Tensor,
+        bias: torch.Tensor | None,
+        output_shape: list,
+    ) -> torch.Tensor:
+        out = triton_scaled_mm(
+            A, B, scale_a=As, scale_b=Bs, out_dtype=out_dtype, bias=bias
         )
-    return triton_scaled_mm(x_q, w_q, x_s, w_s, out_dtype, bias)
-
-
-def _triton_int8_scaled_mm_fake(
-    x_q: torch.Tensor,
-    w_q: torch.Tensor,
-    x_s: torch.Tensor,
-    w_s: torch.Tensor,
-    out_dtype: torch.dtype,
-    bias: torch.Tensor | None = None,
-) -> torch.Tensor:
-    return torch.empty((x_q.size(0), w_q.size(1)), dtype=out_dtype, device=x_q.device)
-
-
-# Opaque to Dynamo: the kernel and its tile are picked from M, which must be the
-# runtime M, not the symbolic M that torch.compile traced with.
-direct_register_custom_op(
-    "triton_int8_scaled_mm",
-    _triton_int8_scaled_mm_func,
-    fake_impl=_triton_int8_scaled_mm_fake,
-)
+        return out.view(*output_shape)
 
 
 class TritonFp8BlockScaledMMKernel(Fp8BlockScaledMMLinearKernel):
@@ -253,6 +254,54 @@ class TritonFp8BlockScaledMMKernel(Fp8BlockScaledMMLinearKernel):
             list(self.weight_group_shape),
             self.config.out_dtype,
         )
+
+
+def _int8_scaled_mm_func(
+    qx: torch.Tensor,
+    weight: torch.Tensor,
+    x_scale: torch.Tensor,
+    weight_scale: torch.Tensor,
+    output_dtype: torch.dtype,
+    bias: torch.Tensor | None = None,
+) -> torch.Tensor:
+    rdna2_op = _rdna2_w8a8_op(qx, weight, x_scale, weight_scale, output_dtype)
+    if rdna2_op is not None:
+        return rdna2_op(
+            qx,
+            weight.t(),
+            x_scale.contiguous(),
+            weight_scale.contiguous(),
+            output_dtype,
+            bias,
+        )
+    return triton_scaled_mm(
+        qx,
+        weight,
+        scale_a=x_scale,
+        scale_b=weight_scale,
+        out_dtype=output_dtype,
+        bias=bias,
+    )
+
+
+def _int8_scaled_mm_fake(
+    qx: torch.Tensor,
+    weight: torch.Tensor,
+    x_scale: torch.Tensor,
+    weight_scale: torch.Tensor,
+    output_dtype: torch.dtype,
+    bias: torch.Tensor | None = None,
+) -> torch.Tensor:
+    return torch.empty(
+        (qx.size(0), weight.size(1)), dtype=output_dtype, device=qx.device
+    )
+
+
+direct_register_custom_op(
+    "int8_scaled_mm_func",
+    _int8_scaled_mm_func,
+    fake_impl=_int8_scaled_mm_fake,
+)
 
 
 # TODO we should be able to change the type of block_size to GroupShape

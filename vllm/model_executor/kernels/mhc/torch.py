@@ -75,7 +75,7 @@ def mhc_pre_torch(
     Returns:
         post_mix: shape (..., hc_mult), dtype torch.float32
         comb_mix: shape (..., hc_mult, hc_mult), dtype torch.float32
-        layer_input: shape (..., hidden_size), dtype of ``residual``
+        layer_input: shape (..., hidden_size), dtype of `residual`
 
     """
     # Validate shapes
