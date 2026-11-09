@@ -494,6 +494,14 @@ def vmm_unavailable_reason() -> str | None:
 
         if not torch.accelerator.is_available():
             return "no CUDA/ROCm device is available"
+        from vllm.platforms import current_platform
+
+        if current_platform.is_rocm():
+            from vllm.platforms.rocm import on_gfx10
+
+            if on_gfx10():
+                # The probe below never returns there: hipMemSetAccess hangs.
+                return "hipMemSetAccess hangs on gfx10 (RDNA1/RDNA2)"
         driver = get_vmm_driver()
         device_index = torch.accelerator.current_device_index()
         driver.ensure_context(device_index)

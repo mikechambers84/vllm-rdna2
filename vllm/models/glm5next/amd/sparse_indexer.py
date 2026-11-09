@@ -28,6 +28,7 @@ from vllm.platforms import current_platform
 from vllm.platforms.rocm import (
     _ON_GFX942,
     _ON_GFX950,
+    _ON_GFX1030,
     _ON_GFX1151,
     _ON_RDNA,
 )
@@ -201,7 +202,8 @@ def sparse_attn_indexer_kpool(
         # [H, B * next_n, max_pool_len] on the stage1 fallback path). This
         # profiling branch returns before invoking the logits kernel itself.
         decode_rows = _max_decode_logits_rows(hidden_states.shape[0])
-        if _ON_GFX942 or _ON_GFX950 or (_ON_RDNA and not _ON_GFX1151):
+        # gfx1030's paged_mqa_logits_rdna2 also writes [B * next_n, max_pool_len].
+        if _ON_GFX942 or _ON_GFX950 or _ON_GFX1030 or (_ON_RDNA and not _ON_GFX1151):
             workspace_manager.get_simultaneous(
                 ((decode_rows, max_pool_len), torch.float32),
             )

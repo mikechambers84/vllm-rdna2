@@ -1250,6 +1250,12 @@ class RocmPlatform(Platform):
         compilation_config = vllm_config.compilation_config
         parallel_config = vllm_config.parallel_config
 
+        # HIP does not survive a fork once initialized, and the engine core
+        # queries the device (e.g. its capability) before starting the workers;
+        # the GCN arch now comes from amdsmi, so nothing forces spawn earlier.
+        if "VLLM_WORKER_MULTIPROC_METHOD" not in os.environ:
+            os.environ["VLLM_WORKER_MULTIPROC_METHOD"] = "spawn"
+
         if (
             compilation_config.cudagraph_mode.has_full_cudagraphs()
             and parallel_config.prefill_context_parallel_size > 1

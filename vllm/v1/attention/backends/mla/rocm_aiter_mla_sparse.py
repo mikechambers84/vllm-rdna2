@@ -675,7 +675,11 @@ class ROCMAiterMLASparseMetadataBuilder(
         reduce_indptr = None
         reduce_final_map = None
         reduce_partial_map = None
-        is_long_pure_bf16_prefill = _is_long_bf16_prefill(self._mla_kv_dtype, metadata)
+        # The MLA dtypes are set up with the persistent metadata (aiter only).
+        is_long_pure_bf16_prefill = (
+            self._use_persistent_metadata
+            and _is_long_bf16_prefill(self._mla_kv_dtype, metadata)
+        )
         if (
             self._use_persistent_metadata
             and not use_triton_sparse
