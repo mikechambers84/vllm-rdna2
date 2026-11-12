@@ -120,8 +120,8 @@ class GatedResidual(nn.Module):
         self.fusable_up = (
             self.hc_count == 4
             and config.hidden_size % 32 == 0
-            and self.lora_rank % 8 == 0
-            and self.lora_rank <= 512
+            and self.hc_lowrank % 8 == 0
+            and self.hc_lowrank <= 512
         )
         self.input_mix_weight_up = ReplicatedLinear(
             self.hc_lowrank,
