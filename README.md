@@ -9,8 +9,9 @@ FP8, bf16 dot products), and runs most hot paths on slow fallbacks.
 
 This fork fixes the platform layer and adds hand-written HIP kernels built on
 what gfx1030 does have: `v_dot2_f32_f16`, `v_dot4_i32_i8`, wave32 and 64 KB of
-LDS. It is based on upstream commit `6e517b15c1`. Everything was developed and
-tested on a host with 8x Radeon Pro V620 (32 GB each, PCIe only, no XGMI).
+LDS. It is based on upstream commit `3213796cd3` (2026-11-09). Everything was
+developed and tested on a host with 8x Radeon Pro V620 (32 GB each, PCIe only,
+no XGMI).
 
 ### What has been added and optimized
 
@@ -99,7 +100,8 @@ were not measured.
 | Qwen3.6-35B-A3B W4A16 | 1 | 14.3 ms/token | 3.0 s, 2730 tok/s; 2.5 s, 3270 tok/s with the W4A8 opt-in | throughput 1738 tok/s, 1970 with the K-major opt-in; MTP chat 120 tok/s |
 | Qwen3.6-35B-A3B W8A8 | 2 (PP=2) | | 8K prompt + 256 output tokens: 6.7 s | throughput 2462 tok/s |
 | Qwen3.8-Flash-Next INT4 (fp8 KV, int8 / W4A8 opt-ins) | 4 (PP=4) | 21.5 ms/token; 12.8 ms/token with MTP k=2 | 2.74 s, 2990 tok/s | batch-8 decode 34.2 ms/step |
-| GLM-5.3-Flash W4A16 | 8 (PP=8) | 30.9 ms/token, 32 tok/s with MTP k=2 | 4.95 s, 1650 tok/s | 32K / 64K prefill 17.8 / 35.4 s |
+| Qwen3.8-Flash-Next W4A16 experts (fp8 KV, int8 / W4A8 opt-ins) | 8 (PP=8) | 11.9 ms/token with MTP k=3 | 2.34 s, 3510 tok/s | |
+| GLM-5.3-Flash W4A16 | 8 (PP=8) | 32.2 ms/token, 31 tok/s with MTP k=2 | 4.95 s, 1650 tok/s | 32K / 64K prefill 17.7 / 35.2 s |
 
 ### Building
 
