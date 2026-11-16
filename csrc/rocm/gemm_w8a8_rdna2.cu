@@ -186,13 +186,12 @@ __global__ void __launch_bounds__(THREADS)
   #pragma unroll
       for (int j = 0; j < 4; j++) {
         const int n = min(col + j, N - 1);
-        // Round, then add the bias in the output dtype, as triton_scaled_mm
-        // does, so both give identical results.
-        TOut v = from_float<TOut>((float)acc[i][g * 4 + j] * s_row *
-                                  sb[n * sb_stride]);
-        if (bias)
-          v = from_float<TOut>(to_float<TOut>(v) + to_float<TOut>(bias[n]));
-        out[j] = v;
+        // Scale, add the bias in fp32 (separately rounded, not fused), then
+        // round once, as triton_scaled_mm does, so both give identical results.
+        float v = __fmul_rn(__fmul_rn((float)acc[i][g * 4 + j], s_row),
+                            sb[n * sb_stride]);
+        if (bias) v = __fadd_rn(v, to_float<TOut>(bias[n]));
+        out[j] = from_float<TOut>(v);
       }
       TOut* dst = C + (long)row * ldc + col;
       if (col + 4 <= N && ldc % 4 == 0) {

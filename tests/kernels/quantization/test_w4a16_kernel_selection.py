@@ -26,7 +26,7 @@ _HYBRID_GROUP_SIZES = (32, 64, 128)
 
 
 def _expected_rocm_kernel(weight_type, group_size: int) -> str:
-    """Mirror the ROCm priority order in ``_POSSIBLE_KERNELS[ROCM]``:
+    """Mirror the ROCm priority order in `_POSSIBLE_KERNELS[ROCM]`:
     RDNA3 (gfx1100, symmetric uint4b8) -> Hybrid (gfx11/gfx12) -> Triton, with
     Exllama moved first on gfx10, where it also takes uint4 with zero points
     and bf16 activations (run as fp16).

@@ -2,9 +2,11 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 import builtins
 import logging
+from types import SimpleNamespace
 from unittest.mock import MagicMock, mock_open, patch
 
 import pytest
+import torch
 
 from vllm.platforms import (
     _is_amd_zen_cpu,
@@ -12,23 +14,6 @@ from vllm.platforms import (
     cuda_platform_plugin,
     resolve_current_platform_cls_qualname,
 )
-
-
-@pytest.fixture
-def caplog_vllm(caplog):
-    """`caplog`, but also captures vLLM's loggers.
-
-    vllm/logger.py configures the "vllm" logger with propagate=False, so
-    records from child loggers like "vllm.platforms" reach vLLM's own
-    handler but never bubble up to the root logger where plain `caplog`
-    listens. Attach caplog's handler directly to "vllm" to see them too.
-    """
-    logger = logging.getLogger("vllm")
-    logger.addHandler(caplog.handler)
-    try:
-        yield caplog
-    finally:
-        logger.removeHandler(caplog.handler)
 
 
 def test_is_amd_zen_cpu_detects_amd_with_avx512():
@@ -174,3 +159,18 @@ def test_cuda_plugin_stays_off_under_rocm_torch(hip_version, expected):
         patch("vllm.platforms.vllm_version_matches_substr", return_value=False),
     ):
         assert cuda_platform_plugin() == expected
+
+
+@pytest.mark.parametrize("fp16_supported", [True, False])
+def test_zen_cpu_supported_dtypes_track_fp16_capability(fp16_supported):
+    from vllm.platforms.zen_cpu import ZenCpuPlatform
+
+    # zentorch is absent on most CI hosts, so torch.ops.zentorch has to be
+    # stood up rather than patched in place.
+    zentorch_ops = SimpleNamespace(zentorch_is_fp16_supported=lambda: fp16_supported)
+    with patch.object(torch.ops, "zentorch", zentorch_ops, create=True):
+        dtypes = ZenCpuPlatform().supported_dtypes
+
+    # bf16 stays first so `--dtype auto` resolves to it on every Zen part.
+    assert dtypes[0] is torch.bfloat16
+    assert (torch.float16 in dtypes) is fp16_supported

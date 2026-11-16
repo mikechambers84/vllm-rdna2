@@ -411,14 +411,13 @@ __global__ void __launch_bounds__(NW* WARP32)
         if (t0 + i < M) {
           __align__(8) O o[4];
           if constexpr (DOT4) {
-            // As triton_scaled_mm: round the scaled sum, then add the bias.
+            // As triton_scaled_mm: scale, add the bias in fp32 (separately
+            // rounded, not fused), then round once to the output dtype.
             const float sa = SA[(t0 + i) * sa_stride];
   #pragma unroll
-            for (int c = 0; c < 4; c++) {
-              o[c] = from_float<O>((float)acc[ct][c][i] * sa * s[c]);
-              if (bias != nullptr)
-                o[c] = from_float<O>(to_float<O>(o[c]) + bv[c]);
-            }
+            for (int c = 0; c < 4; c++)
+              o[c] = from_float<O>(__fadd_rn(
+                  __fmul_rn(__fmul_rn((float)acc[ct][c][i], sa), s[c]), bv[c]));
           } else {
   #pragma unroll
             for (int c = 0; c < 4; c++)

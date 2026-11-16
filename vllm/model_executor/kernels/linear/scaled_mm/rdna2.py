@@ -1,8 +1,8 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 """FP8 and W8A8 int8 checkpoints on gfx1030 (RDNA2) through
-``gemm_w8_rdna2``, at every batch size, on weights stored K-major
-(``kmajor_w8``).
+`gemm_w8_rdna2`, at every batch size, on weights stored K-major
+(`kmajor_w8`).
 
 gfx1030 has no FP8 instructions: e4m3fn weights stay one byte each and are
 widened exactly to fp16 in registers. The activations keep full precision, so
@@ -57,7 +57,7 @@ def _split_block_scales(
     """2D block scales [ceil(n / block_n), ceil(k / block_k)] as a scale per
     output channel (the largest block of its row) and fp16 ratios <= 1 per
     block, transposed to [ceil(k / block_k), ceil(n / block_n)]: the form
-    ``gemm_w8_rdna2`` takes."""
+    `gemm_w8_rdna2` takes."""
     s = scale.float()
     row = s.amax(dim=1).clamp(min=torch.finfo(torch.float32).tiny)
     channel = row.repeat_interleave(block_n)[:n].contiguous()
@@ -69,7 +69,7 @@ class RDNA2FP8ScaledMMLinearKernel(FP8ScaledMMLinearKernel):
 
     Takes the weights the way MarlinFP8ScaledMMLinearKernel does: (K, N) with
     per-tensor, per-shard or per-channel scales, or (N, K) with 2D block
-    scales in ``weight_scale_inv`` or ``weight_scale``.
+    scales in `weight_scale_inv` or `weight_scale`.
     """
 
     @classmethod

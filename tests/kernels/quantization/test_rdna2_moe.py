@@ -2,11 +2,11 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 """The gfx1030 fused-MoE kernels against fp32 references, on the weights the
 Triton paths keep (Qwen3.6-35B-A3B dims, E capped at 16): the decode kernels
-``moe_wna16_decode_rdna2`` on uint8-packed ``[E, N, K/2]`` int4 weights (group
+`moe_wna16_decode_rdna2` on uint8-packed `[E, N, K/2]` int4 weights (group
 size 32 or 128, symmetric or with zero points) and
-``moe_int8_decode_rdna2`` on ``[E, N, K]`` int8 weights with channel scales,
-the prefill GEMMs ``moe_wna16_gemm_rdna2``, ``moe_wna16_skinny_rdna2`` and
-``moe_w4a8_gemm_rdna2``, and the weight-only FP8 experts (``Rdna2Fp8Experts``)
+`moe_int8_decode_rdna2` on `[E, N, K]` int8 weights with channel scales,
+the prefill GEMMs `moe_wna16_gemm_rdna2`, `moe_wna16_skinny_rdna2` and
+`moe_w4a8_gemm_rdna2`, and the weight-only FP8 experts (`Rdna2Fp8Experts`)
 on both kinds of kernels."""
 
 import pytest
@@ -534,7 +534,7 @@ def test_rdna2_wna16_experts_run_bf16_in_fp16(num_tokens, monkeypatch):
     assert ((out.float() - ref).norm() / ref.norm()).item() < 1e-2
 
 
-def test_fp8_moe_selects_rdna2_backend():
+def test_fp8_moe_selects_rdna2_backend(default_vllm_config):
     """Block-scaled FP8 MoE layers pick the weight-only gfx1030 experts."""
     from tests.kernels.moe.utils import make_dummy_moe_config
     from vllm.model_executor.layers.fused_moe.oracle.fp8 import (

@@ -3,7 +3,7 @@
 """bf16 Triton kernels on gfx10 (RDNA1/RDNA2).
 
 Triton's AMD backend lowers bf16 multiplies to
-``llvm.amdgcn.fdot2.bf16.bf16(<a, 0>, <b, 0>, 0)``, an instruction gfx11 and
+`llvm.amdgcn.fdot2.bf16.bf16(<a, 0>, <b, 0>, 0)`, an instruction gfx11 and
 later have but gfx10 does not, so any kernel doing bf16 arithmetic aborts the
 process in code generation ("LLVM ERROR: Cannot select: intrinsic
 %llvm.amdgcn.fdot2.bf16.bf16"). For gfx10 targets, the LLVM IR handed to code
