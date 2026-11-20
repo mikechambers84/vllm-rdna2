@@ -336,7 +336,10 @@ def release_dynamo_tracked_fakes():
     """
     from torch._dynamo import convert_frame
 
-    original = convert_frame.clear_compile_context_weakrefs
+    original = getattr(convert_frame, "clear_compile_context_weakrefs", None)
+    if original is None:  # torch builds without this hook (e.g. ROCm 2.12)
+        yield
+        return
 
     def clear_compile_context_weakrefs(tracer_output, compiler_fn):
         original(tracer_output, compiler_fn)

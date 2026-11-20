@@ -386,17 +386,30 @@ __device__ __forceinline__ void lds_barrier() {
   asm volatile("s_waitcnt lgkmcnt(0)\n\ts_barrier" ::: "memory");
 }
 
+// One element of a state written in the checkpoint buffer's dtype (FLA's
+// `.to()`: round to nearest even).
+__device__ __forceinline__ void store_state(void* p, const int kind,
+                                            const long off, const float v) {
+  if (kind == 0) {
+    static_cast<float*>(p)[off] = v;
+  } else if (kind == 1) {
+    static_cast<__half*>(p)[off] = __float2half_rn(v);
+  } else {
+    uint32_t b = __float_as_uint(v);
+    b = (v != v) ? (b | 0x400000u) : b + 0x7fffu + ((b >> 16) & 1u);
+    static_cast<uint16_t*>(p)[off] = static_cast<uint16_t>(b >> 16);
+  }
+}
+
 template <int BV, bool H0_F32>
-__global__ void __launch_bounds__(THREADS)
-    gdn_fwd_h_rdna2_kernel(const __half* __restrict__ k,
-                           const __half* __restrict__ w,
-                           const __half* __restrict__ u,
-                           const float* __restrict__ g,
-                           const void* __restrict__ h0, __half* __restrict__ hs,
-                           __half* __restrict__ vnew, float* __restrict__ ht,
-                           const int* __restrict__ cu_seqlens,
-                           const void* __restrict__ chunk_offsets,
-                           const bool co64, const int H, const int Hg) {
+__global__ void __launch_bounds__(THREADS) gdn_fwd_h_rdna2_kernel(
+    const __half* __restrict__ k, const __half* __restrict__ w,
+    const __half* __restrict__ u, const float* __restrict__ g,
+    const void* __restrict__ h0, __half* __restrict__ hs,
+    __half* __restrict__ vnew, float* __restrict__ ht,
+    const int* __restrict__ cu_seqlens, const void* __restrict__ chunk_offsets,
+    const bool co64, const int H, const int Hg, void* __restrict__ ckpt,
+    const int* __restrict__ ckpt_offsets, const int ckpt_kind) {
   constexpr int HLD =
       BV + (BV >= 64 ? 4 : 2);  // k2-major S row stride (dwords)
   constexpr int VR = BV / 16;   // state value rows per thread
@@ -419,6 +432,13 @@ __global__ void __launch_bounds__(THREADS)
   const long boh = co64 ? static_cast<const int64_t*>(chunk_offsets)[n]
                         : static_cast<const int*>(chunk_offsets)[n];
   const int v0 = vb * BV;
+  // The state after o_c tokens is the one entering chunk o_c / BT. As in FLA,
+  // only offsets on a chunk boundary strictly inside the sequence are stored.
+  int i_c = -1;
+  if (ckpt != nullptr) {
+    const int o_c = ckpt_offsets[n];
+    if (o_c > 0 && o_c % BT == 0 && o_c < T) i_c = o_c / BT;
+  }
 
   // State: rows v = VR*ty + i, cols 4tx + {0..3} and 64 + 4tx + {0..3}.
   float S[VR][8];
@@ -499,6 +519,17 @@ __global__ void __launch_bounds__(THREADS)
   #pragma unroll
       for (int b = 0; b < VC; b++) uc[a][b] = __half2float(ru[a][b]);
     __half* hrow = hs + ((boh + i) * H + h) * (long)KD * KD;
+    if (i == i_c) {  // from the fp32 state, unlike h
+  #pragma unroll
+      for (int ii = 0; ii < VR; ii++)
+  #pragma unroll
+        for (int j = 0; j < 8; j++) {
+          const int kc = (j / 4) * 64 + tx * 4 + j % 4;
+          store_state(ckpt, ckpt_kind,
+                      ((long)(n * H + h) * KD + v0 + VR * ty + ii) * KD + kc,
+                      S[ii][j]);
+        }
+    }
   #pragma unroll
     for (int ii = 0; ii < VR; ii++) {
       const int v = VR * ty + ii;
@@ -872,6 +903,7 @@ __global__ void gdn_fwd_h_rdna2_kernel(const __half*, const __half*,
                                        const __half*, const float*, const void*,
                                        __half*, __half*, float*, const int*,
                                        const void*, const bool, const int,
+                                       const int, void*, const int*,
                                        const int) {}
 
 __global__ void gdn_fwd_o_rdna2_kernel(const __half*, const __half*,
@@ -1006,14 +1038,19 @@ void gdn_wy_rdna2(const torch::Tensor& k, const torch::Tensor& v,
 // (fp32 or fp16, [value][key]) -> h [NT, H, 128, 128] fp16 (state at each chunk
 // start), v_new [T, H, 128] fp16 and optional final state ht [N, H, 128, 128]
 // fp32. chunk_offsets [N + 1] (int32 or int64) from FLA's
-// prepare_chunk_offsets.
+// prepare_chunk_offsets. Optional checkpoint_state [N, H, 128, 128] (fp32 /
+// fp16 / bf16) receives sequence n's state after checkpoint_offsets[n] (int32)
+// tokens when that is a multiple of 64 below its length; other rows are left
+// untouched.
 void gdn_fwd_h_rdna2(const torch::Tensor& k, const torch::Tensor& w,
                      const torch::Tensor& u, const torch::Tensor& g_cum,
                      const std::optional<torch::Tensor>& h0, torch::Tensor& h,
                      torch::Tensor& v_new,
                      const std::optional<torch::Tensor>& ht,
                      const torch::Tensor& cu_seqlens,
-                     const torch::Tensor& chunk_offsets) {
+                     const torch::Tensor& chunk_offsets,
+                     const std::optional<torch::Tensor>& checkpoint_state,
+                     const std::optional<torch::Tensor>& checkpoint_offsets) {
   using namespace vllm::gdn_rdna2;
   TORCH_CHECK(
       k.dtype() == torch::kFloat16 && w.dtype() == torch::kFloat16 &&
@@ -1051,17 +1088,40 @@ void gdn_fwd_h_rdna2(const torch::Tensor& k, const torch::Tensor& w,
                 "gdn_fwd_h_rdna2: ht must be contiguous fp32 [N, H, 128, 128]");
     htp = ht->data_ptr<float>();
   }
+  TORCH_CHECK(checkpoint_state.has_value() == checkpoint_offsets.has_value(),
+              "gdn_fwd_h_rdna2: checkpoint_state and checkpoint_offsets go "
+              "together");
+  void* ckptp = nullptr;
+  const int* ckpt_offp = nullptr;
+  int ckpt_kind = 0;
+  if (checkpoint_state) {
+    const auto dt = checkpoint_state->dtype();
+    TORCH_CHECK(checkpoint_state->is_contiguous() &&
+                    checkpoint_state->numel() == (long)N * H * KD * KD &&
+                    (dt == torch::kFloat32 || dt == torch::kFloat16 ||
+                     dt == torch::kBFloat16),
+                "gdn_fwd_h_rdna2: checkpoint_state must be contiguous "
+                "[N, H, 128, 128] fp32 / fp16 / bf16");
+    TORCH_CHECK(checkpoint_offsets->dtype() == torch::kInt32 &&
+                    checkpoint_offsets->is_contiguous() &&
+                    checkpoint_offsets->numel() == N,
+                "gdn_fwd_h_rdna2: checkpoint_offsets must be int32 [N]");
+    ckptp = checkpoint_state->data_ptr();
+    ckpt_offp = checkpoint_offsets->data_ptr<int>();
+    ckpt_kind = dt == torch::kFloat32 ? 0 : dt == torch::kFloat16 ? 1 : 2;
+  }
   if (N == 0) return;
   const at::cuda::OptionalCUDAGuard device_guard(device_of(k));
   const cudaStream_t stream = at::cuda::getCurrentCUDAStream();
   const dim3 grid(H * (KD / H_BV), N);
-#define VLLM_GDN_FWD_H_LAUNCH(F32)                                 \
-  gdn_fwd_h_rdna2_kernel<H_BV, F32><<<grid, THREADS, 0, stream>>>( \
-      (const __half*)k.data_ptr(), (const __half*)w.data_ptr(),    \
-      (const __half*)u.data_ptr(), g_cum.data_ptr<float>(), h0p,   \
-      (__half*)h.data_ptr(), (__half*)v_new.data_ptr(), htp,       \
-      cu_seqlens.data_ptr<int>(), chunk_offsets.data_ptr(),        \
-      chunk_offsets.dtype() == torch::kInt64, H, Hg)
+#define VLLM_GDN_FWD_H_LAUNCH(F32)                                     \
+  gdn_fwd_h_rdna2_kernel<H_BV, F32><<<grid, THREADS, 0, stream>>>(     \
+      (const __half*)k.data_ptr(), (const __half*)w.data_ptr(),        \
+      (const __half*)u.data_ptr(), g_cum.data_ptr<float>(), h0p,       \
+      (__half*)h.data_ptr(), (__half*)v_new.data_ptr(), htp,           \
+      cu_seqlens.data_ptr<int>(), chunk_offsets.data_ptr(),            \
+      chunk_offsets.dtype() == torch::kInt64, H, Hg, ckptp, ckpt_offp, \
+      ckpt_kind)
   if (h0_f32) {
     VLLM_GDN_FWD_H_LAUNCH(true);
   } else {

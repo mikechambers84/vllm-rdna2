@@ -279,7 +279,9 @@ void gdn_fwd_h_rdna2(const torch::Tensor& k, const torch::Tensor& w,
                      torch::Tensor& v_new,
                      const std::optional<torch::Tensor>& ht,
                      const torch::Tensor& cu_seqlens,
-                     const torch::Tensor& chunk_offsets);
+                     const torch::Tensor& chunk_offsets,
+                     const std::optional<torch::Tensor>& checkpoint_state,
+                     const std::optional<torch::Tensor>& checkpoint_offsets);
 
 void gdn_fwd_o_rdna2(const torch::Tensor& q, const torch::Tensor& k,
                      const torch::Tensor& v_new, const torch::Tensor& h,

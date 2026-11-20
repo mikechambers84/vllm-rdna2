@@ -59,7 +59,8 @@ def _use_rdna2_gdn(q, k, v, beta, g, cu_seqlens, initial_state) -> bool:
 
 def _chunk_gated_delta_rule_fwd_rdna2(
     q, k, v, g, beta, scale, initial_state, output_final_state, cu_seqlens,
-    chunk_indices, chunk_offsets, core_attn_out,
+    chunk_indices, chunk_offsets, core_attn_out, checkpoint_state=None,
+    checkpoint_offsets=None,
 ):
     """gfx1030: the whole chunked pipeline in three HIP kernels (WY step with
     the (I + A)^-1 matrix kept on chip, state recurrence, output)."""
@@ -80,9 +81,11 @@ def _chunk_gated_delta_rule_fwd_rdna2(
     final_state = (
         k.new_empty(N, H, V, K, dtype=torch.float32) if output_final_state else None
     )
+    if checkpoint_offsets is not None:
+        checkpoint_offsets = checkpoint_offsets.to(torch.int32).contiguous()
     ops.gdn_fwd_h_rdna2(
         k, w, u, g_cum, initial_state, h, v_new, final_state, cu_seqlens,
-        chunk_offsets,
+        chunk_offsets, checkpoint_state, checkpoint_offsets,
     )
     if core_attn_out is not None:
         o = core_attn_out[: v.numel()].view(*v.shape)
@@ -110,7 +113,10 @@ def chunk_gated_delta_rule_fwd(
     checkpoint_state: torch.Tensor | None = None,
     checkpoint_offsets: torch.Tensor | None = None,
 ):
-    if _use_rdna2_gdn(q, k, v, beta, g, cu_seqlens, initial_state):
+    if _use_rdna2_gdn(q, k, v, beta, g, cu_seqlens, initial_state) and (
+        checkpoint_state is None
+        or checkpoint_state.dtype in (torch.float32, torch.float16, torch.bfloat16)
+    ):
         bf16 = q.dtype == torch.bfloat16
         if bf16:
             # fp16 kernels: q and k are l2-normalized, v saturates at fp16's
@@ -122,6 +128,7 @@ def chunk_gated_delta_rule_fwd(
         g, o, w, h, v_new, final_state = _chunk_gated_delta_rule_fwd_rdna2(
             q, k, v, g, beta, scale, initial_state, output_final_state,
             cu_seqlens, chunk_indices, chunk_offsets, core_attn_out,
+            checkpoint_state, checkpoint_offsets,
         )
         if bf16:
             if bf16_out is not None:

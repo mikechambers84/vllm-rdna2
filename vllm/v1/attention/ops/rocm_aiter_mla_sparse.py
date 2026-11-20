@@ -612,10 +612,11 @@ def fp8_paged_mqa_logits_torch(
             )
             s = torch.relu(s) * weight_slice[..., None]
             s = s.sum(dim=0)
-            logits[
-                i * next_n : (i + 1) * next_n,
-                block_rk * block_size : (block_rk + 1) * block_size,
-            ] = torch.where(k_offsets[None, :] <= q_offsets[:, None], s, float("-inf"))
+            s = torch.where(k_offsets[None, :] <= q_offsets[:, None], s, float("-inf"))
+            # The last block may run past max_model_len.
+            start = block_rk * block_size
+            width = min(block_size, max_model_len - start)
+            logits[i * next_n : (i + 1) * next_n, start : start + width] = s[:, :width]
     return logits
 
 

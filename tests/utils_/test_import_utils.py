@@ -85,14 +85,19 @@ class TestHasModule:
             assert _has_module("fake_native_ext") is False
 
     def test_returns_false_when_find_spec_raises(self):
-        """`find_spec` itself can raise for dotted names whose parent package
-        fails to import. This should be treated as the module being unavailable.
+        """`find_spec` itself raises for dotted names whose parent package is
+        not installed. That is an unavailable module, not a failed import to
+        warn about.
         """
-        with patch(
-            "vllm.utils.import_utils.importlib.util.find_spec",
-            side_effect=ModuleNotFoundError("No module named 'fake_parent'"),
+        with (
+            patch(
+                "vllm.utils.import_utils.importlib.util.find_spec",
+                side_effect=ModuleNotFoundError("No module named 'fake_parent'"),
+            ),
+            patch("vllm.utils.import_utils.logger") as logger,
         ):
             assert _has_module("fake_parent.child") is False
+        logger.warning.assert_not_called()
 
     def test_result_is_cached(self):
         """Verify the @cache decorator prevents repeated imports."""

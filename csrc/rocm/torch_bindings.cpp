@@ -289,7 +289,8 @@ TORCH_LIBRARY_EXPAND(TORCH_EXTENSION_NAME, rocm_ops) {
   rocm_ops.def(
       "gdn_fwd_h_rdna2(Tensor k, Tensor w, Tensor u, Tensor g_cum, Tensor? h0, "
       "Tensor! h, Tensor! v_new, Tensor(a!)? ht, Tensor cu_seqlens, "
-      "Tensor chunk_offsets) -> ()");
+      "Tensor chunk_offsets, Tensor(b!)? checkpoint_state=None, "
+      "Tensor? checkpoint_offsets=None) -> ()");
   rocm_ops.impl("gdn_fwd_h_rdna2", torch::kCUDA, &gdn_fwd_h_rdna2);
   rocm_ops.def(
       "gdn_fwd_o_rdna2(Tensor q, Tensor k, Tensor v_new, Tensor h, "

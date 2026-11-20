@@ -12,6 +12,7 @@ import torch.nn.functional as F
 
 from vllm.platforms import current_platform
 from vllm.third_party.flash_linear_attention.ops import chunk_gated_delta_rule
+from vllm.third_party.flash_linear_attention.ops.chunk import _rdna2_gdn_available
 from vllm.third_party.flash_linear_attention.ops.chunk_delta_h import (
     chunk_gated_delta_rule_fwd_kernel_h_blockdim64,
 )
@@ -40,6 +41,11 @@ def _run(inputs, seq_lens, **kwargs):
     )
 
 
+@pytest.mark.skipif(
+    _rdna2_gdn_available(),
+    reason="gfx1030 runs the HIP kernels, not this Triton kernel "
+    "(test_chunk_gated_delta_rule_rdna2.py covers their checkpoints)",
+)
 @pytest.mark.parametrize("state_dtype", [torch.float32, torch.bfloat16])
 def test_checkpoints_are_states_at_their_offsets(
     state_dtype: torch.dtype, monkeypatch: pytest.MonkeyPatch

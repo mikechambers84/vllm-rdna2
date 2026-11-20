@@ -89,3 +89,66 @@ def test_chunk_gated_delta_rule_varlen(lens, heads, dtype, state_dtype, monkeypa
     assert o.dtype == dtype
     torch.testing.assert_close(o.float(), ref_o, atol=2e-2, rtol=2e-2)
     torch.testing.assert_close(final_state.float(), ref_state, atol=2e-2, rtol=2e-2)
+
+
+@pytest.mark.parametrize("state_dtype", [torch.float32, torch.float16, torch.bfloat16])
+@torch.inference_mode()
+def test_chunk_gated_delta_rule_checkpoints(state_dtype, monkeypatch):
+    """Prefix caching stores mid-prefill states as cache-block states, so a
+    wrong one is served silently on a later prefix hit. Each stored row is the
+    state after its offset (the final state of that prefix, in the row's
+    dtype); offsets off a chunk boundary, 0 or at the end leave rows as they
+    were. On gfx1030 the HIP kernels write them."""
+    torch.manual_seed(0)
+    Hg, H, K = 2, 4, 128
+    seq_lens = [300, 50, 257, 128, 200, 192]
+    offsets = [128, 0, 256, 128, 100, 64]
+    stored = [0, 2, 5]
+    T = sum(seq_lens)
+    q = F.normalize(torch.randn(1, T, Hg, K, device="cuda"), dim=-1).half()
+    k = F.normalize(torch.randn(1, T, Hg, K, device="cuda"), dim=-1).half()
+    v = torch.randn(1, T, H, K, device="cuda").half()
+    g = -torch.rand(1, T, H, device="cuda") * 0.3
+    beta = torch.rand(1, T, H, device="cuda")
+    h0 = torch.randn(len(seq_lens), H, K, K, device="cuda") * 0.1
+    starts = [0, *torch.tensor(seq_lens).cumsum(0).tolist()]
+
+    def run(x, lens, initial_state, **kwargs):
+        cu = torch.tensor([0, *torch.tensor(lens).cumsum(0).tolist()])
+        return chunk_gated_delta_rule(
+            *x,
+            scale=K**-0.5,
+            initial_state=initial_state,
+            output_final_state=True,
+            cu_seqlens=cu.to(device="cuda", dtype=torch.int32),
+            **kwargs,
+        )
+
+    calls = []
+    if chunk._rdna2_gdn_available():
+        hip_h = ops.gdn_fwd_h_rdna2
+
+        def spy(*args) -> None:
+            calls.append(args)
+            hip_h(*args)
+
+        monkeypatch.setattr(ops, "gdn_fwd_h_rdna2", spy)
+
+    inputs = (q, k, v, g, beta)
+    snapshots = torch.full_like(h0, 7.0, dtype=state_dtype)
+    run(
+        inputs,
+        seq_lens,
+        h0,
+        checkpoint_state=snapshots,
+        checkpoint_offsets=torch.tensor(offsets, dtype=torch.int32, device="cuda"),
+    )
+    assert len(calls) == (1 if chunk._rdna2_gdn_available() else 0)
+    skipped = [i for i in range(len(seq_lens)) if i not in stored]
+    assert (snapshots[skipped] == 7.0).all()
+    for i in stored:
+        prefix = tuple(x[:, starts[i] : starts[i] + offsets[i]] for x in inputs)
+        _, expected = run(prefix, [offsets[i]], h0[i : i + 1])
+        torch.testing.assert_close(
+            snapshots[i], expected[0].to(state_dtype), atol=0, rtol=0
+        )

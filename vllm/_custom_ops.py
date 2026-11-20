@@ -2920,12 +2920,26 @@ def gdn_fwd_h_rdna2(
     ht: torch.Tensor | None,
     cu_seqlens: torch.Tensor,
     chunk_offsets: torch.Tensor,
+    checkpoint_state: torch.Tensor | None = None,
+    checkpoint_offsets: torch.Tensor | None = None,
 ) -> None:
     """RDNA2 chunk state recurrence of the varlen gated delta rule (FLA's
     chunk_gated_delta_rule_fwd_h): writes the per-chunk states `h`,
-    `v_new` and, if given, the final states `ht`."""
+    `v_new` and, if given, the final states `ht` and FLA's mid-sequence
+    `checkpoint_state` (int32 `checkpoint_offsets`)."""
     torch.ops._rocm_C.gdn_fwd_h_rdna2(
-        k, w, u, g_cum, h0, h, v_new, ht, cu_seqlens, chunk_offsets
+        k,
+        w,
+        u,
+        g_cum,
+        h0,
+        h,
+        v_new,
+        ht,
+        cu_seqlens,
+        chunk_offsets,
+        checkpoint_state,
+        checkpoint_offsets,
     )
 
 

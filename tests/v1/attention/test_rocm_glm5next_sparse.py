@@ -457,7 +457,8 @@ def test_paged_mqa_logits_reference_mtp_rows_match_single_rows(ctx_per_row):
         block_tables.repeat_interleave(next_n, dim=0),
         max_len,
     )
-    torch.testing.assert_close(mtp, single)
+    # MTP rows scale the keys before the dot product, single rows after it.
+    torch.testing.assert_close(mtp, single, atol=1e-3, rtol=1e-4)
 
 
 def _shuffle_fp8_cache(cache, block_size):

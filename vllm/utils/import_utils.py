@@ -412,6 +412,9 @@ def _has_module(module_name: str) -> bool:
     try:
         if importlib.util.find_spec(module_name) is None:
             return False
+    except ModuleNotFoundError:  # a parent package is not installed
+        return False
+    try:
         importlib.import_module(module_name)
     except Exception:
         logger.warning(
