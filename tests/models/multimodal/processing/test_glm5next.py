@@ -133,3 +133,21 @@ def test_image_encoder_cache_follows_max_pixels_override():
         info.get_num_image_tokens(image_width=size.width, image_height=size.height)
         == 100
     )
+
+
+def test_encoder_cache_follows_per_modality_token_caps():
+    """The Rust frontend applies `videos_kwargs` / `images_kwargs` caps to its
+    own modality only, so profiling must too: capping videos (whose 240000
+    token default the encoder cannot profile on small GPUs) leaves images at
+    the checkpoint's 8000 tokens."""
+    info = _image_info(
+        mm_processor_kwargs={"videos_kwargs": {"max_image_tokens": 100}}
+    )
+    assert info.get_max_image_tokens() == 8000
+    assert info._get_video_max_pixels() == 1568 * 100
+
+    info = _image_info(
+        mm_processor_kwargs={"images_kwargs": {"max_image_tokens": 100}}
+    )
+    assert info.get_max_image_tokens() == 100
+    assert info._get_video_max_pixels() == 1568 * 240000

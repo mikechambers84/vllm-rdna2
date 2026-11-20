@@ -643,17 +643,27 @@ class Glm5NextProcessingInfo(Glm4vProcessingInfo):
             proc.max_image_tokens * pixels_per_token,
         )
 
-    def _get_image_max_pixels(self) -> int:
+    def _max_pixels(self, proc, scope: str) -> int:
+        """`max_pixels`, else `max_image_tokens` as the Rust frontend resolves
+        `mm_processor_kwargs`: flat keys, then the modality's `scope`
+        (`images_kwargs` / `videos_kwargs`), so profiling sizes the items the
+        frontend produces."""
         mm_kwargs = self.ctx.get_merged_mm_kwargs({})
         if (override := mm_kwargs.get("max_pixels")) is not None:
             return int(override)
-        return self._processor_pixel_budget(self.get_hf_processor().image_processor)[1]
+        max_tokens = mm_kwargs.get("max_image_tokens")
+        max_tokens = (mm_kwargs.get(scope) or {}).get("max_image_tokens", max_tokens)
+        if max_tokens is None:
+            return self._processor_pixel_budget(proc)[1]
+        return int(max_tokens) * self._pixels_per_token(proc)
+
+    def _get_image_max_pixels(self) -> int:
+        image_processor = self.get_hf_processor().image_processor
+        return self._max_pixels(image_processor, "images_kwargs")
 
     def _get_video_max_pixels(self) -> int:
-        mm_kwargs = self.ctx.get_merged_mm_kwargs({})
-        if (override := mm_kwargs.get("max_pixels")) is not None:
-            return int(override)
-        return self._processor_pixel_budget(self.get_hf_processor().video_processor)[1]
+        video_processor = self.get_hf_processor().video_processor
+        return self._max_pixels(video_processor, "videos_kwargs")
 
     def _get_max_video_frames(self, max_tokens: int) -> int:
         image_processor = self.get_hf_processor().image_processor

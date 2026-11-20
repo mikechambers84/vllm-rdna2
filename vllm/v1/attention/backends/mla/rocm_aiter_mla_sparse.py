@@ -1093,8 +1093,14 @@ class ROCMAiterMLASparseImpl(SparseMLACommonImpl[ROCMAiterMLASparseMetadata]):
         )
         max_tokens = vllm_config.scheduler_config.max_num_batched_tokens
         q_concat_shape = (max_tokens, num_heads, head_size)
-        (self.q_concat_buffer,) = current_workspace_manager().get_simultaneous(
-            (q_concat_shape, vllm_config.model_config.dtype),
+        q_dtype = vllm_config.model_config.dtype
+        q_device = vllm_config.device_config.device
+        # Persistent, not a view of the scratch workspace: a view taken while
+        # the layers are built pins the buffer the workspace has then (e.g. a
+        # KDA checkpoint reservation) once the workspace grows.
+        self.q_concat_buffer = current_workspace_manager().get_persistent_resource(
+            ("rocm_mla_sparse_q_concat", q_concat_shape, q_dtype),
+            lambda: torch.empty(q_concat_shape, dtype=q_dtype, device=q_device),
         )
         self.qk_rope_head_dim: int = mla_args["qk_rope_head_dim"]
         rank = self.kv_lora_rank
