@@ -29,6 +29,11 @@ from vllm.model_executor.models.interfaces import (
     SupportsPP,
     _require_is_multimodal,
 )
+from vllm.model_executor.models.qwen3_5_mtp import (
+    _uses_target_vocab_layers,
+    _vocab_layers_device,
+    compute_draft_logits,
+)
 from vllm.model_executor.models.qwen3_next import (
     Qwen3NextSparseMoeBlock,
     QwenNextMixtureOfExperts,
@@ -68,10 +73,11 @@ class Qwen3_5MultiTokenPredictor(nn.Module):
         self.mtp_start_layer_idx = config.num_hidden_layers
         self.num_mtp_layers = getattr(config, "mtp_num_hidden_layers", 1)
 
-        self.embed_tokens = VocabParallelEmbedding(
-            self.vocab_size,
-            config.hidden_size,
-        )
+        with _vocab_layers_device():
+            self.embed_tokens = VocabParallelEmbedding(
+                self.vocab_size,
+                config.hidden_size,
+            )
 
         # Workaround: mtp.fc is stored as BF16 in NVFP4 checkpoints but is
         # missing from hf_quant_config.json exclude_modules. Force unquantized.
@@ -222,12 +228,13 @@ class Qwen3_5MTP(LocalArgmaxMixin, nn.Module, SupportsMultiModal, SupportsPP):
         )
 
         if get_pp_group().is_last_rank:
-            self.lm_head = ParallelLMHead(
-                config.vocab_size,
-                config.hidden_size,
-                quant_config=self.quant_config,
-                prefix=maybe_prefix(prefix, "lm_head"),
-            )
+            with _vocab_layers_device():
+                self.lm_head = ParallelLMHead(
+                    config.vocab_size,
+                    config.hidden_size,
+                    quant_config=self.quant_config,
+                    prefix=maybe_prefix(prefix, "lm_head"),
+                )
             if config.tie_word_embeddings:
                 self.lm_head = self.lm_head.tie_weights(self.model.embed_tokens)
         else:
@@ -289,7 +296,7 @@ class Qwen3_5MTP(LocalArgmaxMixin, nn.Module, SupportsMultiModal, SupportsPP):
         hidden_states: torch.Tensor,
         spec_step_idx: int = 0,
     ) -> torch.Tensor | None:
-        return self.logits_processor(self.lm_head, hidden_states)
+        return compute_draft_logits(self.lm_head, self.logits_processor, hidden_states)
 
     def get_top_tokens(
         self,
@@ -311,8 +318,11 @@ class Qwen3_5MTP(LocalArgmaxMixin, nn.Module, SupportsMultiModal, SupportsPP):
                     continue
                 if name.startswith("mtp."):
                     name = name.replace("mtp.", "model.")
-                elif "embed_tokens" in name:
-                    name = name.replace("language_model.", "")
+                elif any(key in name for key in ["embed_tokens", "lm_head"]):
+                    if _uses_target_vocab_layers():
+                        continue  # replaced by the target model's
+                    if "embed_tokens" in name:
+                        name = name.replace("language_model.", "")
                 yield name, weight
 
         loader = AutoWeightsLoader(self)
