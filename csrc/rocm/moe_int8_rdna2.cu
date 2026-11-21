@@ -129,14 +129,16 @@ __device__ __forceinline__ void stage_row(__half* dst, const __half* src,
 }
 
 // One workgroup per (token, expert) pair and WAVES output columns; each wave
-// computes gate row j and up row I + j and writes silu(gate) * up.
+// computes gate row j and up row I + j and writes silu(gate) * up, with gate
+// and up clamped first when lim > 0.
 template <W8 F>
 __global__ void __launch_bounds__(WAVES* WARP32)
     gate_up_silu_kernel(const __half* __restrict__ x,
                         const int32_t* __restrict__ topk_ids,
                         const int8_t* __restrict__ w13, const Scales s13,
                         __half* __restrict__ act, const int E, const int H,
-                        const int I, const int topk, const int ldx) {
+                        const int I, const int topk, const int ldx,
+                        const float lim) {
   extern __shared__ __align__(16) __half sx[];
   const int pair = blockIdx.y;
   const long e = topk_ids[pair];
@@ -177,6 +179,10 @@ __global__ void __launch_bounds__(WAVES* WARP32)
         gate *= gate_s[0];
         up *= up_s[0];
       }
+    }
+    if (lim > 0.f) {
+      gate = fminf(gate, lim);
+      up = fminf(fmaxf(up, -lim), lim);
     }
     act[(long)pair * I + j] = __float2half(gate / (1.f + __expf(-gate)) * up);
   }
@@ -229,7 +235,7 @@ template <W8 F>
 __global__ void gate_up_silu_kernel(const __half*, const int32_t*,
                                     const int8_t*, const Scales, __half*,
                                     const int, const int, const int, const int,
-                                    const int) {}
+                                    const int, const float) {}
 template <W8 F>
 __global__ void down_sum_kernel(const __half*, const int32_t*, const float*,
                                 const int8_t*, const Scales, __half*, const int,
@@ -251,7 +257,7 @@ void moe_w8_decode(const char* name, torch::Tensor& output,
                    const torch::Tensor& x, const torch::Tensor& topk_ids,
                    const torch::Tensor& topk_weights, const torch::Tensor& w13,
                    const Scales& s13, const torch::Tensor& w2, const Scales& s2,
-                   torch::Tensor& act) {
+                   torch::Tensor& act, const double swiglu_limit) {
   using namespace vllm::moe_int8_rdna2;
   TORCH_CHECK(x.dtype() == torch::kFloat16 &&
                   output.dtype() == torch::kFloat16 &&
@@ -286,7 +292,7 @@ void moe_w8_decode(const char* name, torch::Tensor& output,
       <<<dim3((I + WAVES - 1) / WAVES, M * topk), block, H * sizeof(__half),
          stream>>>((const __half*)x.data_ptr(), topk_ids.data_ptr<int32_t>(),
                    (const int8_t*)w13.data_ptr(), s13, (__half*)act.data_ptr(),
-                   E, H, I, topk, x.stride(0));
+                   E, H, I, topk, x.stride(0), (float)swiglu_limit);
   down_sum_kernel<F><<<dim3((H + WAVES - 1) / WAVES, M), block,
                        topk * I * sizeof(__half), stream>>>(
       (const __half*)act.data_ptr(), topk_ids.data_ptr<int32_t>(),
@@ -328,13 +334,13 @@ Scales fp8_scales(const torch::Tensor& w, const torch::Tensor& s,
 // topk_ids [M, topk] int32, topk_weights [M, topk] fp32, w13 [E, 2I, H] and
 // w2 [E, H, I] int8, s13 [E, 2I, 1] and s2 [E, H, 1] fp32, act a
 // [M * topk, I] fp16 workspace. H and I multiples of 16 with H and topk * I
-// at most 32768.
+// at most 32768. swiglu_limit > 0 clamps gate and up before silu(gate) * up.
 void moe_int8_decode_rdna2(torch::Tensor& output, const torch::Tensor& x,
                            const torch::Tensor& topk_ids,
                            const torch::Tensor& topk_weights,
                            const torch::Tensor& w13, const torch::Tensor& s13,
                            const torch::Tensor& w2, const torch::Tensor& s2,
-                           torch::Tensor& act) {
+                           torch::Tensor& act, double swiglu_limit) {
   TORCH_CHECK(w13.dtype() == torch::kInt8 && w2.dtype() == torch::kInt8 &&
                   s13.dtype() == torch::kFloat32 &&
                   s2.dtype() == torch::kFloat32 && s13.is_contiguous() &&
@@ -347,7 +353,8 @@ void moe_int8_decode_rdna2(torch::Tensor& output, const torch::Tensor& x,
   moe_w8_decode<W8::kInt8>("moe_int8_decode_rdna2", output, x, topk_ids,
                            topk_weights, w13,
                            Scales{s13.data_ptr<float>(), 1, 31, N13, 1}, w2,
-                           Scales{s2.data_ptr<float>(), 1, 31, N2, 1}, act);
+                           Scales{s2.data_ptr<float>(), 1, 31, N2, 1}, act,
+                           swiglu_limit);
 }
 
 // Same as moe_int8_decode_rdna2 for float8_e4m3fn w13 / w2 with scales as in
@@ -358,15 +365,16 @@ void moe_fp8_decode_rdna2(torch::Tensor& output, const torch::Tensor& x,
                           const torch::Tensor& w13, const torch::Tensor& s13,
                           const torch::Tensor& w2, const torch::Tensor& s2,
                           int64_t block_n, int64_t block_k,
-                          torch::Tensor& act) {
+                          torch::Tensor& act, double swiglu_limit) {
   const Scales a = fp8_scales(w13, s13, block_n, block_k);
   const Scales b = fp8_scales(w2, s2, block_n, block_k);
   TORCH_CHECK((a.cols > 1) == (b.cols > 1),
               "moe_fp8_decode_rdna2 needs w13 and w2 scales of one kind");
   if (a.cols > 1)
     moe_w8_decode<W8::kFp8Block>("moe_fp8_decode_rdna2", output, x, topk_ids,
-                                 topk_weights, w13, a, w2, b, act);
+                                 topk_weights, w13, a, w2, b, act,
+                                 swiglu_limit);
   else
     moe_w8_decode<W8::kFp8>("moe_fp8_decode_rdna2", output, x, topk_ids,
-                            topk_weights, w13, a, w2, b, act);
+                            topk_weights, w13, a, w2, b, act, swiglu_limit);
 }

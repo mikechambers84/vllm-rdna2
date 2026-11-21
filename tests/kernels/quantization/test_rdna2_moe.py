@@ -101,12 +101,15 @@ def test_moe_wna16_decode_rdna2_matches_reference(num_tokens, group, zp, dims, l
     assert ((out.float() - ref).norm() / ref.norm()).item() < 2e-3
 
 
+@pytest.mark.parametrize("limit", [0.0, 0.05])
 @pytest.mark.parametrize("num_tokens", [1, 3, 32])
-@pytest.mark.parametrize("dims", [(H, INTER), (1040, 176)])
-def test_moe_int8_decode_rdna2_matches_reference(num_tokens, dims):
+@pytest.mark.parametrize("dims", [(H, INTER), (1040, 176), (1536, 1536)])
+def test_moe_int8_decode_rdna2_matches_reference(num_tokens, dims, limit):
     """int8 weights are converted exactly to fp16 and the activations stay
     fp16, so the error is fp16 rounding (the W8A8 path also quantizes the
-    activations, ~2e-2); H and I need only be multiples of 16."""
+    activations, ~2e-2); H and I need only be multiples of 16. A SwiGLU limit
+    (HY4-Flash clamps its routed experts; 0.05 clamps many of these values)
+    matches the clamped reference."""
     from vllm import _custom_ops as ops
 
     hidden, inter = dims
@@ -125,9 +128,13 @@ def test_moe_int8_decode_rdna2_matches_reference(num_tokens, dims):
     out = torch.empty(num_tokens, hidden, dtype=torch.float16, device="cuda")
     act = torch.empty(num_tokens * TOPK, inter, dtype=torch.float16, device="cuda")
 
-    ops.moe_int8_decode_rdna2(out, x, topk_ids, topk_weights, w13, s13, w2, s2, act)
+    ops.moe_int8_decode_rdna2(
+        out, x, topk_ids, topk_weights, w13, s13, w2, s2, act, limit
+    )
 
-    ref = _reference(x, topk_weights, topk_ids, w13.float() * s13, w2.float() * s2)
+    ref = _reference(
+        x, topk_weights, topk_ids, w13.float() * s13, w2.float() * s2, limit
+    )
     assert ((out.float() - ref).norm() / ref.norm()).item() < 2e-3
 
 

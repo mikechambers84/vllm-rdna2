@@ -2144,12 +2144,23 @@ def moe_int8_decode_rdna2(
     w2: torch.Tensor,
     w2_scale: torch.Tensor,
     act: torch.Tensor,
+    swiglu_limit: float = 0.0,
 ) -> None:
     """RDNA2 int8-weight fused-MoE decode (SiLU, per-channel scales) into
     `output`, on the `[E, N, K]` int8 weights of the Triton int8 path, with
-    fp16 activations; `act` is a `[M * topk, I]` workspace."""
+    fp16 activations; `act` is a `[M * topk, I]` workspace. `swiglu_limit` > 0
+    clamps the activation to silu(min(gate, L)) * clamp(up, -L, L)."""
     torch.ops._rocm_C.moe_int8_decode_rdna2(
-        output, x, topk_ids, topk_weights, w13, w13_scale, w2, w2_scale, act
+        output,
+        x,
+        topk_ids,
+        topk_weights,
+        w13,
+        w13_scale,
+        w2,
+        w2_scale,
+        act,
+        swiglu_limit,
     )
 
 
@@ -2165,11 +2176,13 @@ def moe_fp8_decode_rdna2(
     block_n: int,
     block_k: int,
     act: torch.Tensor,
+    swiglu_limit: float = 0.0,
 ) -> None:
     """RDNA2 fp8-weight fused-MoE decode (SiLU) into `output`, on `[E, N,
     K]` float8_e4m3fn weights with fp32 scales `[E]` or `[E, ceil(N /
     block_n), S]` (S == 1 or ceil(K / block_k)), with fp16 activations;
-    `act` is a `[M * topk, I]` workspace."""
+    `act` is a `[M * topk, I]` workspace. `swiglu_limit` as in
+    `moe_int8_decode_rdna2`."""
     torch.ops._rocm_C.moe_fp8_decode_rdna2(
         output,
         x,
@@ -2182,6 +2195,7 @@ def moe_fp8_decode_rdna2(
         block_n,
         block_k,
         act,
+        swiglu_limit,
     )
 
 

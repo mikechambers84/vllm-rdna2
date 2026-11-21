@@ -89,14 +89,15 @@ void moe_int8_decode_rdna2(torch::Tensor& output, const torch::Tensor& x,
                            const torch::Tensor& topk_weights,
                            const torch::Tensor& w13, const torch::Tensor& s13,
                            const torch::Tensor& w2, const torch::Tensor& s2,
-                           torch::Tensor& act);
+                           torch::Tensor& act, double swiglu_limit);
 
 void moe_fp8_decode_rdna2(torch::Tensor& output, const torch::Tensor& x,
                           const torch::Tensor& topk_ids,
                           const torch::Tensor& topk_weights,
                           const torch::Tensor& w13, const torch::Tensor& s13,
                           const torch::Tensor& w2, const torch::Tensor& s2,
-                          int64_t block_n, int64_t block_k, torch::Tensor& act);
+                          int64_t block_n, int64_t block_k, torch::Tensor& act,
+                          double swiglu_limit);
 
 void moe_fp8_gemm_rdna2(torch::Tensor& output, const torch::Tensor& a,
                         const torch::Tensor& w, const torch::Tensor& scales,
