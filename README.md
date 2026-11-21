@@ -9,7 +9,7 @@ FP8, bf16 dot products), and runs most hot paths on slow fallbacks.
 
 This fork fixes the platform layer and adds hand-written HIP kernels built on
 what gfx1030 does have: `v_dot2_f32_f16`, `v_dot4_i32_i8`, wave32 and 64 KB of
-LDS. It is based on upstream commit `3213796cd3` (2026-11-09). Everything was
+LDS. It is based on upstream commit `82c6b325b4` (2026-11-19). Everything was
 developed and tested on a host with 8x Radeon Pro V620 (32 GB each, PCIe only,
 no XGMI).
 
@@ -58,7 +58,8 @@ no XGMI).
 - HIP paged prefill attention (head 64 / 128 / 256, GQA packing, sliding window,
   softcap, sinks) at 2.5-4.6x Triton's speed.
 - Split-KV decode and speculative-verify attention, and fp8 KV cache support.
-- A HIP chunked gated-delta (GDN) pipeline for Qwen3.x linear-attention layers.
+- A HIP chunked gated-delta (GDN) pipeline for Qwen3.x linear-attention layers,
+  including the states prefix caching stores mid-prefill.
 - Model-specific kernels:
     - Qwen3.8-Flash-Next: QSA sparse attention, PLE short conv and the
       hyper-connection gate.
@@ -97,11 +98,12 @@ were not measured.
 | --- | --- | --- | --- | --- |
 | Qwen3.8-27B W4A16 | 1 | 38.8 ms/token | 23.2 s, 353 tok/s; 11.8 s, 694 tok/s with the W4A8 opt-in | throughput 321 tok/s, MTP chat 42 tok/s; 3.8-5.1x stock vLLM |
 | Qwen3.8-27B W8A8 | 1 | | 11.7 s, 700 tok/s | throughput 454 tok/s; 1.8-2.1x stock vLLM |
-| Qwen3.6-35B-A3B W4A16 | 1 | 14.3 ms/token | 3.0 s, 2730 tok/s; 2.5 s, 3270 tok/s with the W4A8 opt-in | throughput 1738 tok/s, 1970 with the K-major opt-in; MTP chat 120 tok/s |
+| Qwen3.6-35B-A3B W4A16 | 1 | 14.3 ms/token | 3.0 s, 2730 tok/s; 2.5 s, 3270 tok/s with the W4A8 opt-in | throughput 1738 tok/s, 1970 with the K-major opt-in; MTP chat 124 tok/s |
 | Qwen3.6-35B-A3B W8A8 | 2 (PP=2) | | 8K prompt + 256 output tokens: 6.7 s | throughput 2462 tok/s |
 | Qwen3.8-Flash-Next INT4 (fp8 KV, int8 / W4A8 opt-ins) | 4 (PP=4) | 21.5 ms/token; 12.8 ms/token with MTP k=2 | 2.74 s, 2990 tok/s | batch-8 decode 34.2 ms/step |
-| Qwen3.8-Flash-Next W4A16 experts (fp8 KV, int8 / W4A8 opt-ins) | 8 (PP=8) | 11.9 ms/token with MTP k=3 | 2.34 s, 3510 tok/s | |
-| GLM-5.3-Flash W4A16 | 8 (PP=8) | 32.2 ms/token, 31 tok/s with MTP k=2 | 4.95 s, 1650 tok/s | 32K / 64K prefill 17.7 / 35.2 s |
+| Qwen3.8-Flash-Next W4A16 experts (fp8 KV, int8 / W4A8 opt-ins) | 8 (PP=8) | 12.4 ms/token with MTP k=3 | 2.33 s, 3520 tok/s | batch-8 decode 45.0 ms/step |
+| Qwen3.8-Flash-Next W8A8 experts (fp8 KV, int8 / W4A8 opt-ins) | 8 (PP=8) | 14.1 ms/token with MTP k=3 | 2.29 s, 3570 tok/s | |
+| GLM-5.3-Flash W4A16 | 8 (PP=8) | 31.9 ms/token, 31 tok/s with MTP k=2 | 4.92 s, 1665 tok/s | 32K / 64K prefill 17.6 / 34.9 s |
 
 ### Building
 
@@ -151,19 +153,28 @@ MTP, tool calling, reasoning, images and video (the GLM-5.3-Flash
 figures above use these settings):
 
 ```bash
-VLLM_ROCM_KMAJOR_UNQUANTIZED=1 VLLM_PP_LAYER_PARTITION=7,6,5,5,6,6,6,4 \
+VLLM_USE_RUST_FRONTEND=1 VLLM_ROCM_KMAJOR_UNQUANTIZED=1 \
+VLLM_PP_LAYER_PARTITION=7,6,5,5,6,6,6,4 \
 vllm serve /path/to/GLM-5.3-Flash-W4A16 \
     --dtype float16 --pipeline-parallel-size 8 \
     --max-model-len 262144 --max-num-batched-tokens 384 --max-num-seqs 32 \
     --gpu-memory-utilization 0.95 \
     --speculative-config '{"method": "mtp", "num_speculative_tokens": 2}' \
-    --tool-call-parser glm47 --enable-auto-tool-choice --reasoning-parser glm47
+    --tool-call-parser glm47 --enable-auto-tool-choice --reasoning-parser glm47 \
+    --mm-processor-kwargs '{"videos_kwargs": {"max_image_tokens": 32000}}'
 ```
 
 `VLLM_PP_LAYER_PARTITION` balances the stages: the MTP layer adds about 5 GiB
 to the last one, and the first carries the three dense layers. Smaller prefill
 chunks (`--max-num-batched-tokens` 384) keep all eight stages busy on a long
 prompt.
+
+Upstream vLLM preprocesses GLM-5.3-Flash images and video only in the Rust
+frontend (`VLLM_USE_RUST_FRONTEND=1`); the Python server runs it text-only
+(`--limit-mm-per-prompt '{"image": 0, "video": 0}'`). The checkpoint allows
+videos of up to 240000 vision tokens, which the vision tower cannot profile
+on the first stage of a 32 GB card, so `--mm-processor-kwargs` caps videos at
+32000 tokens; images keep their 8000.
 
 The gfx1030 kernels are selected automatically. These environment variables
 control the opt-in paths, which trade memory or accuracy for speed:
@@ -182,8 +193,8 @@ control the opt-in paths, which trade memory or accuracy for speed:
 | `VLLM_UVA_INPUT_EMBEDDINGS` | 0 | Keep untied input embeddings in pinned host memory to free device memory for the KV cache or a drafter |
 
 Not supported on gfx1030: FP8 compute (FP8 checkpoints run weight-only),
-TileLang, and aiter kernels. GLM-5.3-Flash has been tested with text, images
-and video.
+TileLang, and aiter kernels. GLM-5.3-Flash has been tested with text, images,
+video and tool calls through the Rust frontend.
 
 ---
 
