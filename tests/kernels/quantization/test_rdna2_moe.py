@@ -541,6 +541,146 @@ def test_rdna2_wna16_experts_run_bf16_in_fp16(num_tokens, monkeypatch):
     assert ((out.float() - ref).norm() / ref.norm()).item() < 1e-2
 
 
+_RDNA2_MOE_OPS = (
+    "moe_wna16_decode_rdna2",
+    "moe_wna16_skinny_rdna2",
+    "moe_wna16_kslice_rdna2",
+    "moe_wna16_gemm_rdna2",
+    "moe_w4a8_gemm_rdna2",
+    "moe_int8_decode_rdna2",
+    "moe_int8_skinny_rdna2",
+    "moe_int8_gemm_rdna2",
+    "moe_fp8_decode_rdna2",
+    "moe_fp8_gemm_rdna2",
+)
+
+
+@pytest.mark.parametrize(
+    "kind,path,num_tokens,dims",
+    [
+        ("int4", "moe_wna16_decode_rdna2", 3, (H, INTER)),
+        ("int4", "moe_wna16_skinny_rdna2", 16, (H, INTER)),
+        ("int4", "moe_wna16_kslice_rdna2", 16, (2048, 2048)),
+        ("int4", "moe_wna16_gemm_rdna2", 256, (H, INTER)),
+        ("int4", "moe_w4a8_gemm_rdna2", 256, (H, INTER)),
+        ("int4", "triton", 64, (H, INTER)),
+        ("int8", "moe_int8_decode_rdna2", 3, (H, INTER)),
+        ("int8", "moe_int8_skinny_rdna2", 48, (H, INTER)),
+        ("int8", "moe_int8_gemm_rdna2", 256, (H, INTER)),
+        ("int8", "triton", 64, (H, INTER)),
+        ("fp8", "moe_fp8_decode_rdna2", 3, (H, INTER)),
+        ("fp8", "moe_fp8_gemm_rdna2", 64, (H, INTER)),
+    ],
+)
+@torch.inference_mode()
+def test_rdna2_experts_apply_swiglu_limit(kind, path, num_tokens, dims, monkeypatch):
+    """Every gfx1030 MoE path (fused decode kernels, skinny / k-slice / tiled /
+    W4A8 GEMMs with the separate activation, Triton fallback) applies the
+    model's SwiGLU limit (GLM-5.3-Flash and HY4-Flash clamp gate and up).
+    The decode kernels once ignored it, decoding unclamped while prefill
+    clamped. The limit is the median |gate_up|, so it clamps half the values
+    and moves the output ~80% (the unclamped result must miss by over 20%).
+    Clamping half the values also shrinks the output, so the relative error
+    of the fp16 paths sits a little above the unclamped tests'."""
+    import dataclasses
+
+    from tests.kernels.moe.utils import make_dummy_moe_config
+    from vllm import _custom_ops as ops
+    from vllm.model_executor.layers.fused_moe.config import (
+        fp8_w8a16_moe_quant_config,
+        int4_w4a16_moe_quant_config,
+        int8_w8a8_moe_quant_config,
+    )
+    from vllm.model_executor.layers.fused_moe.experts import rdna2_moe
+
+    hidden, inter = dims
+    torch.manual_seed(0)
+    if path == "moe_w4a8_gemm_rdna2":
+        monkeypatch.setenv("VLLM_ROCM_W4A8_PREFILL", "1")
+    if kind == "int4":
+        w4a8 = path == "moe_w4a8_gemm_rdna2"
+        w13, s13, w13_ref, _ = _experts(2 * inter, hidden, requant=w4a8)
+        w2, s2, w2_ref, _ = _experts(hidden, inter, requant=w4a8)
+        cls = rdna2_moe.Rdna2WNA16Experts
+        quant = int4_w4a16_moe_quant_config(s13, s2, block_shape=[0, GROUP])
+        tol = 2e-2 if w4a8 else 2e-3
+    elif kind == "int8":
+        w13 = torch.randint(
+            -127, 128, (E, 2 * inter, hidden), dtype=torch.int8, device="cuda"
+        )
+        w2 = torch.randint(
+            -127, 128, (E, hidden, inter), dtype=torch.int8, device="cuda"
+        )
+        s13 = torch.rand(E, 2 * inter, 1, device="cuda") * 2e-4 + 1e-5
+        s2 = torch.rand(E, hidden, 1, device="cuda") * 2e-4 + 1e-5
+        w13_ref, w2_ref = w13.float() * s13, w2.float() * s2
+        cls = rdna2_moe.Rdna2Int8Experts
+        quant = int8_w8a8_moe_quant_config(
+            s13, s2, None, None, per_act_token_quant=True, per_out_ch_quant=True
+        )
+        # The prefill paths also quantize the activations per token.
+        tol = 2e-3 if path == "moe_int8_decode_rdna2" else 3e-2
+    else:
+        w13, s13, w13_ref, _ = _fp8_experts(2 * inter, hidden, "channel")
+        w2, s2, w2_ref, _ = _fp8_experts(hidden, inter, "channel")
+        cls = rdna2_moe.Rdna2Fp8Experts
+        quant = fp8_w8a16_moe_quant_config(s13, s2)
+        tol = 1e-2
+    x = torch.randn(num_tokens, hidden, dtype=torch.float16, device="cuda") * 0.5
+    topk_weights, topk_ids = torch.topk(
+        torch.randn(num_tokens, E, device="cuda").softmax(-1), TOPK, dim=-1
+    )
+    gate_up = torch.einsum("tk,tjnk->tjn", x.float(), w13_ref[topk_ids])
+    limit = float(gate_up.abs().flatten()[: 1 << 20].median())
+    experts = cls(
+        dataclasses.replace(make_dummy_moe_config(), swiglu_limit=limit), quant
+    )
+    if path == "triton":
+        monkeypatch.setattr(cls, "_use_decode_kernel", lambda *a, **k: False)
+        monkeypatch.setattr(cls, "_use_prefill_kernel", lambda *a, **k: False)
+    calls = []
+    for name in _RDNA2_MOE_OPS:
+        op = getattr(ops, name)
+
+        def spy(*args, _op=op, _name=name, **kwargs):
+            calls.append(_name)
+            _op(*args, **kwargs)
+
+        monkeypatch.setattr(ops, name, spy)
+    ws = torch.empty(
+        num_tokens * TOPK * max(2 * inter, hidden), dtype=x.dtype, device="cuda"
+    )
+    out = torch.empty(num_tokens, hidden, dtype=x.dtype, device="cuda")
+
+    experts.apply(
+        out,
+        x,
+        w13,
+        w2,
+        topk_weights,
+        topk_ids,
+        MoEActivation.SILU,
+        E,
+        None,
+        None,
+        None,
+        ws,
+        ws.clone(),
+        None,
+        False,
+    )
+
+    assert calls == [] if path == "triton" else path in calls, calls
+    ref = _reference(x, topk_weights, topk_ids, w13_ref, w2_ref, limit)
+    unclamped = _reference(x, topk_weights, topk_ids, w13_ref, w2_ref)
+
+    def rel(r):
+        return ((out.float() - r).norm() / r.norm()).item()
+
+    assert rel(ref) < tol, (rel(ref), rel(unclamped))
+    assert rel(unclamped) > 0.2, (rel(ref), rel(unclamped))
+
+
 def test_fp8_moe_selects_rdna2_backend(default_vllm_config):
     """Block-scaled FP8 MoE layers pick the weight-only gfx1030 experts."""
     from tests.kernels.moe.utils import make_dummy_moe_config
