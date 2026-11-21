@@ -425,8 +425,9 @@ def _w8a8_layer(n: int, k: int, static: bool):
 @pytest.mark.parametrize("static", [False, True])
 @pytest.mark.parametrize("num_tokens", [1, 40])
 def test_w8a8_linear_matches_triton(n, static, num_tokens):
-    """A symmetric W8A8 layer gives the Triton kernel's results exactly; one
-    whose output size is not a multiple of 4 keeps the Triton layout."""
+    """A symmetric W8A8 layer gives the Triton kernel's results (up to fp16
+    rounding ties, which the two fp32 epilogues may round apart); one whose
+    output size is not a multiple of 4 keeps the Triton layout."""
     from vllm.model_executor.kernels.linear import (
         RDNA2Int8ScaledMMLinearKernel,
         TritonInt8ScaledMMLinearKernel,
@@ -451,7 +452,8 @@ def test_w8a8_linear_matches_triton(n, static, num_tokens):
     x = torch.randn(num_tokens, 512, dtype=torch.float16, device="cuda")
     out = rdna2.apply_weights(layer, x, bias)
     ref = triton.apply_weights(ref_layer, x, bias)
-    torch.testing.assert_close(out, ref, atol=0, rtol=0)
+    # One fp16 ulp (2^-10 relative) covers a tie rounded the other way.
+    torch.testing.assert_close(out, ref, atol=1e-5, rtol=2**-10)
 
 
 @pytest.mark.skipif(not on_gfx1030(), reason="gfx1030 only")

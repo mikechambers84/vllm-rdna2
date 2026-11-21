@@ -197,6 +197,21 @@ def rotary_embedding(
         )
 
 
+def rotary_embedding_out(
+    positions: torch.Tensor,
+    query: torch.Tensor,
+    key: torch.Tensor | None,
+    query_out: torch.Tensor,
+    key_out: torch.Tensor | None,
+    head_size: int,
+    cos_sin_cache: torch.Tensor,
+    is_neox: bool,
+) -> None:
+    torch.ops._C.rotary_embedding_out(
+        positions, query, key, query_out, key_out, head_size, cos_sin_cache, is_neox
+    )
+
+
 # layer norm ops
 def rms_norm(
     out: torch.Tensor,
@@ -2905,12 +2920,26 @@ def gdn_fwd_h_rdna2(
     ht: torch.Tensor | None,
     cu_seqlens: torch.Tensor,
     chunk_offsets: torch.Tensor,
+    checkpoint_state: torch.Tensor | None = None,
+    checkpoint_offsets: torch.Tensor | None = None,
 ) -> None:
     """RDNA2 chunk state recurrence of the varlen gated delta rule (FLA's
     chunk_gated_delta_rule_fwd_h): writes the per-chunk states `h`,
-    `v_new` and, if given, the final states `ht`."""
+    `v_new` and, if given, the final states `ht` and FLA's mid-sequence
+    `checkpoint_state` (int32 `checkpoint_offsets`)."""
     torch.ops._rocm_C.gdn_fwd_h_rdna2(
-        k, w, u, g_cum, h0, h, v_new, ht, cu_seqlens, chunk_offsets
+        k,
+        w,
+        u,
+        g_cum,
+        h0,
+        h,
+        v_new,
+        ht,
+        cu_seqlens,
+        chunk_offsets,
+        checkpoint_state,
+        checkpoint_offsets,
     )
 
 
@@ -3009,6 +3038,16 @@ def wvSplitKQ(
     out = torch.empty((b.shape[0], a.shape[0]), dtype=out_dtype, device=b.device)
     torch.ops._rocm_C.wvSplitKQ(a, b, bias, out, scale_a, scale_b, cu_count)
     return out
+
+
+def swmmac_gemm(
+    a: torch.Tensor,
+    b: torch.Tensor,
+    logical_m: int,
+    cu_count: int,
+    bias: torch.Tensor | None = None,
+) -> torch.Tensor:
+    return torch.ops._rocm_C.swmmacGEMM(a, b, bias, logical_m, cu_count)
 
 
 # moe
@@ -3545,7 +3584,10 @@ def fused_qknorm_rope_cache(
     rotary_dim: int,
     eps: float,
     norm_weight_bias: float = 0.0,
+    *,
+    q_dtype: torch.dtype | None = None,
     kv_cache_dtype: str = "auto",
+    q_scale: float = 1.0,
     k_scale: torch.Tensor | None = None,
     v_scale: torch.Tensor | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
@@ -3556,7 +3598,11 @@ def fused_qknorm_rope_cache(
     """
     if rotary_dim < 0 or rotary_dim > head_dim or rotary_dim % 8:
         raise ValueError("rotary_dim must be a multiple of 8 in [0, head_dim]")
-    q = qkv.new_empty((qkv.shape[0], num_q_heads * head_dim))
+    q = torch.empty(
+        (qkv.shape[0], num_q_heads * head_dim),
+        device=qkv.device,
+        dtype=qkv.dtype if q_dtype is None else q_dtype,
+    )
     k = qkv.new_empty((qkv.shape[0], num_kv_heads * head_dim))
     v = torch.empty_like(k)
     cos, sin = cos_sin_cache.chunk(2, dim=-1)
@@ -3580,6 +3626,7 @@ def fused_qknorm_rope_cache(
         eps,
         norm_weight_bias,
         kv_cache_dtype,
+        q_scale,
         k_scale,
         v_scale,
     )
@@ -3864,16 +3911,9 @@ def concat_and_cache_mla(
     scale: torch.Tensor,
     skip_scale: bool = False,
 ) -> None:
-    if current_platform.is_xpu():
-        if skip_scale:
-            raise NotImplementedError("skip_scale is not supported on XPU")
-        torch.ops._C_cache_ops.concat_and_cache_mla(
-            kv_c, k_pe, kv_cache, slot_mapping, kv_cache_dtype, scale
-        )
-    else:
-        torch.ops._C_cache_ops.concat_and_cache_mla(
-            kv_c, k_pe, kv_cache, slot_mapping, kv_cache_dtype, scale, skip_scale
-        )
+    torch.ops._C_cache_ops.concat_and_cache_mla(
+        kv_c, k_pe, kv_cache, slot_mapping, kv_cache_dtype, scale, skip_scale
+    )
 
 
 def concat_and_cache_mla_grouped(

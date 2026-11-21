@@ -412,6 +412,9 @@ def _has_module(module_name: str) -> bool:
     try:
         if importlib.util.find_spec(module_name) is None:
             return False
+    except ModuleNotFoundError:  # a parent package is not installed
+        return False
+    try:
         importlib.import_module(module_name)
     except Exception:
         logger.warning(
@@ -522,6 +525,11 @@ def has_deep_gemm() -> bool:
 def has_nixl_ep() -> bool:
     """Whether the optional `nixl_ep` package is available."""
     return _has_module("nixl_ep")
+
+
+def has_mooncake() -> bool:
+    """Whether the optional Mooncake TransferEngine is available."""
+    return _has_module("mooncake.engine")
 
 
 def has_moonep() -> bool:
@@ -678,6 +686,14 @@ def has_humming() -> bool:
 def has_quark():
     """Whether the optional `quark` package is available."""
     return _has_module("quark")
+
+
+def has_torchcodec_image_decoding() -> bool:
+    """Whether `torchcodec.decoders.decode_image` is available."""
+    if not _has_module("torchcodec.decoders"):
+        return False
+    decoders = importlib.import_module("torchcodec.decoders")
+    return hasattr(decoders, "decode_image")
 
 
 def check_torchcodec_available():

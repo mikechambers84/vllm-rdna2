@@ -13,7 +13,7 @@ from vllm.v1.attention.backends.triton_attn import TritonAttentionMetadataBuilde
 from vllm.v1.attention.backends.triton_attn_diffkv import (
     TritonAttentionDiffKVMetadataBuilder,
 )
-from vllm.v1.kv_cache_interface import FullAttentionSpec, KVQuantMode
+from vllm.v1.kv_cache_interface import AttentionSpec, KVQuantMode
 
 
 def _build(
@@ -54,7 +54,7 @@ def _build(
             cudagraph_mode=CUDAGraphMode.NONE, static_forward_context={}
         ),
     )
-    spec = FullAttentionSpec(
+    spec = AttentionSpec(
         block_size=16,
         num_kv_heads=num_kv_heads,
         head_size=128,
@@ -197,7 +197,7 @@ def test_gfx1030_large_decode_batches_keep_3d_path(
             cudagraph_mode=CUDAGraphMode.NONE, static_forward_context={}
         ),
     )
-    spec = FullAttentionSpec(
+    spec = AttentionSpec(
         block_size=16, num_kv_heads=8, head_size=128, dtype=torch.float16
     )
     builder = TritonAttentionMetadataBuilder(spec, ["layer.0"], config, "cpu")

@@ -13,6 +13,7 @@ import vllm.envs as envs
 from vllm.compilation.decorators import support_torch_compile
 from vllm.config import VllmConfig
 from vllm.distributed import get_pp_group, tensor_model_parallel_all_gather
+from vllm.distributed.parallel_state import in_single_pp_stage
 from vllm.logger import init_logger
 from vllm.model_executor.layers.linear import ColumnParallelLinear
 from vllm.model_executor.layers.logits_processor import LogitsProcessor
@@ -45,7 +46,6 @@ from .interfaces import (
 )
 from .utils import (
     AutoWeightsLoader,
-    PPMissingLayer,
     _merge_multimodal_embeddings,
     get_fused_shared_expert_layers,
     make_empty_intermediate_tensors_factory,
@@ -82,11 +82,17 @@ def compute_draft_logits(
     return logits
 
 
+def _uses_target_vocab_layers() -> bool:
+    """Without PP the proposer replaces the drafter's embedding and lm_head
+    with the target model's; under PP the drafter, one pipeline stage of its
+    own, keeps and loads its own."""
+    return get_pp_group().world_size == 1 and not in_single_pp_stage()
+
+
 def _vocab_layers_device():
-    """With one pipeline stage the proposer replaces the drafter's embedding
-    and lm_head with the target model's, so build them on the meta device: two
+    """Build the vocab layers the target's replace on the meta device: two
     transient ~2.4 GiB copies do not fit beside a 27B target on a 32 GB GPU."""
-    return torch.device("meta") if get_pp_group().world_size == 1 else nullcontext()
+    return torch.device("meta") if _uses_target_vocab_layers() else nullcontext()
 
 
 @support_torch_compile(
@@ -144,16 +150,6 @@ class Qwen3_5MultiTokenPredictor(nn.Module):
             prefix=f"{prefix}.fc",
         )
 
-        # GPTQ: quantized checkpoints may exclude MTP from quantization via
-        # quantization_config.dynamic with "-:pattern" entries. When detected,
-        # disable quantization for MTP layers so they use unquantized params.
-        original_quant = vllm_config.quant_config
-        if quant_config and quant_config.get_name() not in ("modelopt_fp4",):
-            hf_qc = getattr(model_config.hf_config, "quantization_config", None)
-            if isinstance(hf_qc, dict):
-                dynamic = hf_qc.get("dynamic", {})
-                if any(k.startswith("-:") and "mtp" in k for k in dynamic):
-                    vllm_config.quant_config = None
         self.layers = torch.nn.ModuleList(
             Qwen3_5DecoderLayer(
                 vllm_config,
@@ -162,7 +158,6 @@ class Qwen3_5MultiTokenPredictor(nn.Module):
             )
             for idx in range(self.num_mtp_layers)
         )
-        vllm_config.quant_config = original_quant
         self.fused_shared_expert_layers = get_fused_shared_expert_layers(
             self,
             Qwen3NextSparseMoeBlock,
@@ -191,20 +186,14 @@ class Qwen3_5MultiTokenPredictor(nn.Module):
         inputs_embeds: torch.Tensor | None = None,
         spec_step_idx: int = 0,
     ) -> torch.Tensor:
-        # Branch on the inputs, not the rank: the drafter is built entirely on
-        # the last PP stage, where `is_first_rank` is False.
-        if intermediate_tensors is None:
-            if inputs_embeds is None:
-                inputs_embeds = self.embed_input_ids(input_ids)
-            assert hidden_states.shape[-1] == inputs_embeds.shape[-1]
-            inputs_embeds = self.pre_fc_norm_embedding(inputs_embeds)
-            hidden_states = self.pre_fc_norm_hidden(hidden_states)
-            hidden_states = torch.cat([inputs_embeds, hidden_states], dim=-1)
-            hidden_states = self.fc(hidden_states)
-            residual = None
-        else:
-            hidden_states = intermediate_tensors["hidden_states"]
-            residual = intermediate_tensors["residual"]
+        if inputs_embeds is None:
+            inputs_embeds = self.embed_input_ids(input_ids)
+        assert hidden_states.shape[-1] == inputs_embeds.shape[-1]
+        inputs_embeds = self.pre_fc_norm_embedding(inputs_embeds)
+        hidden_states = self.pre_fc_norm_hidden(hidden_states)
+        hidden_states = torch.cat([inputs_embeds, hidden_states], dim=-1)
+        hidden_states = self.fc(hidden_states)
+        residual = None
 
         current_step_idx = spec_step_idx % self.num_mtp_layers
         mtp_layer = self.layers[current_step_idx]
@@ -217,11 +206,6 @@ class Qwen3_5MultiTokenPredictor(nn.Module):
             hidden_states=hidden_states,
             residual=residual,
         )
-
-        if not get_pp_group().is_last_rank:
-            return IntermediateTensors(
-                {"hidden_states": hidden_states, "residual": residual}
-            )
 
         hidden_states, _ = self.norm(hidden_states, residual)
         if mtp_layer.use_attn_reduce_scatter_for_moe:
@@ -274,18 +258,15 @@ class Qwen3_5MTP(LocalArgmaxMixin, nn.Module, SupportsMultiModal, SupportsPP):
             vllm_config=vllm_config, prefix=maybe_prefix(prefix, "mtp")
         )
 
-        if get_pp_group().is_last_rank:
-            with _vocab_layers_device():
-                self.lm_head = ParallelLMHead(
-                    config.vocab_size,
-                    config.hidden_size,
-                    quant_config=self.quant_config,
-                    prefix=maybe_prefix(prefix, "lm_head"),
-                )
-            if config.tie_word_embeddings:
-                self.lm_head = self.lm_head.tie_weights(self.model.embed_tokens)
-        else:
-            self.lm_head = PPMissingLayer()
+        with _vocab_layers_device():
+            self.lm_head = ParallelLMHead(
+                config.vocab_size,
+                config.hidden_size,
+                quant_config=self.quant_config,
+                prefix=maybe_prefix(prefix, "lm_head"),
+            )
+        if config.tie_word_embeddings:
+            self.lm_head = self.lm_head.tie_weights(self.model.embed_tokens)
 
         self.logits_processor = LogitsProcessor(config.vocab_size)
 
@@ -366,7 +347,7 @@ class Qwen3_5MTP(LocalArgmaxMixin, nn.Module, SupportsMultiModal, SupportsPP):
                 if name.startswith("mtp."):
                     name = name.replace("mtp.", "model.")
                 elif any(key in name for key in ["embed_tokens", "lm_head"]):
-                    if get_pp_group().world_size == 1:
+                    if _uses_target_vocab_layers():
                         continue  # replaced by the target model's
                     if "embed_tokens" in name:
                         name = name.replace("language_model.", "")

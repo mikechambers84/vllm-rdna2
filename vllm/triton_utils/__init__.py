@@ -24,7 +24,10 @@ else:
     gl = TritonLanguagePlaceholder()
     aggregate = TritonLanguagePlaceholder()
 
-from vllm.triton_utils.tensor_descriptor import use_tensor_descriptor
+from vllm.triton_utils.tensor_descriptor import (
+    tensor_descriptor_compatible,
+    use_tensor_descriptor,
+)
 
 if HAS_TRITON:
     from vllm.platforms import current_platform
@@ -60,5 +63,6 @@ __all__ = [
     "gluon",
     "gl",
     "aggregate",
+    "tensor_descriptor_compatible",
     "use_tensor_descriptor",
 ]
