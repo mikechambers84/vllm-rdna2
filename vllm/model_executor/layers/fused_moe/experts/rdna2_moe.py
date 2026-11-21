@@ -697,6 +697,7 @@ class Rdna2Int8Experts(TritonExperts):
             w2,
             self.w2_scale,
             act,
+            self.activation_config.clamp_limit or 0.0,
         )
 
 
@@ -816,6 +817,7 @@ class Rdna2Fp8Experts(TritonExperts):
                 block_n,
                 block_k,
                 act,
+                self.activation_config.clamp_limit or 0.0,
             )
             return
         num_experts, n = w1.size(0), w1.size(1)
